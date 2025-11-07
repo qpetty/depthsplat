@@ -9,7 +9,7 @@ jaxtyping==0.2.33
 lpips==0.1.4
 matplotlib==3.9.1
 moviepy==1.0.3
-numpy==1.24.4
+numpy
 opencv_python==4.11.0.86
 Pillow==10.4.0
 plyfile==1.1
