@@ -35,8 +35,7 @@ def get_view_sampler(
     step_tracker: StepTracker | None,
 ) -> ViewSampler[Any]:
     print(f'cfg.name: {cfg.name}')
-#    return VIEW_SAMPLERS[cfg.name](
-    return ViewSamplerEvaluation(
+    return VIEW_SAMPLERS[cfg.name](
         cfg,
         stage,
         overfit,
