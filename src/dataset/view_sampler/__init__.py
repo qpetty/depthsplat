@@ -34,7 +34,7 @@ def get_view_sampler(
     cameras_are_circular: bool,
     step_tracker: StepTracker | None,
 ) -> ViewSampler[Any]:
-    print("{cfg.name}")
+    print(f'cfg.name: {cfg.name}')
     return VIEW_SAMPLERS[cfg.name](
         cfg,
         stage,
