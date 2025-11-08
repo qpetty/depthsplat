@@ -120,7 +120,9 @@ class DatasetDL3DV(IterableDataset):
                 if chunk_index % worker_info.num_workers == worker_info.id
             ]
 
+        print("Process chunks")
         for chunk_path in self.chunks:
+            print("Process single chunk")
             # Load the chunk.
             chunk = torch.load(chunk_path)
 
