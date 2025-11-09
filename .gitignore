@@ -166,3 +166,5 @@ pretrained
 outputs
 output
 checkpoints
+
+.DS_Store
