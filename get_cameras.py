@@ -243,16 +243,67 @@ for img_name in image_names_to_print:
         ordered_extrinsics.append(extrinsics_list[idx])
         ordered_names.append(img_name)
 
+# Compute coordinate system scale diagnostics
+if len(ordered_extrinsics) >= 2:
+    # Compute camera baselines
+    camera_centers_for_scale = [c2w[:3, 3] for c2w in ordered_extrinsics]
+    baselines = []
+    for i in range(len(camera_centers_for_scale)):
+        for j in range(i + 1, len(camera_centers_for_scale)):
+            baseline = np.linalg.norm(camera_centers_for_scale[i] - camera_centers_for_scale[j])
+            baselines.append(baseline)
+    
+    if baselines:
+        avg_baseline = np.mean(baselines)
+        min_baseline = np.min(baselines)
+        max_baseline = np.max(baselines)
+        
+        print("\n" + "="*70)
+        print("COORDINATE SYSTEM SCALE ANALYSIS")
+        print("="*70)
+        print(f"Camera baselines (distances between cameras):")
+        print(f"  Minimum baseline: {min_baseline:.3f} units")
+        print(f"  Maximum baseline: {max_baseline:.3f} units")
+        print(f"  Average baseline: {avg_baseline:.3f} units")
+        print(f"\nNOTE: COLMAP uses arbitrary scale units.")
+        print(f"  - The scale depends on your reconstruction")
+        print(f"  - These values are in COLMAP's coordinate system units")
+        print(f"  - Near/far planes should be computed dynamically based on baselines")
+        print(f"  - inference.py will automatically compute near/far from baselines")
+        print(f"\n  Typical baseline scales for reference:")
+        print(f"    * Small scene (indoors, close-up): 0.1-2.0 units")
+        print(f"    * Medium scene (room, person): 1.0-10.0 units")
+        print(f"    * Large scene (outdoor, building): 5.0-100.0 units")
+        print(f"\n  Your scene appears to be: ", end="")
+        if avg_baseline < 1.0:
+            print("SMALL scale (indoor/close-up)")
+        elif avg_baseline < 5.0:
+            print("MEDIUM scale (room/person)")
+        else:
+            print("LARGE scale (outdoor/building)")
+        print("="*70)
+
 # Print in format ready for inference.py
 print("\n" + "="*70)
 print("COPY THE FOLLOWING TO inference.py:")
 print("="*70)
+
+# Print IMAGE DIMENSIONS - CRITICAL!
+if camera_used is not None:
+    print("\n" + "="*70)
+    print("IMPORTANT: IMAGE DIMENSIONS")
+    print("="*70)
+    print(f"COLMAP reconstruction used: width={camera_used.width}, height={camera_used.height}")
+    print(f"\nIn inference.py, set:")
+    print(f"  height, width = {camera_used.height}, {camera_used.width}  # Match COLMAP dimensions")
+    print("="*70)
 
 # Print INTRINSICS_HARDCODED
 if intrinsics_fx is not None and intrinsics_fy is not None and intrinsics_cx is not None and intrinsics_cy is not None:
     print("\n# Camera intrinsics (before normalization)")
     print("# Set to None to use computed values, or provide [fx, fy, cx, cy] in pixels")
     print("# If provided, will be normalized by image dimensions automatically")
+    print("# IMPORTANT: Make sure image dimensions in inference.py match COLMAP dimensions above!")
     print("INTRINSICS_HARDCODED = None")
     print("# Example (uncomment to use):")
     print(f"INTRINSICS_HARDCODED = [{intrinsics_fx:.5f}, {intrinsics_fy:.5f}, {intrinsics_cx:.1f}, {intrinsics_cy:.1f}]  # [fx, fy, cx, cy] in pixels")
