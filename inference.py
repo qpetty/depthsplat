@@ -10,13 +10,13 @@ Image resolution: 512x960
 # ============================================================================
 
 CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
-CONFIG_ROOT = "config"  # Path to config directory
-OUTPUT_DIR = "run-output"
+CONFIG_ROOT = "/content/depthsplat/config"  # Path to config directory
+OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
 
 # Input image paths (set to None to use random images)
-IMAGE_LEFT_PATH = "3_input/underwater-left.png"   # View 0: 90° left
-IMAGE_CENTER_PATH = "3_input/Underwater.png"  # View 1: Head-on
-IMAGE_RIGHT_PATH = "3_input/underwater-right.png"  # View 2: 90° right
+IMAGE_LEFT_PATH = "/content/drive/MyDrive/DepthSplat/3_input/underwater-left.png"   # View 0: 90° left
+IMAGE_CENTER_PATH = "/content/drive/MyDrive/DepthSplat/3_input/Underwater.png"  # View 1: Head-on
+IMAGE_RIGHT_PATH = "/content/drive/MyDrive/DepthSplat/3_input/underwater-right.png"  # View 2: 90° right
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
@@ -152,13 +152,13 @@ def load_encoder_config(config_root: str, overrides: dict = None) -> EncoderDept
 
     # Convert to typed config
     encoder_cfg = load_typed_config(encoder_cfg_dict, EncoderDepthSplatCfg)
-    
+
     print(f"Encoder config loaded successfully!")
     print(f"  name: {encoder_cfg.name}")
     print(f"  num_scales: {encoder_cfg.num_scales}")
     print(f"  monodepth_vit_type: {encoder_cfg.monodepth_vit_type}")
     print(f"  gaussian_scale_max: {encoder_cfg.gaussian_adapter.gaussian_scale_max}")
-    
+
     return encoder_cfg
 
 
@@ -359,7 +359,7 @@ def main():
         print("  Cannot export to PLY without this information.")
         print("  This may happen if the encoder config has certain settings.")
         print(f"  Available keys in visualization_dump: {list(visualization_dump.keys())}")
-        
+
         # Try to export with scales/rotations from gaussians if available
         # Note: The gaussians object from the adapter should have scales and rotations
         # But they're not in world space, so this is a fallback
