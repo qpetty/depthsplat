@@ -10,13 +10,13 @@ Image resolution: 512x960
 # ============================================================================
 
 CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
-CONFIG_ROOT = "/content/depthsplat/config"  # Path to config directory
-OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
+CONFIG_ROOT = "config"  # Path to config directory
+OUTPUT_DIR = "run-output"
 
 # Input image paths (set to None to use random images)
-IMAGE_LEFT_PATH = "/content/drive/MyDrive/DepthSplat/3_input/underwater-left.png"   # View 0: 90° left
-IMAGE_CENTER_PATH = "/content/drive/MyDrive/DepthSplat/3_input/Underwater.png"  # View 1: Head-on
-IMAGE_RIGHT_PATH = "/content/drive/MyDrive/DepthSplat/3_input/underwater-right.png"  # View 2: 90° right
+IMAGE_LEFT_PATH = "3_input/underwater-left.png"   # View 0: 90° left
+IMAGE_CENTER_PATH = "3_input/Underwater.png"  # View 1: Head-on
+IMAGE_RIGHT_PATH = "3_input/underwater-right.png"  # View 2: 90° right
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
