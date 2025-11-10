@@ -2,7 +2,7 @@
 Run encoder using direct config loading (no Hydra) and export to PLY.
 
 Image resolution: 512x960
-3 input views: left 90°, head-on, right 90°
+Input views: determined by EXTRINSICS_HARDCODED dictionary keys (image filenames)
 """
 
 # ============================================================================
@@ -13,10 +13,11 @@ CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-
 CONFIG_ROOT = "/content/depthsplat/config"  # Path to config directory
 OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
 
-# Input image paths (set to None to use random images)
-IMAGE_LEFT_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input/frame_0002.png"   # View 0: 90° left
-IMAGE_CENTER_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input/frame_0070.png"  # View 1: Head-on
-IMAGE_RIGHT_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input/frame_0140.png"  # View 2: 90° right
+# Input image base path (directory containing images)
+# If EXTRINSICS_HARDCODED is a dictionary, image paths will be constructed as:
+#   IMAGE_BASE_PATH / image_filename (where image_filename is a key in EXTRINSICS_HARDCODED)
+# Set to None to use random images
+IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input"  # Base directory for images
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
@@ -39,34 +40,51 @@ INTRINSICS_HARDCODED = None
 INTRINSICS_HARDCODED = [1719.87357, 1719.87357, 256.0, 480.0]  # [fx, fy, cx, cy] in pixels
 
 # Camera extrinsics (4x4 camera-to-world matrices)
-# Set to None to use computed poses, or provide list of 3 numpy arrays or torch tensors
+# Set to None to use computed poses, or provide a dictionary mapping image filenames to numpy arrays
 # Each matrix should be 4x4 in shape
-# If provided, must have exactly 3 matrices (one per view)
+# Keys are image filenames (e.g., 'frame_0002.png'), values are 4x4 C2W matrices
+# If provided, images will be loaded from IMAGE_BASE_PATH using the dictionary keys as filenames
 EXTRINSICS_HARDCODED = None
 # Example (uncomment to use - note: numpy is already imported as np):
-EXTRINSICS_HARDCODED = [
-     # View 0: Left 90° (camera looks down -X axis)
-     np.array([
+EXTRINSICS_HARDCODED = {
+    "frame_0002.png": np.array([
         [0.7534, 0.0369, -0.6566, 4.5406],
         [-0.0366, 0.9992, 0.0142, -0.0882],
         [0.6566, 0.0133, 0.7541, -2.1090],
         [0.0000, 0.0000, 0.0000, 1.0000],
-     ], dtype=np.float32),
-     # View 1: Head-on (camera looks down +Z axis)
-     np.array([
+    ], dtype=np.float32),
+    "frame_0035.png": np.array([
+        [0.9432, -0.0505, 0.3284, 0.0438],
+        [0.0766, 0.9948, -0.0671, 0.2621],
+        [-0.3233, 0.0885, 0.9421, -2.7673],
+        [0.0000, 0.0000, 0.0000, 1.0000],
+    ], dtype=np.float32),
+    "frame_0070.png": np.array([
         [-0.1835, -0.0286, 0.9826, -2.6224],
         [0.1672, 0.9841, 0.0599, -0.3042],
         [-0.9687, 0.1753, -0.1758, 2.1813],
-        [0.0000, 0.0000, 0.0000, 1.0000]
-     ], dtype=np.float32),
-     # View 2: Right 90° (camera looks down +X axis)
-     np.array([
+        [0.0000, 0.0000, 0.0000, 1.0000],
+    ], dtype=np.float32),
+    "frame_0105.png": np.array([
+        [-0.7107, 0.1201, 0.6932, -0.9500],
+        [0.0934, 0.9927, -0.0762, 0.1415],
+        [-0.6973, 0.0106, -0.7167, 4.5686],
+        [0.0000, 0.0000, 0.0000, 1.0000],
+    ], dtype=np.float32),
+    "frame_0122.png": np.array([
+        [0.8110, 0.0134, -0.5848, 3.7776],
+        [-0.0522, 0.9974, -0.0495, 0.1060],
+        [0.5827, 0.0707, 0.8096, -1.6895],
+        [0.0000, 0.0000, 0.0000, 1.0000],
+    ], dtype=np.float32),
+    "frame_0140.png": np.array([
         [0.9055, -0.0566, 0.4205, -0.0873],
         [0.0506, 0.9984, 0.0254, -0.1815],
         [-0.4212, -0.0017, 0.9070, -2.0622],
-        [0.0000, 0.0000, 0.0000, 1.0000]
-     ], dtype=np.float32),
- ]
+        [0.0000, 0.0000, 0.0000, 1.0000],
+    ], dtype=np.float32),
+}
+
 
 # Near/Far plane computation (only used if EXTRINSICS_HARDCODED is provided)
 # These disparity values control how near/far planes are computed from camera baselines
@@ -283,26 +301,52 @@ def main():
     # NOTE: Dimensions must match what COLMAP used during reconstruction
     # Based on principal point analysis: COLMAP used width=512, height=960
     batch_size = 1
-    num_views = 3  # Left, center, right
     height, width = 960, 512  # FIXED: Match COLMAP dimensions (was 512, 960)
+
+    # Determine number of views and image paths from EXTRINSICS_HARDCODED
+    image_paths = []
+    image_filenames = []
+    if EXTRINSICS_HARDCODED is not None:
+        if isinstance(EXTRINSICS_HARDCODED, dict):
+            # Extract image filenames from dictionary keys
+            image_filenames = list(EXTRINSICS_HARDCODED.keys())
+            num_views = len(image_filenames)
+            if IMAGE_BASE_PATH is not None:
+                image_base = Path(IMAGE_BASE_PATH)
+                image_paths = [str(image_base / filename) for filename in image_filenames]
+            else:
+                print("  WARNING: EXTRINSICS_HARDCODED is a dictionary but IMAGE_BASE_PATH is None.")
+                print("  Cannot load images. Falling back to random images.")
+                image_paths = []
+        elif isinstance(EXTRINSICS_HARDCODED, (list, tuple)):
+            # Backward compatibility: list format
+            num_views = len(EXTRINSICS_HARDCODED)
+            image_filenames = []  # No filenames available for list format
+            image_paths = []  # Cannot construct paths without filenames
+        else:
+            raise TypeError(f"EXTRINSICS_HARDCODED must be a dict, list, or None, got {type(EXTRINSICS_HARDCODED)}")
+    else:
+        # Default to 3 views if not using hardcoded extrinsics
+        num_views = 3
+        image_paths = []
+        image_filenames = []
 
     # Load images from paths or generate random ones
     print("\n" + "="*70)
     print("Loading Images")
     print("="*70)
-    if IMAGE_LEFT_PATH and IMAGE_CENTER_PATH and IMAGE_RIGHT_PATH:
+    if image_paths and len(image_paths) > 0:
         try:
-            image_left = load_and_resize_image(IMAGE_LEFT_PATH, (height, width))
-            image_center = load_and_resize_image(IMAGE_CENTER_PATH, (height, width))
-            image_right = load_and_resize_image(IMAGE_RIGHT_PATH, (height, width))
+            loaded_images = []
+            for img_path, img_filename in zip(image_paths, image_filenames):
+                loaded_img = load_and_resize_image(img_path, (height, width))
+                loaded_images.append(loaded_img)
+                print(f"  Loaded: {img_filename} from {img_path}")
 
-            # Stack images: [3, height, width] -> [1, 3, 3, height, width]
-            images = torch.stack([image_left, image_center, image_right], dim=0).unsqueeze(0)
-            print(f"  Loaded images from:")
-            print(f"    Left: {IMAGE_LEFT_PATH}")
-            print(f"    Center: {IMAGE_CENTER_PATH}")
-            print(f"    Right: {IMAGE_RIGHT_PATH}")
+            # Stack images: [num_views, 3, height, width] -> [1, num_views, 3, height, width]
+            images = torch.stack(loaded_images, dim=0).unsqueeze(0)
             print(f"  Image shape: {images.shape}")
+            print(f"  Number of views: {num_views}")
         except FileNotFoundError as e:
             print(f"  Warning: {e}")
             print("  Falling back to random images.")
@@ -311,7 +355,7 @@ def main():
         print("  Using random images (image paths not set or incomplete).")
         images = torch.rand(batch_size, num_views, 3, height, width)
 
-    # Create camera poses for 3 views
+    # Create camera poses
     print("\n" + "="*70)
     print("Setting Up Camera Poses")
     print("="*70)
@@ -324,24 +368,39 @@ def main():
     if EXTRINSICS_HARDCODED is not None:
         # Use hardcoded extrinsics
         print("  Using hardcoded extrinsics")
-        if len(EXTRINSICS_HARDCODED) != num_views:
-            raise ValueError(f"EXTRINSICS_HARDCODED must contain exactly {num_views} matrices, got {len(EXTRINSICS_HARDCODED)}")
+        
+        # Handle dictionary format
+        if isinstance(EXTRINSICS_HARDCODED, dict):
+            # Verify all image filenames are in the dictionary
+            # (num_views should already match since we set it from the dict length)
+            missing_files = [fname for fname in image_filenames if fname not in EXTRINSICS_HARDCODED]
+            if missing_files:
+                raise ValueError(f"EXTRINSICS_HARDCODED dictionary is missing entries for: {missing_files}")
+            
+            # Extract extrinsics in the order of image_filenames
+            extrinsics_values = [EXTRINSICS_HARDCODED[fname] for fname in image_filenames]
+        else:
+            # Handle list format (backward compatibility)
+            # num_views was set from the list length, so they should match
+            extrinsics_values = EXTRINSICS_HARDCODED
         
         extrinsics_list = []
         camera_centers = []
         camera_distances = []
         viewing_directions = []
         
-        for i, ext in enumerate(EXTRINSICS_HARDCODED):
+        for i, ext in enumerate(extrinsics_values):
+            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
+            
             if isinstance(ext, np.ndarray):
                 ext_tensor = torch.from_numpy(ext).float()
             elif isinstance(ext, torch.Tensor):
                 ext_tensor = ext.float()
             else:
-                raise TypeError(f"Extrinsic {i} must be numpy array or torch tensor, got {type(ext)}")
+                raise TypeError(f"Extrinsic {i} ({img_name}) must be numpy array or torch tensor, got {type(ext)}")
             
             if ext_tensor.shape != (4, 4):
-                raise ValueError(f"Extrinsic {i} must be 4x4 matrix, got shape {ext_tensor.shape}")
+                raise ValueError(f"Extrinsic {i} ({img_name}) must be 4x4 matrix, got shape {ext_tensor.shape}")
             
             # Normalize the rotation matrix (3x3 upper-left block) to ensure it's valid
             rotation = ext_tensor[:3, :3]
@@ -351,7 +410,7 @@ def main():
             # Check determinant for validation
             det = torch.det(rotation_normalized)
             if not torch.allclose(det, torch.tensor(1.0), atol=1e-5):
-                print(f"  WARNING: View {i} rotation matrix determinant after normalization: {det.item():.6f} (should be 1.0)")
+                print(f"  WARNING: View {i} ({img_name}) rotation matrix determinant after normalization: {det.item():.6f} (should be 1.0)")
             
             # Extract camera center (translation part of C2W matrix)
             camera_center = ext_tensor[:3, 3]
@@ -365,24 +424,27 @@ def main():
             
             extrinsics_list.append(ext_tensor)
         
-        extrinsics = torch.stack(extrinsics_list, dim=0).unsqueeze(0)  # [1, 3, 4, 4]
+        extrinsics = torch.stack(extrinsics_list, dim=0).unsqueeze(0)  # [1, num_views, 4, 4]
         
         # Print detailed extrinsics information
         print(f"\n  Extrinsics Validation:")
         print(f"    Camera positions (world coordinates):")
         for i, center in enumerate(camera_centers):
             dist = camera_distances[i]
-            print(f"      View {i}: [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}] (distance from origin: {dist:.3f})")
+            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
+            print(f"      View {i} ({img_name}): [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}] (distance from origin: {dist:.3f})")
         
         print(f"\n    Viewing directions (camera forward in world coordinates):")
         for i, view_dir in enumerate(viewing_directions):
-            print(f"      View {i}: [{view_dir[0]:.3f}, {view_dir[1]:.3f}, {view_dir[2]:.3f}]")
+            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
+            print(f"      View {i} ({img_name}): [{view_dir[0]:.3f}, {view_dir[1]:.3f}, {view_dir[2]:.3f}]")
         
         # Check camera distances consistency
         if len(set([round(d, 1) for d in camera_distances])) > 1:
             print(f"\n    WARNING: Camera distances vary significantly:")
             for i, dist in enumerate(camera_distances):
-                print(f"      View {i}: {dist:.3f}")
+                img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
+                print(f"      View {i} ({img_name}): {dist:.3f}")
             print(f"    This may indicate cameras are at different distances from the scene.")
         
         # Check if cameras are too close or too far
@@ -399,7 +461,9 @@ def main():
         for i in range(len(camera_centers)):
             for j in range(i + 1, len(camera_centers)):
                 baseline = torch.norm(camera_centers[i] - camera_centers[j]).item()
-                print(f"      View {i} <-> View {j}: {baseline:.3f}")
+                img_name_i = image_filenames[i] if i < len(image_filenames) else f"View {i}"
+                img_name_j = image_filenames[j] if j < len(image_filenames) else f"View {j}"
+                print(f"      View {i} ({img_name_i}) <-> View {j} ({img_name_j}): {baseline:.3f}")
         
         # Check viewing angles between cameras
         print(f"\n    Viewing angles between cameras:")
@@ -407,12 +471,15 @@ def main():
             for j in range(i + 1, len(viewing_directions)):
                 angle_rad = torch.acos(torch.clamp(torch.dot(viewing_directions[i], viewing_directions[j]), -1.0, 1.0))
                 angle_deg = angle_rad * 180 / math.pi
-                print(f"      View {i} <-> View {j}: {angle_deg:.1f}°")
+                img_name_i = image_filenames[i] if i < len(image_filenames) else f"View {i}"
+                img_name_j = image_filenames[j] if j < len(image_filenames) else f"View {j}"
+                print(f"      View {i} ({img_name_i}) <-> View {j} ({img_name_j}): {angle_deg:.1f}°")
         
         # Print full extrinsic matrices
         print(f"\n    Full extrinsic matrices (C2W):")
         for i, ext in enumerate(extrinsics_list):
-            print(f"      View {i}:")
+            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
+            print(f"      View {i} ({img_name}):")
             ext_np = ext.numpy()
             for row in ext_np:
                 print(f"        [{row[0]:8.4f}, {row[1]:8.4f}, {row[2]:8.4f}, {row[3]:8.4f}]")

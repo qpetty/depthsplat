@@ -5,8 +5,8 @@ from read_write_model import read_cameras_binary, read_images_binary, qvec2rotma
 
 # Define the path to your sparse model directory
 model_path = "/Users/quinton/Desktop/colmap_output/sparse/0/"
-#image_names_to_print = ["frame_0002.png", "frame_0035.png", "frame_0070.png", "frame_0105.png", "frame_0140.png"]
-image_names_to_print = ["frame_0002.png", "frame_0070.png", "frame_0140.png"]
+image_names_to_print = ["frame_0017.png", "frame_0025.png", "frame_0034.png", "frame_0043.png", "frame_0051.png"]
+#image_names_to_print = ["frame_0002.png", "frame_0070.png", "frame_0140.png"]
 
 # Read the binary files
 cameras = read_cameras_binary(model_path + "cameras.bin")
@@ -316,21 +316,20 @@ else:
         print("#   2. The cameras.bin file exists and is readable")
         print("#   3. The reconstruction contains at least one camera")
 
-# Print EXTRINSICS_HARDCODED
+# Print EXTRINSICS_HARDCODED as a dictionary
 print("\n# Camera extrinsics (4x4 camera-to-world matrices)")
-print("# Set to None to use computed poses, or provide list of 3 numpy arrays or torch tensors")
+print("# Set to None to use computed poses, or provide a dictionary mapping image filenames to numpy arrays")
 print("# Each matrix should be 4x4 in shape")
-print("# If provided, must have exactly 3 matrices (one per view)")
+print("# Keys are image filenames (e.g., 'frame_0002.png'), values are 4x4 C2W matrices")
 print("EXTRINSICS_HARDCODED = None")
 print("# Example (uncomment to use - note: numpy is already imported as np):")
-print("EXTRINSICS_HARDCODED = [")
+print("EXTRINSICS_HARDCODED = {")
 for i, c2w in enumerate(ordered_extrinsics):
     img_name = ordered_names[i] if i < len(ordered_names) else f"View {i}"
-    print(f"     # View {i}: {img_name}")
-    print(f"     np.array([")
+    print(f"    \"{img_name}\": np.array([")
     for row in c2w:
         print(f"        [{row[0]:.4f}, {row[1]:.4f}, {row[2]:.4f}, {row[3]:.4f}],")
-    print(f"     ], dtype=np.float32),")
-print("]")
+    print(f"    ], dtype=np.float32),")
+print("}")
 
 print("\n" + "="*70)
