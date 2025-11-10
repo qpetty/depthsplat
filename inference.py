@@ -100,6 +100,7 @@ from plyfile import PlyData, PlyElement
 from src.misc.image_io import load_image
 from einops import rearrange
 import math
+import time
 import torchvision.transforms as tf
 from src.geometry.projection import get_fov
 from src.dataset.shims.bounds_shim import compute_depth_for_disparity
@@ -878,6 +879,10 @@ def main():
     print("\n" + "="*70)
     print("Running Encoder Inference")
     print("="*70)
+    encoder_start_time = time.perf_counter()
+    encoder_start_wall_time = time.time()
+    print(f"  Encoder start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
+    
     with torch.no_grad():
         result = encoder(
             context=context,
@@ -886,6 +891,12 @@ def main():
             visualization_dump=visualization_dump,
             scene_names=None,
         )
+    
+    encoder_end_time = time.perf_counter()
+    encoder_end_wall_time = time.time()
+    encoder_elapsed = encoder_end_time - encoder_start_time
+    print(f"  Encoder end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
+    print(f"  Encoder elapsed time: {encoder_elapsed:.3f} seconds ({encoder_elapsed/60:.2f} minutes)")
 
     # Handle both dict and direct gaussians return
     if isinstance(result, dict):
@@ -928,6 +939,10 @@ def main():
     print("\n" + "="*70)
     print("Exporting to PLY")
     print("="*70)
+    ply_export_start_time = time.perf_counter()
+    ply_export_start_wall_time = time.time()
+    print(f"  PLY export start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_start_wall_time))}")
+    
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     ply_path = output_dir / "gaussians.ply"
@@ -1179,8 +1194,14 @@ def main():
         # Write PLY file
         ply_path.parent.mkdir(parents=True, exist_ok=True)
         PlyData([PlyElement.describe(elements, "vertex")]).write(ply_path)
+        
+        ply_export_end_time = time.perf_counter()
+        ply_export_end_wall_time = time.time()
+        ply_export_elapsed = ply_export_end_time - ply_export_start_time
         print(f"✓ Successfully exported {gaussians.means.shape[1]} Gaussians to {ply_path}")
         print(f"  File size: {ply_path.stat().st_size / (1024*1024):.2f} MB")
+        print(f"  PLY export end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_end_wall_time))}")
+        print(f"  PLY export elapsed time: {ply_export_elapsed:.3f} seconds ({ply_export_elapsed/60:.2f} minutes)")
     else:
         print("✗ Warning: visualization_dump does not contain scales/rotations.")
         print("  Cannot export to PLY without this information.")
@@ -1192,6 +1213,27 @@ def main():
         # But they're not in world space, so this is a fallback
         print("\n  Note: The visualization_dump should be populated by the encoder.")
         print("  If this is missing, check that the encoder is configured correctly.")
+        # PLY export didn't complete, so we don't have end time
+        ply_export_elapsed = None
+
+    # Print timing summary
+    print("\n" + "="*70)
+    print("Timing Summary")
+    print("="*70)
+    print(f"  Encoder inference:")
+    print(f"    Start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
+    print(f"    End: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
+    print(f"    Elapsed: {encoder_elapsed:.3f} seconds ({encoder_elapsed/60:.2f} minutes)")
+    if ply_export_elapsed is not None:
+        print(f"  PLY export:")
+        print(f"    Start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_start_wall_time))}")
+        print(f"    End: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_end_wall_time))}")
+        print(f"    Elapsed: {ply_export_elapsed:.3f} seconds ({ply_export_elapsed/60:.2f} minutes)")
+        total_elapsed = encoder_elapsed + ply_export_elapsed
+        print(f"  Total time: {total_elapsed:.3f} seconds ({total_elapsed/60:.2f} minutes)")
+    else:
+        print(f"  PLY export: Not completed (missing visualization data)")
+        print(f"  Total time (encoder only): {encoder_elapsed:.3f} seconds ({encoder_elapsed/60:.2f} minutes)")
 
     print("\n" + "="*70)
     print("Done!")
