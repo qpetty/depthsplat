@@ -253,7 +253,13 @@ def load_encoder_config(config_root: str, overrides: dict = None) -> EncoderDept
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Device selection: prefer CUDA, then MPS (Apple Silicon), then CPU
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"Using device: {device}")
 
     # Load encoder config
@@ -976,10 +982,12 @@ def main():
             
             # Convert back to quaternion (scipy uses xyzw format)
             world_rotations_quat = R.from_matrix(world_rotations_mat).as_quat()  # [num_gaussians_per_view, 4] (xyzw)
-            world_rotations_list.append(torch.from_numpy(world_rotations_quat))
+            # Convert to float32 explicitly to avoid float64 issues with MPS
+            world_rotations_list.append(torch.from_numpy(world_rotations_quat).float())
         
         # Flatten back to [num_gaussians, 4]
-        world_rotations = torch.cat(world_rotations_list, dim=0).to(rotations.device)
+        # Ensure float32 dtype before moving to device (MPS doesn't support float64)
+        world_rotations = torch.cat(world_rotations_list, dim=0).float().to(rotations.device)
 
         # Export to PLY directly in world space (avoiding export_ply's coordinate transformations)
         # All gaussians are already in world space from the encoder, so we can export them directly

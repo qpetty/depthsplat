@@ -16,10 +16,26 @@ def rotate_sh(
 
     *_, n = sh_coefficients.shape
     alpha, beta, gamma = matrix_to_angles(rotations)
+    
+    # MPS doesn't support float64/complex128, so we need to compute wigner_D on CPU
+    # if we're on MPS, then move the result back
+    compute_device = device
+    if device.type == "mps":
+        # Move angles to CPU for wigner_D computation
+        alpha = alpha.cpu()
+        beta = beta.cpu()
+        gamma = gamma.cpu()
+        compute_device = torch.device("cpu")
+    
     result = []
     for degree in range(isqrt(n)):
-        with torch.device(device):
+        with torch.device(compute_device):
             sh_rotations = wigner_D(degree, alpha, beta, gamma).type(dtype)
+        
+        # Move back to original device if we computed on CPU
+        if compute_device != device:
+            sh_rotations = sh_rotations.to(device)
+        
         sh_rotated = einsum(
             sh_rotations,
             sh_coefficients[..., degree**2 : (degree + 1) ** 2],

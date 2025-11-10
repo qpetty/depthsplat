@@ -817,7 +817,26 @@ class ModelWrapper(LightningModule):
                 break
 
             batch = self.data_shim(batch)
-            batch = self.transfer_batch_to_device(batch, "cuda", dataloader_idx=0)
+            # Use the model's device instead of hardcoded "cuda"
+            # Get device from model parameters, or determine from available backends
+            if len(list(self.parameters())) > 0:
+                model_device = next(self.parameters()).device
+                # Convert torch.device to string format expected by transfer_batch_to_device
+                if model_device.type == "cuda":
+                    device_str = "cuda"
+                elif model_device.type == "mps":
+                    device_str = "mps"
+                else:
+                    device_str = "cpu"
+            else:
+                # Fallback: determine device from available backends
+                if torch.cuda.is_available():
+                    device_str = "cuda"
+                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    device_str = "mps"
+                else:
+                    device_str = "cpu"
+            batch = self.transfer_batch_to_device(batch, device_str, dataloader_idx=0)
 
             # Render Gaussians.
             b, v, _, h, w = batch["target"]["image"].shape

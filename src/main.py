@@ -132,12 +132,26 @@ def train(cfg_dict: DictConfig):
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker()
 
+    # Determine accelerator and devices
+    if torch.cuda.is_available():
+        accelerator = "gpu"
+        devices = torch.cuda.device_count()
+        strategy = 'ddp' if devices > 1 else "auto"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        accelerator = "mps"
+        devices = 1  # MPS only supports single device
+        strategy = "auto"
+    else:
+        accelerator = "cpu"
+        devices = 1
+        strategy = "auto"
+    
     trainer = Trainer(
         max_epochs=-1,
-        accelerator="gpu",
+        accelerator=accelerator,
         logger=logger,
-        devices=torch.cuda.device_count(),
-        strategy='ddp' if torch.cuda.device_count() > 1 else "auto",
+        devices=devices,
+        strategy=strategy,
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
         enable_progress_bar=cfg.mode == "test",

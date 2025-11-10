@@ -29,8 +29,15 @@ class Benchmarker:
 
     def dump_memory(self, path: Path) -> None:
         path.parent.mkdir(exist_ok=True, parents=True)
-        with path.open("w") as f:
-            json.dump(torch.cuda.memory_stats()["allocated_bytes.all.peak"], f)
+        # Only dump CUDA memory stats if CUDA is available
+        # MPS and CPU don't have the same memory stats API
+        if torch.cuda.is_available():
+            with path.open("w") as f:
+                json.dump(torch.cuda.memory_stats()["allocated_bytes.all.peak"], f)
+        else:
+            # For non-CUDA devices, dump a placeholder or skip
+            with path.open("w") as f:
+                json.dump({"note": "Memory stats not available for non-CUDA devices"}, f)
 
     def summarize(self) -> None:
         for tag, times in self.execution_times.items():
