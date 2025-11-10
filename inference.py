@@ -17,7 +17,7 @@ OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
 # If EXTRINSICS_HARDCODED is a dictionary, image paths will be constructed as:
 #   IMAGE_BASE_PATH / image_filename (where image_filename is a key in EXTRINSICS_HARDCODED)
 # Set to None to use random images
-IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input"  # Base directory for images
+IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/hillman_images"  # Base directory for images
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
@@ -47,43 +47,38 @@ INTRINSICS_HARDCODED = [1719.87357, 1719.87357, 256.0, 480.0]  # [fx, fy, cx, cy
 EXTRINSICS_HARDCODED = None
 # Example (uncomment to use - note: numpy is already imported as np):
 EXTRINSICS_HARDCODED = {
-    "frame_0002.png": np.array([
-        [0.7534, 0.0369, -0.6566, 4.5406],
-        [-0.0366, 0.9992, 0.0142, -0.0882],
-        [0.6566, 0.0133, 0.7541, -2.1090],
+    "frame_0017.png": np.array([
+        [0.2097, -0.0580, -0.9760, 4.0834],
+        [-0.0471, 0.9965, -0.0693, 0.0745],
+        [0.9766, 0.0605, 0.2062, 2.4196],
         [0.0000, 0.0000, 0.0000, 1.0000],
     ], dtype=np.float32),
-    "frame_0035.png": np.array([
-        [0.9432, -0.0505, 0.3284, 0.0438],
-        [0.0766, 0.9948, -0.0671, 0.2621],
-        [-0.3233, 0.0885, 0.9421, -2.7673],
+    "frame_0025.png": np.array([
+        [0.3673, -0.0574, -0.9283, 3.8409],
+        [-0.0363, 0.9964, -0.0760, 0.1100],
+        [0.9294, 0.0616, 0.3639, 1.6217],
         [0.0000, 0.0000, 0.0000, 1.0000],
     ], dtype=np.float32),
-    "frame_0070.png": np.array([
-        [-0.1835, -0.0286, 0.9826, -2.6224],
-        [0.1672, 0.9841, 0.0599, -0.3042],
-        [-0.9687, 0.1753, -0.1758, 2.1813],
+    "frame_0034.png": np.array([
+        [0.5372, -0.0551, -0.8417, 3.4024],
+        [-0.0238, 0.9965, -0.0804, 0.1335],
+        [0.8431, 0.0632, 0.5340, 0.7633],
         [0.0000, 0.0000, 0.0000, 1.0000],
     ], dtype=np.float32),
-    "frame_0105.png": np.array([
-        [-0.7107, 0.1201, 0.6932, -0.9500],
-        [0.0934, 0.9927, -0.0762, 0.1415],
-        [-0.6973, 0.0106, -0.7167, 4.5686],
+    "frame_0043.png": np.array([
+        [0.6923, -0.0511, -0.7198, 2.7938],
+        [-0.0104, 0.9967, -0.0808, 0.1430],
+        [0.7216, 0.0634, 0.6894, -0.0107],
         [0.0000, 0.0000, 0.0000, 1.0000],
     ], dtype=np.float32),
-    "frame_0122.png": np.array([
-        [0.8110, 0.0134, -0.5848, 3.7776],
-        [-0.0522, 0.9974, -0.0495, 0.1060],
-        [0.5827, 0.0707, 0.8096, -1.6895],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
-    "frame_0140.png": np.array([
-        [0.9055, -0.0566, 0.4205, -0.0873],
-        [0.0506, 0.9984, 0.0254, -0.1815],
-        [-0.4212, -0.0017, 0.9070, -2.0622],
+    "frame_0051.png": np.array([
+        [0.8075, -0.0494, -0.5878, 2.1365],
+        [0.0020, 0.9967, -0.0810, 0.1406],
+        [0.5899, 0.0642, 0.8049, -0.5854],
         [0.0000, 0.0000, 0.0000, 1.0000],
     ], dtype=np.float32),
 }
+
 
 
 # Near/Far plane computation (only used if EXTRINSICS_HARDCODED is provided)
@@ -301,7 +296,7 @@ def main():
     # NOTE: Dimensions must match what COLMAP used during reconstruction
     # Based on principal point analysis: COLMAP used width=512, height=960
     batch_size = 1
-    height, width = 960, 512  # FIXED: Match COLMAP dimensions (was 512, 960)
+    height, width = 512, 960  # FIXED: Match COLMAP dimensions (was 512, 960)
 
     # Determine number of views and image paths from EXTRINSICS_HARDCODED
     image_paths = []
