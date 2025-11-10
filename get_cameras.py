@@ -1,8 +1,7 @@
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 # Assuming read_write_model.py is in the same directory
 #from read_write_model import read_cameras_binary, read_images_binary, read_points3d_binary
-from read_write_model import read_cameras_binary, read_images_binary
+from read_write_model import read_cameras_binary, read_images_binary, qvec2rotmat
 
 # Define the path to your sparse model directory
 model_path = "/Users/quinton/Desktop/colmap_output/sparse/0/"
@@ -188,10 +187,10 @@ for img_id, img_data in images.items():
         print(f"  Quaternion (QW, QX, QY, QZ): {qvec}")
         print(f"  Translation Vector (TX, TY, TZ): {tvec}")
         
-        # 2. Convert quaternion to rotation matrix
-        # COLMAP quaternion is [QW, QX, QY, QZ]
-        # scipy expects [QX, QY, QZ, QW]
-        rotation_matrix = R.from_quat([qvec[1], qvec[2], qvec[3], qvec[0]]).as_matrix()
+        # 2. Convert quaternion to rotation matrix using COLMAP's official function
+        # CRITICAL: Use COLMAP's qvec2rotmat instead of scipy to ensure correct conversion
+        # This ensures we use the exact same conversion as COLMAP's internal implementation
+        rotation_matrix = qvec2rotmat(qvec)
         
         # 3. Create World-to-Camera (W2C) matrix
         # COLMAP provides: X_camera = R @ X_world + t
@@ -203,20 +202,8 @@ for img_id, img_data in images.items():
         print(w2c_matrix)
         
         # 4. Convert to Camera-to-World (C2W) matrix
-        # C2W = inverse(W2C) = [R^T | -R^T @ t; 0 0 0 | 1]
-        R_w2c = w2c_matrix[:3, :3]
-        t_w2c = w2c_matrix[:3, 3]
-        
-        # C2W rotation is transpose of W2C rotation
-        R_c2w = R_w2c.T
-        
-        # C2W translation is -R^T @ t
-        t_c2w = -R_c2w @ t_w2c
-        
-        # Create C2W matrix
-        c2w_matrix = np.eye(4, dtype=np.float32)
-        c2w_matrix[:3, :3] = R_c2w
-        c2w_matrix[:3, 3] = t_c2w
+        # Use numpy's inverse for numerical stability and correctness
+        c2w_matrix = np.linalg.inv(w2c_matrix).astype(np.float32)
         
         print("\n  4x4 Camera-to-World (C2W) Matrix (for inference.py):")
         print(c2w_matrix)
@@ -226,9 +213,18 @@ for img_id, img_data in images.items():
         camera_center_world = c2w_matrix[:3, 3]
         print(f"\n  Camera Center Position (World Coords): {camera_center_world}")
         
-        # 6. Verify: camera center should also be -R_w2c^T @ t_w2c
+        # 6. Verify camera center computation
+        R_w2c = w2c_matrix[:3, :3]
+        t_w2c = w2c_matrix[:3, 3]
         camera_center_verify = -R_w2c.T @ t_w2c
         print(f"  Camera Center (verified): {camera_center_verify}")
+        
+        # Verify they match (should be very close)
+        if np.allclose(camera_center_world, camera_center_verify, atol=1e-5):
+            print(f"  ✓ Camera center verification passed!")
+        else:
+            diff = np.abs(camera_center_world - camera_center_verify).max()
+            print(f"  ⚠️  WARNING: Camera center mismatch! Max difference: {diff:.6f}")
         
         # 7. Store for EXTRINSICS_HARDCODED (maintain order from image_names_to_print)
         extrinsics_list.append(c2w_matrix)
