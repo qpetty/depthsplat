@@ -8,8 +8,7 @@ from torch import Tensor
 
 from ...dataset import DatasetCfg
 from ..types import Gaussians
-from .cuda_splatting import DepthRenderingMode, render_cuda, render_depth_cuda
-from .decoder import Decoder, DecoderOutput
+from .decoder import Decoder, DecoderOutput, DepthRenderingMode
 
 
 @dataclass
@@ -42,6 +41,9 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         image_shape: tuple[int, int],
         depth_mode: DepthRenderingMode | None = None,
     ) -> DecoderOutput:
+        # Lazy import to avoid requiring diff-gaussian-rasterization at module import time
+        from .cuda_splatting import render_cuda, render_depth_cuda
+        
         b, v, _, _ = extrinsics.shape
         color = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),
@@ -76,6 +78,9 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         image_shape: tuple[int, int],
         mode: DepthRenderingMode = "depth",
     ) -> Float[Tensor, "batch view height width"]:
+        # Lazy import to avoid requiring diff-gaussian-rasterization at module import time
+        from .cuda_splatting import render_depth_cuda
+        
         b, v, _, _ = extrinsics.shape
         result = render_depth_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),

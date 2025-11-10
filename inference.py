@@ -10,14 +10,14 @@ Input views: determined by EXTRINSICS_HARDCODED dictionary keys (image filenames
 # ============================================================================
 
 CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
-CONFIG_ROOT = "/content/depthsplat/config"  # Path to config directory
-OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
+CONFIG_ROOT = "config"  # Path to config directory
+OUTPUT_DIR = "run-output"
 
 # Input image base path (directory containing images)
 # If EXTRINSICS_HARDCODED is a dictionary, image paths will be constructed as:
 #   IMAGE_BASE_PATH / image_filename (where image_filename is a key in EXTRINSICS_HARDCODED)
 # Set to None to use random images
-IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/hillman_images"  # Base directory for images
+IMAGE_BASE_PATH = "/Users/quinton/Desktop/hillman_mov_horizontal"  # Base directory for images
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {

@@ -2,6 +2,60 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Patch xformers globally to use PyTorch's attention as fallback (for macOS compatibility)
+# This needs to happen before DINOv2 is loaded
+try:
+    import xformers.ops as xops
+    if hasattr(xops, 'memory_efficient_attention'):
+        original_mea = xops.memory_efficient_attention
+        
+        def patched_memory_efficient_attention(query, key, value, attn_bias=None, p=0.0, scale=None):
+            try:
+                return original_mea(query, key, value, attn_bias=attn_bias, p=p, scale=scale)
+            except (NotImplementedError, RuntimeError) as e:
+                # Fall back to PyTorch's attention if xformers fails
+                error_str = str(e).lower()
+                if any(keyword in error_str for keyword in ['memory_efficient_attention', 'xformers', 'not supported', 'not implemented', 'device=cpu', 'dtype=torch.float32']):
+                    # Convert to format expected by scaled_dot_product_attention
+                    # xformers format: (batch, seq_len, num_heads, head_dim)
+                    # PyTorch format: (batch, num_heads, seq_len, head_dim)
+                    if query.dim() == 4:
+                        q = query.transpose(1, 2)  # [B, num_heads, seq_len, head_dim]
+                        k = key.transpose(1, 2)
+                        v = value.transpose(1, 2)
+                    else:
+                        q, k, v = query, key, value
+                    
+                    # Handle attn_bias if provided
+                    attn_mask = None
+                    if attn_bias is not None:
+                        if hasattr(attn_bias, 'materialize'):
+                            # xformers LowerTriangularMask or similar
+                            try:
+                                attn_mask = attn_bias.materialize(
+                                    (query.shape[0], query.shape[1], key.shape[1]), 
+                                    device=query.device, 
+                                    dtype=query.dtype
+                                )
+                            except:
+                                attn_mask = None
+                        elif isinstance(attn_bias, torch.Tensor):
+                            attn_mask = attn_bias
+                    
+                    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p, scale=scale)
+                    
+                    # Convert back to xformers format if needed
+                    if query.dim() == 4:
+                        out = out.transpose(1, 2)  # [B, seq_len, num_heads, head_dim]
+                    return out
+                else:
+                    raise
+        
+        xops.memory_efficient_attention = patched_memory_efficient_attention
+except ImportError:
+    # xformers not available, nothing to patch
+    pass
+
 from .backbone import CNNEncoder
 from .vit_fpn import ViTFeaturePyramid
 from .mv_transformer import (
@@ -13,6 +67,126 @@ from .utils import mv_feature_add_position
 from .dpt_head import DPTHead
 from .ldm_unet.unet import UNetModel, AttentionBlock
 from einops import rearrange
+
+
+def _patch_dinov2_attention(model):
+    """
+    Patch DINOv2 attention layers to use PyTorch's scaled_dot_product_attention
+    instead of xformers. This allows the model to work on macOS where xformers
+    is not available or doesn't support the current device/dtype.
+    """
+    import torch.nn.functional as F
+    
+    def patched_attention_forward(self, qkv, attn_bias=None):
+        """
+        Patched attention forward that uses PyTorch's scaled_dot_product_attention
+        instead of xformers.memory_efficient_attention.
+        """
+        # DINOv2 attention expects qkv in a specific format
+        # The original uses xformers.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        # We need to extract q, k, v from the attention module's internal structure
+        
+        # Try to get q, k, v from the module's internal state
+        # The attention module in DINOv2 processes qkv internally
+        # We need to patch at the block level, not the attention level
+        
+        # For now, we'll patch the block's attention forward method
+        # The actual patching happens in the block's forward method
+        pass
+    
+    # Patch all attention blocks in the model
+    for name, module in model.named_modules():
+        # DINOv2 uses attention layers in blocks
+        # The attention is typically in a 'attn' attribute of blocks
+        if hasattr(module, 'attn') and hasattr(module.attn, 'forward'):
+            original_forward = module.attn.forward
+            
+            def make_patched_forward(orig_fwd, attn_module):
+                def patched_forward(x, attn_bias=None):
+                    # Try to use PyTorch's attention if xformers fails
+                    try:
+                        return orig_fwd(x, attn_bias=attn_bias)
+                    except (NotImplementedError, RuntimeError) as e:
+                        # If xformers fails (e.g., on CPU or unsupported dtype),
+                        # fall back to PyTorch's scaled_dot_product_attention
+                        if 'memory_efficient_attention' in str(e) or 'xformers' in str(e).lower():
+                            # Extract q, k, v from the attention module
+                            # DINOv2 attention structure: it has qkv projection
+                            if hasattr(attn_module, 'qkv'):
+                                qkv_proj = attn_module.qkv(x)
+                                # Reshape and split qkv
+                                # Format depends on DINOv2's internal structure
+                                # This is a simplified version - may need adjustment
+                                B, N, C = qkv_proj.shape
+                                head_dim = C // (3 * attn_module.num_heads)
+                                qkv = qkv_proj.reshape(B, N, 3, attn_module.num_heads, head_dim)
+                                q, k, v = qkv.permute(2, 0, 3, 1, 4)  # [3, B, num_heads, N, head_dim]
+                                q, k, v = q[0], k[1], v[2]  # Extract q, k, v
+                                
+                                # Use PyTorch's scaled_dot_product_attention
+                                out = F.scaled_dot_product_attention(q, k, v, attn_bias=attn_bias)
+                                
+                                # Reshape back
+                                out = out.reshape(B, N, C)
+                                
+                                # Apply output projection if exists
+                                if hasattr(attn_module, 'proj'):
+                                    out = attn_module.proj(out)
+                                
+                                return out
+                            else:
+                                # Fallback: re-raise the original error
+                                raise
+                        else:
+                            raise
+                
+                return patched_forward
+            
+            module.attn.forward = make_patched_forward(original_forward, module.attn)
+    
+    # Also patch the xformers import at the module level if possible
+    # This is a more aggressive approach - monkey-patch xformers.ops.memory_efficient_attention
+    try:
+        import xformers.ops as xops
+        original_mea = xops.memory_efficient_attention
+        
+        def patched_memory_efficient_attention(query, key, value, attn_bias=None, p=0.0, scale=None):
+            try:
+                return original_mea(query, key, value, attn_bias=attn_bias, p=p, scale=scale)
+            except (NotImplementedError, RuntimeError) as e:
+                # Fall back to PyTorch's attention
+                if 'memory_efficient_attention' in str(e) or 'xformers' in str(e).lower() or 'not supported' in str(e).lower():
+                    # Convert to format expected by scaled_dot_product_attention
+                    # xformers format: (batch, seq_len, num_heads, head_dim)
+                    # PyTorch format: (batch, num_heads, seq_len, head_dim)
+                    q = query.transpose(1, 2) if query.dim() == 4 else query
+                    k = key.transpose(1, 2) if key.dim() == 4 else key
+                    v = value.transpose(1, 2) if value.dim() == 4 else value
+                    
+                    # Handle attn_bias if provided (simplified - may need more work for complex biases)
+                    attn_mask = None
+                    if attn_bias is not None:
+                        # Convert attn_bias to attn_mask format if needed
+                        # This is a simplified conversion
+                        if hasattr(attn_bias, 'materialize'):
+                            # xformers LowerTriangularMask or similar
+                            attn_mask = attn_bias.materialize((query.shape[0], query.shape[1], key.shape[1]), 
+                                                             device=query.device, dtype=query.dtype)
+                        elif isinstance(attn_bias, torch.Tensor):
+                            attn_mask = attn_bias
+                    
+                    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p, scale=scale)
+                    
+                    # Convert back to xformers format
+                    out = out.transpose(1, 2) if out.dim() == 4 else out
+                    return out
+                else:
+                    raise
+        
+        xops.memory_efficient_attention = patched_memory_efficient_attention
+    except ImportError:
+        # xformers not available, nothing to patch
+        pass
 
 
 class MultiViewUniMatch(nn.Module):
@@ -83,6 +257,10 @@ class MultiViewUniMatch(nn.Module):
         )
 
         del self.pretrained.mask_token  # unused
+        
+        # Patch DINOv2 attention to use PyTorch's scaled_dot_product_attention
+        # instead of xformers (for macOS compatibility)
+        _patch_dinov2_attention(self.pretrained)
 
         if self.num_scales > 1:
             # generate multi-scale features

@@ -2,11 +2,22 @@ import torch
 from jaxtyping import Float, Shaped
 from torch import Tensor
 
-from ..model.decoder.cuda_splatting import render_cuda_orthographic
 from ..model.types import Gaussians
 from ..visualization.annotation import add_label
 from ..visualization.drawing.cameras import draw_cameras
 from .drawing.cameras import compute_equal_aabb_with_margin
+
+
+def _get_render_cuda_orthographic():
+    """Lazy import of render_cuda_orthographic to avoid requiring diff-gaussian-rasterization."""
+    try:
+        from ..model.decoder.cuda_splatting import render_cuda_orthographic
+        return render_cuda_orthographic
+    except ImportError as e:
+        raise ImportError(
+            "render_cuda_orthographic requires diff-gaussian-rasterization, "
+            "which is not available. This function is only needed for visualization."
+        ) from e
 
 
 def pad(images: list[Shaped[Tensor, "..."]]) -> list[Shaped[Tensor, "..."]]:
@@ -65,6 +76,7 @@ def render_projections(
         width = extents[:, right_axis]
         height = extents[:, down_axis]
 
+        render_cuda_orthographic = _get_render_cuda_orthographic()
         projection = render_cuda_orthographic(
             extrinsics,
             width,

@@ -4,7 +4,8 @@ import numpy as np
 from read_write_model import read_cameras_binary, read_images_binary, qvec2rotmat
 
 # Define the path to your sparse model directory
-model_path = "/Users/quinton/Desktop/colmap_output/sparse/0/"
+#model_path = "/Users/quinton/Desktop/colmap_output/sparse/0/"
+model_path = "/Users/quinton/Desktop/colmap_output_hillman/sparse/0/"
 image_names_to_print = ["frame_0017.png", "frame_0025.png", "frame_0034.png", "frame_0043.png", "frame_0051.png"]
 #image_names_to_print = ["frame_0002.png", "frame_0070.png", "frame_0140.png"]
 

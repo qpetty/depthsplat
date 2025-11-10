@@ -11,12 +11,16 @@ try:
         from xformers.ops import memory_efficient_attention, unbind
 
         XFORMERS_AVAILABLE = True
+        USE_XFORMERS = True
         # warnings.warn("xFormers is available (Attention)")
     else:
         # warnings.warn("xFormers is disabled (Attention)")
         raise ImportError
 except ImportError:
     XFORMERS_AVAILABLE = False
+    USE_XFORMERS = False
+    # Use torch.unbind instead of xformers.unbind
+    unbind = torch.unbind
     # warnings.warn("xFormers is not available (Attention)")
 
 
@@ -33,7 +37,8 @@ class CrossAttention(nn.Module):
     ):
         super().__init__()
 
-        assert XFORMERS_AVAILABLE
+        # Remove assert - allow it to work without xformers
+        # assert XFORMERS_AVAILABLE
 
         if out_dim is None:
             out_dim = in_dim1
@@ -53,8 +58,18 @@ class CrossAttention(nn.Module):
         kv = self.kv(y).reshape(b, n2, 2, self.num_heads, c // self.num_heads)
         k, v = unbind(kv, 2)
 
-        x = memory_efficient_attention(q, k, v)
-        x = x.reshape(b, n1, c)
+        # Use xformers if available, otherwise use PyTorch's scaled_dot_product_attention
+        if USE_XFORMERS:
+            x = memory_efficient_attention(q, k, v)
+            x = x.reshape(b, n1, c)
+        else:
+            # PyTorch's scaled_dot_product_attention expects (batch, num_heads, seq_len, head_dim)
+            q = q.transpose(1, 2)  # [b, num_heads, n1, head_dim]
+            k = k.transpose(1, 2)  # [b, num_heads, n2, head_dim]
+            v = v.transpose(1, 2)  # [b, num_heads, n2, head_dim]
+            x = F.scaled_dot_product_attention(q, k, v)
+            x = x.transpose(1, 2)  # [b, n1, num_heads, head_dim]
+            x = x.reshape(b, n1, c)
         
         x = self.proj(x)
 

@@ -4,7 +4,8 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-DATASET_PATH = Path("your_dataset_path")
+#DATASET_PATH = Path("your_dataset_path")
+DATASET_PATH = Path("dl3dv-bench-output")
 
 if __name__ == "__main__":
     # "train" or "test"
