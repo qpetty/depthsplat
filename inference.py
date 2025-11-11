@@ -15,8 +15,8 @@ OUTPUT_DIR = "run-output"
 
 # Input image base path (directory containing images and metadata files)
 # Images and metadata files (*_metadata.json) should be in this directory
-IMAGE_BASE_PATH = "/Users/quinton/Desktop/hillman_mov_horizontal"  # Base directory for images
-#IMAGE_BASE_PATH = "/Users/quinton/repos/Image_sender/received_images"
+#IMAGE_BASE_PATH = "/Users/quinton/Desktop/hillman_mov_horizontal"  # Base directory for images
+IMAGE_BASE_PATH = "/Users/quinton/repos/Image_sender/received_images"
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
