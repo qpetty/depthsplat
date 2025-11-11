@@ -1,4 +1,6 @@
 import numpy as np
+import json
+import os
 # Assuming read_write_model.py is in the same directory
 #from read_write_model import read_cameras_binary, read_images_binary, read_points3d_binary
 from read_write_model import read_cameras_binary, read_images_binary, qvec2rotmat
@@ -7,7 +9,7 @@ from read_write_model import read_cameras_binary, read_images_binary, qvec2rotma
 #model_path = "/Users/quinton/Desktop/colmap_output/sparse/0/"
 model_path = "/Users/quinton/Desktop/colmap_output_hillman/sparse/0/"
 image_names_to_print = ["frame_0017.png", "frame_0025.png", "frame_0034.png", "frame_0043.png", "frame_0051.png"]
-#image_names_to_print = ["frame_0002.png", "frame_0070.png", "frame_0140.png"]
+metadata_output_path = "/Users/quinton/Desktop/hillman_mov_horizontal"
 
 # Read the binary files
 cameras = read_cameras_binary(model_path + "cameras.bin")
@@ -174,8 +176,7 @@ print(f"\n--- Extrinsics for Specified Images ---")
 np.set_printoptions(precision=4, suppress=True) # For legible numpy output
 
 # Iterate through all registered images to find the specified ones
-extrinsics_list = []  # Store C2W matrices for EXTRINSICS_HARDCODED
-extrinsics_image_names = []  # Store corresponding image names
+extrinsics_dict = {}  # Store C2W matrices keyed by image name
 
 for img_id, img_data in images.items():
     if img_data.name in image_names_to_print:
@@ -227,17 +228,15 @@ for img_id, img_data in images.items():
             diff = np.abs(camera_center_world - camera_center_verify).max()
             print(f"  ⚠️  WARNING: Camera center mismatch! Max difference: {diff:.6f}")
         
-        # 7. Store for EXTRINSICS_HARDCODED (maintain order from image_names_to_print)
-        extrinsics_list.append(c2w_matrix)
-        extrinsics_image_names.append(img_data.name)
+        # 7. Store extrinsics keyed by image name
+        extrinsics_dict[img_data.name] = c2w_matrix
 
-# Ensure extrinsics are in the same order as image_names_to_print
+# Get ordered extrinsics for scale analysis
 ordered_extrinsics = []
 ordered_names = []
 for img_name in image_names_to_print:
-    if img_name in extrinsics_image_names:
-        idx = extrinsics_image_names.index(img_name)
-        ordered_extrinsics.append(extrinsics_list[idx])
+    if img_name in extrinsics_dict:
+        ordered_extrinsics.append(extrinsics_dict[img_name])
         ordered_names.append(img_name)
 
 # Compute coordinate system scale diagnostics
@@ -280,57 +279,80 @@ if len(ordered_extrinsics) >= 2:
             print("LARGE scale (outdoor/building)")
         print("="*70)
 
-# Print in format ready for inference.py
+# Write JSON metadata files for each image
 print("\n" + "="*70)
-print("COPY THE FOLLOWING TO inference.py:")
+print("WRITING METADATA FILES")
 print("="*70)
 
-# Print IMAGE DIMENSIONS - CRITICAL!
-if camera_used is not None:
-    print("\n" + "="*70)
-    print("IMPORTANT: IMAGE DIMENSIONS")
-    print("="*70)
-    print(f"COLMAP reconstruction used: width={camera_used.width}, height={camera_used.height}")
-    print(f"\nIn inference.py, set:")
-    print(f"  height, width = {camera_used.height}, {camera_used.width}  # Match COLMAP dimensions")
-    print("="*70)
+# Create output directory if it doesn't exist
+os.makedirs(metadata_output_path, exist_ok=True)
+print(f"Output directory: {metadata_output_path}")
 
-# Print INTRINSICS_HARDCODED
-if intrinsics_fx is not None and intrinsics_fy is not None and intrinsics_cx is not None and intrinsics_cy is not None:
-    print("\n# Camera intrinsics (before normalization)")
-    print("# Set to None to use computed values, or provide [fx, fy, cx, cy] in pixels")
-    print("# If provided, will be normalized by image dimensions automatically")
-    print("# IMPORTANT: Make sure image dimensions in inference.py match COLMAP dimensions above!")
-    print("INTRINSICS_HARDCODED = None")
-    print("# Example (uncomment to use):")
-    print(f"INTRINSICS_HARDCODED = [{intrinsics_fx:.5f}, {intrinsics_fy:.5f}, {intrinsics_cx:.1f}, {intrinsics_cy:.1f}]  # [fx, fy, cx, cy] in pixels")
-else:
-    print("\n# WARNING: Could not extract intrinsics.")
+# Check if we have all required data
+if camera_used is None:
+    print("\nERROR: No camera found. Cannot write metadata files.")
+    print("  Check that:")
+    print("  1. The model_path points to the correct COLMAP sparse reconstruction")
+    print("  2. The cameras.bin file exists and is readable")
+    print("  3. The reconstruction contains at least one camera")
+elif intrinsics_fx is None or intrinsics_fy is None or intrinsics_cx is None or intrinsics_cy is None:
+    print("\nERROR: Could not extract intrinsics. Cannot write metadata files.")
     if camera_used is not None:
-        print(f"#   Camera model found: {camera_used.model}")
-        print(f"#   Camera params: {camera_used.params}")
-        print(f"#   Number of params: {len(camera_used.params)}")
-        print("#   Please check the diagnostic output above for details.")
+        print(f"  Camera model found: {camera_used.model}")
+        print(f"  Camera params: {camera_used.params}")
+        print(f"  Number of params: {len(camera_used.params)}")
+        print("  Please check the diagnostic output above for details.")
+else:
+    # Prepare intrinsics as 3x3 matrix flattened row-major: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+    intrinsics_matrix = np.array([
+        [float(intrinsics_fx), 0, float(intrinsics_cx)],
+        [0, float(intrinsics_fy), float(intrinsics_cy)],
+        [0, 0, 1]
+    ])
+    intrinsics = intrinsics_matrix.flatten().tolist()
+    
+    # Determine orientation based on width vs height
+    width = int(camera_used.width)
+    height = int(camera_used.height)
+    if width > height:
+        orientation = "landscapeLeft"
+    elif height > width:
+        orientation = "portrait"
     else:
-        print("#   No camera was found. Check that:")
-        print("#   1. The model_path points to the correct COLMAP sparse reconstruction")
-        print("#   2. The cameras.bin file exists and is readable")
-        print("#   3. The reconstruction contains at least one camera")
-
-# Print EXTRINSICS_HARDCODED as a dictionary
-print("\n# Camera extrinsics (4x4 camera-to-world matrices)")
-print("# Set to None to use computed poses, or provide a dictionary mapping image filenames to numpy arrays")
-print("# Each matrix should be 4x4 in shape")
-print("# Keys are image filenames (e.g., 'frame_0002.png'), values are 4x4 C2W matrices")
-print("EXTRINSICS_HARDCODED = None")
-print("# Example (uncomment to use - note: numpy is already imported as np):")
-print("EXTRINSICS_HARDCODED = {")
-for i, c2w in enumerate(ordered_extrinsics):
-    img_name = ordered_names[i] if i < len(ordered_names) else f"View {i}"
-    print(f"    \"{img_name}\": np.array([")
-    for row in c2w:
-        print(f"        [{row[0]:.4f}, {row[1]:.4f}, {row[2]:.4f}, {row[3]:.4f}],")
-    print(f"    ], dtype=np.float32),")
-print("}")
-
-print("\n" + "="*70)
+        orientation = "landscapeLeft"  # Default for square images
+    
+    # Write JSON file for each image
+    files_written = 0
+    for img_name in image_names_to_print:
+        if img_name in extrinsics_dict:
+            # Prepare extrinsics as 4x4 matrix flattened row-major (16 elements)
+            c2w_matrix = extrinsics_dict[img_name]
+            extrinsics = c2w_matrix.flatten().tolist()
+            
+            # Create metadata dictionary
+            metadata = {
+                "image_size": width * height,
+                "extrinsics": extrinsics,
+                "intrinsics": intrinsics,
+                "image_width": width,
+                "image_height": height,
+                "orientation": orientation
+            }
+            
+            # Create output filename: {image_name}_metadata.json
+            # Remove extension from image name and add _metadata.json
+            base_name = os.path.splitext(img_name)[0]
+            output_filename = f"{base_name}_metadata.json"
+            output_path = os.path.join(metadata_output_path, output_filename)
+            
+            # Write JSON file
+            with open(output_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"  ✓ Written: {output_filename}")
+            files_written += 1
+        else:
+            print(f"  ⚠️  Skipped: {img_name} (not found in reconstruction)")
+    
+    print(f"\nSuccessfully wrote {files_written} metadata file(s) to {metadata_output_path}")
+    print("="*70)

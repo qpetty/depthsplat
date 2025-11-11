@@ -18,6 +18,7 @@ OUTPUT_DIR = "run-output"
 #   IMAGE_BASE_PATH / image_filename (where image_filename is a key in EXTRINSICS_HARDCODED)
 # Set to None to use random images
 IMAGE_BASE_PATH = "/Users/quinton/Desktop/hillman_mov_horizontal"  # Base directory for images
+# IMAGE_BASE_PATH = "/Users/quinton/repos/Image_sender/received_images"
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
@@ -53,24 +54,24 @@ EXTRINSICS_HARDCODED = {
         [0.9766, 0.0605, 0.2062, 2.4196],
         [0.0000, 0.0000, 0.0000, 1.0000],
     ], dtype=np.float32),
-    "frame_0025.png": np.array([
-        [0.3673, -0.0574, -0.9283, 3.8409],
-        [-0.0363, 0.9964, -0.0760, 0.1100],
-        [0.9294, 0.0616, 0.3639, 1.6217],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
+    # "frame_0025.png": np.array([
+    #     [0.3673, -0.0574, -0.9283, 3.8409],
+    #     [-0.0363, 0.9964, -0.0760, 0.1100],
+    #     [0.9294, 0.0616, 0.3639, 1.6217],
+    #     [0.0000, 0.0000, 0.0000, 1.0000],
+    # ], dtype=np.float32),
     "frame_0034.png": np.array([
         [0.5372, -0.0551, -0.8417, 3.4024],
         [-0.0238, 0.9965, -0.0804, 0.1335],
         [0.8431, 0.0632, 0.5340, 0.7633],
         [0.0000, 0.0000, 0.0000, 1.0000],
     ], dtype=np.float32),
-    "frame_0043.png": np.array([
-        [0.6923, -0.0511, -0.7198, 2.7938],
-        [-0.0104, 0.9967, -0.0808, 0.1430],
-        [0.7216, 0.0634, 0.6894, -0.0107],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
+    # "frame_0043.png": np.array([
+    #     [0.6923, -0.0511, -0.7198, 2.7938],
+    #     [-0.0104, 0.9967, -0.0808, 0.1430],
+    #     [0.7216, 0.0634, 0.6894, -0.0107],
+    #     [0.0000, 0.0000, 0.0000, 1.0000],
+    # ], dtype=np.float32),
     "frame_0051.png": np.array([
         [0.8075, -0.0494, -0.5878, 2.1365],
         [0.0020, 0.9967, -0.0810, 0.1406],
@@ -105,6 +106,113 @@ import torchvision.transforms as tf
 from src.geometry.projection import get_fov
 from src.dataset.shims.bounds_shim import compute_depth_for_disparity
 from scipy.spatial.transform import Rotation as R
+import json
+
+
+def load_metadata_from_json(image_base_path: str, image_filename: str) -> dict:
+    """
+    Load camera metadata from JSON file.
+    
+    Args:
+        image_base_path: Base directory containing metadata files
+        image_filename: Image filename (e.g., 'frame_0017.png')
+    
+    Returns:
+        Dictionary with 'intrinsics', 'extrinsics', 'image_width', 'image_height', etc.
+        Returns None if file not found.
+    """
+    base_name = Path(image_filename).stem  # Remove extension
+    metadata_path = Path(image_base_path) / f"{base_name}_metadata.json"
+    
+    if not metadata_path.exists():
+        return None
+    
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    
+    return metadata
+
+
+def load_intrinsics_extrinsics_from_metadata(image_base_path: str) -> tuple:
+    """
+    Load intrinsics and extrinsics from JSON metadata files in the image directory.
+    
+    Looks for files matching pattern: {image_name}_metadata.json
+    
+    Args:
+        image_base_path: Base directory containing images and metadata files
+    
+    Returns:
+        Tuple of (intrinsics_dict, extrinsics_dict) where:
+        - intrinsics_dict: Dictionary mapping image filenames to [fx, fy, cx, cy]
+        - extrinsics_dict: Dictionary mapping image filenames to 4x4 C2W numpy arrays
+        Returns (None, None) if no metadata files found or if image_base_path is None
+    """
+    if image_base_path is None:
+        return None, None
+    
+    base_path = Path(image_base_path)
+    if not base_path.exists():
+        return None, None
+    
+    # Find all metadata JSON files
+    metadata_files = list(base_path.glob("*_metadata.json"))
+    
+    if len(metadata_files) == 0:
+        return None, None
+    
+    intrinsics_dict = {}
+    extrinsics_dict = {}
+    
+    for metadata_file in metadata_files:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        
+        # Extract image filename from metadata filename
+        # e.g., "frame_0017_metadata.json" -> "frame_0017.png"
+        # We need to find the actual image file to get the extension
+        base_name = metadata_file.stem.replace("_metadata", "")
+        
+        # Try common image extensions
+        image_extensions = ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG']
+        image_filename = None
+        for ext in image_extensions:
+            candidate = base_path / f"{base_name}{ext}"
+            if candidate.exists():
+                image_filename = candidate.name
+                break
+        
+        # If no image found, use .png as default
+        if image_filename is None:
+            image_filename = f"{base_name}.png"
+        
+        # Parse intrinsics from flattened 3x3 matrix
+        # Format: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+        intrinsics_flat = metadata.get("intrinsics", [])
+        if len(intrinsics_flat) == 9:
+            fx = intrinsics_flat[0]
+            fy = intrinsics_flat[4]
+            cx = intrinsics_flat[2]
+            cy = intrinsics_flat[5]
+            intrinsics_dict[image_filename] = [fx, fy, cx, cy]
+        else:
+            print(f"  WARNING: Invalid intrinsics format in {metadata_file.name}, expected 9 elements, got {len(intrinsics_flat)}")
+            continue
+        
+        # Parse extrinsics from flattened 4x4 matrix
+        # Format: 16 elements in row-major order
+        extrinsics_flat = metadata.get("extrinsics", [])
+        if len(extrinsics_flat) == 16:
+            extrinsics_matrix = np.array(extrinsics_flat, dtype=np.float32).reshape(4, 4)
+            extrinsics_dict[image_filename] = extrinsics_matrix
+        else:
+            print(f"  WARNING: Invalid extrinsics format in {metadata_file.name}, expected 16 elements, got {len(extrinsics_flat)}")
+            continue
+    
+    if len(intrinsics_dict) == 0:
+        return None, None
+    
+    return intrinsics_dict, extrinsics_dict
 
 
 def create_rotation_matrix_y(angle_degrees: float) -> torch.Tensor:
@@ -178,6 +286,25 @@ def create_camera_pose(rotation: torch.Tensor, translation: torch.Tensor = None)
     pose[:3, :3] = rotation
     pose[:3, 3] = translation
     return pose
+
+
+def get_image_dimensions(image_path: str) -> tuple[int, int]:
+    """
+    Get the dimensions of an image without loading the full image data.
+    
+    Args:
+        image_path: Path to image file
+    
+    Returns:
+        Tuple of (height, width)
+    """
+    if image_path is None or not Path(image_path).exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    
+    # Load image to get dimensions
+    image = load_image(image_path)  # [3, H, W] in range [0, 1]
+    height, width = image.shape[1], image.shape[2]
+    return height, width
 
 
 def load_and_resize_image(image_path: str, target_size: tuple[int, int]) -> torch.Tensor:
@@ -262,6 +389,47 @@ def main():
     else:
         device = "cpu"
     print(f"Using device: {device}")
+    
+    # Load intrinsics and extrinsics from JSON metadata files if available
+    # This will override hardcoded values if metadata files are found
+    global INTRINSICS_HARDCODED, EXTRINSICS_HARDCODED
+    print("\n" + "="*70)
+    print("Loading Camera Metadata")
+    print("="*70)
+    
+    intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_metadata(IMAGE_BASE_PATH)
+    
+    if intrinsics_from_metadata is not None and extrinsics_from_metadata is not None:
+        print(f"  Found {len(extrinsics_from_metadata)} metadata file(s) in {IMAGE_BASE_PATH}")
+        
+        # Use metadata to populate EXTRINSICS_HARDCODED
+        # If EXTRINSICS_HARDCODED was already set, metadata takes precedence
+        EXTRINSICS_HARDCODED = extrinsics_from_metadata
+        print(f"  Loaded extrinsics for {len(EXTRINSICS_HARDCODED)} image(s)")
+        
+        # For intrinsics, we need to handle per-image intrinsics
+        # If all images have the same intrinsics, use the first one
+        # Otherwise, we'll need to handle per-image intrinsics later
+        intrinsics_values = list(intrinsics_from_metadata.values())
+        if len(set(tuple(v) for v in intrinsics_values)) == 1:
+            # All images have the same intrinsics
+            INTRINSICS_HARDCODED = intrinsics_values[0]
+            print(f"  Loaded intrinsics: fx={INTRINSICS_HARDCODED[0]:.2f}, fy={INTRINSICS_HARDCODED[1]:.2f}, "
+                  f"cx={INTRINSICS_HARDCODED[2]:.2f}, cy={INTRINSICS_HARDCODED[3]:.2f}")
+        else:
+            # Different intrinsics per image - use first one and warn
+            INTRINSICS_HARDCODED = intrinsics_values[0]
+            first_image = list(intrinsics_from_metadata.keys())[0]
+            print(f"  WARNING: Images have different intrinsics. Using intrinsics from {first_image}")
+            print(f"  Loaded intrinsics: fx={INTRINSICS_HARDCODED[0]:.2f}, fy={INTRINSICS_HARDCODED[1]:.2f}, "
+                  f"cx={INTRINSICS_HARDCODED[2]:.2f}, cy={INTRINSICS_HARDCODED[3]:.2f}")
+    else:
+        if IMAGE_BASE_PATH is not None:
+            print(f"  No metadata files found in {IMAGE_BASE_PATH}")
+            print(f"  Using hardcoded values (if set) or computed defaults")
+        else:
+            print(f"  IMAGE_BASE_PATH is None, skipping metadata loading")
+            print(f"  Using hardcoded values (if set) or computed defaults")
 
     # Load encoder config
     print("\n" + "="*70)
@@ -299,12 +467,6 @@ def main():
     else:
         print("\nNo checkpoint path provided. Using randomly initialized weights.")
 
-    # Create input with resolution matching COLMAP reconstruction
-    # NOTE: Dimensions must match what COLMAP used during reconstruction
-    # Based on principal point analysis: COLMAP used width=512, height=960
-    batch_size = 1
-    height, width = 512, 960  # FIXED: Match COLMAP dimensions (was 512, 960)
-
     # Determine number of views and image paths from EXTRINSICS_HARDCODED
     image_paths = []
     image_filenames = []
@@ -332,6 +494,52 @@ def main():
         num_views = 3
         image_paths = []
         image_filenames = []
+
+    # Create input with resolution matching COLMAP reconstruction
+    # NOTE: Dimensions must match what COLMAP used during reconstruction
+    # Try to get dimensions from first image, then metadata, otherwise use defaults
+    batch_size = 1
+    height, width = 512, 960  # Default dimensions
+    
+    # First, try to read dimensions from the first input image
+    if image_paths and len(image_paths) > 0:
+        try:
+            first_image_path = image_paths[0]
+            height, width = get_image_dimensions(first_image_path)
+            print(f"\n  Read image dimensions from first image ({Path(first_image_path).name}): height={height}, width={width}")
+        except Exception as e:
+            print(f"\n  WARNING: Could not read dimensions from first image: {e}")
+            # Fall back to metadata or defaults
+            if intrinsics_from_metadata is not None and extrinsics_from_metadata is not None:
+                first_image_filename = list(extrinsics_from_metadata.keys())[0]
+                metadata = load_metadata_from_json(IMAGE_BASE_PATH, first_image_filename)
+                if metadata is not None:
+                    if "image_height" in metadata and "image_width" in metadata:
+                        height = int(metadata["image_height"])
+                        width = int(metadata["image_width"])
+                        print(f"  Using image dimensions from metadata: height={height}, width={width}")
+                    else:
+                        print(f"  WARNING: Metadata file for {first_image_filename} missing image_height/image_width")
+                        print(f"  Using default dimensions: height={height}, width={width}")
+            else:
+                print(f"  Using default dimensions: height={height}, width={width}")
+    else:
+        # No image paths available, try metadata or use defaults
+        if intrinsics_from_metadata is not None and extrinsics_from_metadata is not None:
+            first_image_filename = list(extrinsics_from_metadata.keys())[0]
+            metadata = load_metadata_from_json(IMAGE_BASE_PATH, first_image_filename)
+            if metadata is not None:
+                if "image_height" in metadata and "image_width" in metadata:
+                    height = int(metadata["image_height"])
+                    width = int(metadata["image_width"])
+                    print(f"\n  Using image dimensions from metadata: height={height}, width={width}")
+                else:
+                    print(f"\n  WARNING: Metadata file for {first_image_filename} missing image_height/image_width")
+                    print(f"  Using default dimensions: height={height}, width={width}")
+            else:
+                print(f"\n  Using default dimensions: height={height}, width={width}")
+        else:
+            print(f"\n  Using default dimensions: height={height}, width={width}")
 
     # Load images from paths or generate random ones
     print("\n" + "="*70)

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 # Patch xformers globally to use PyTorch's attention as fallback (for macOS compatibility)
 # This needs to happen before DINOv2 is loaded
@@ -438,7 +439,16 @@ class MultiViewUniMatch(nn.Module):
 
         # list of features, resolution low to high
         # list of [BV, C, H, W]
+        cnn_feature_start = time.perf_counter()
+        cnn_feature_start_wall = time.time()
+        print(f"      [MultiViewUniMatch] CNN feature extraction start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cnn_feature_start_wall))}")
+        
         features_list_cnn = self.extract_feature(images)
+        
+        cnn_feature_end = time.perf_counter()
+        cnn_feature_end_wall = time.time()
+        cnn_feature_elapsed = cnn_feature_end - cnn_feature_start
+        print(f"      [MultiViewUniMatch] CNN feature extraction end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cnn_feature_end_wall))} (elapsed: {cnn_feature_elapsed:.3f}s)")
         features_list_cnn_all_scales = features_list_cnn
         features_list_cnn = features_list_cnn[: self.num_scales]
         results_dict.update({"features_cnn_all_scales": features_list_cnn_all_scales})
@@ -459,11 +469,21 @@ class MultiViewUniMatch(nn.Module):
                 rearrange(features_cnn_pos, "(b v) c h w -> b v c h w", b=b, v=v), dim=1
             )
         )
+        
+        mv_transformer_start = time.perf_counter()
+        mv_transformer_start_wall = time.time()
+        print(f"      [MultiViewUniMatch] Multi-view transformer start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mv_transformer_start_wall))}")
+        
         features_list_mv = self.transformer(
             features_list,
             attn_num_splits=attn_splits,
             nn_matrix=nn_matrix,
         )
+        
+        mv_transformer_end = time.perf_counter()
+        mv_transformer_end_wall = time.time()
+        mv_transformer_elapsed = mv_transformer_end - mv_transformer_start
+        print(f"      [MultiViewUniMatch] Multi-view transformer end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mv_transformer_end_wall))} (elapsed: {mv_transformer_elapsed:.3f}s)")
 
         features_mv = rearrange(
             torch.stack(features_list_mv, dim=1), "b v c h w -> (b v) c h w"
@@ -493,6 +513,10 @@ class MultiViewUniMatch(nn.Module):
             "vitl": [4, 11, 17, 23],
         }
 
+        mono_feature_start = time.perf_counter()
+        mono_feature_start_wall = time.time()
+        print(f"      [MultiViewUniMatch] Monocular feature extraction (DINOv2) start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mono_feature_start_wall))}")
+        
         mono_intermediate_features = list(
             self.pretrained.get_intermediate_layers(
                 concat, intermediate_layer_idx[self.vit_type], return_class_token=False
@@ -514,6 +538,11 @@ class MultiViewUniMatch(nn.Module):
                 align_corners=True,
             )
             mono_intermediate_features[i] = curr_features
+        
+        mono_feature_end = time.perf_counter()
+        mono_feature_end_wall = time.time()
+        mono_feature_elapsed = mono_feature_end - mono_feature_start
+        print(f"      [MultiViewUniMatch] Monocular feature extraction (DINOv2) end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mono_feature_end_wall))} (elapsed: {mono_feature_elapsed:.3f}s)")
 
         results_dict.update({"features_mono_intermediate": mono_intermediate_features})
 
@@ -536,7 +565,13 @@ class MultiViewUniMatch(nn.Module):
 
         depth = None
 
+        multiscale_loop_start = time.perf_counter()
+        multiscale_loop_start_wall = time.time()
+        print(f"      [MultiViewUniMatch] Multi-scale depth prediction loop start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(multiscale_loop_start_wall))} (num_scales={self.num_scales})")
+
         for scale_idx in range(self.num_scales):
+            scale_start = time.perf_counter()
+            print(f"        [MultiViewUniMatch] Processing scale {scale_idx+1}/{self.num_scales}...")
             downsample_factor = self.upsample_factor * (
                 2 ** (self.num_scales - 1 - scale_idx)
             )
@@ -659,6 +694,8 @@ class MultiViewUniMatch(nn.Module):
                 1, tgt_features.size(1), 1, 1
             )  # [BV, V-1, 3, 3]
 
+            cost_volume_start = time.perf_counter()
+            
             warped_tgt_features = warp_with_pose_depth_candidates(
                 rearrange(tgt_features, "b v ... -> (b v) ..."),
                 rearrange(intrinsics_input, "b v ... -> (b v) ..."),
@@ -681,6 +718,10 @@ class MultiViewUniMatch(nn.Module):
                 (ref_features.unsqueeze(-3).unsqueeze(1) * warped_tgt_features).sum(2)
                 / (c**0.5)
             ).mean(1)
+            
+            cost_volume_end = time.perf_counter()
+            cost_volume_elapsed = cost_volume_end - cost_volume_start
+            print(f"          [MultiViewUniMatch] Scale {scale_idx+1} cost volume building: {cost_volume_elapsed:.3f}s")
 
             # regressor
             features_cnn = features_list_cnn[scale_idx]  # [BV, C, H, W]
@@ -691,6 +732,8 @@ class MultiViewUniMatch(nn.Module):
                 (cost_volume, features_cnn, features_mv, features_mono), dim=1
             )
 
+            regressor_start = time.perf_counter()
+            
             out = self.regressor[scale_idx](concat) + self.regressor_residual[
                 scale_idx
             ](concat)
@@ -699,6 +742,11 @@ class MultiViewUniMatch(nn.Module):
             match_prob = F.softmax(
                 self.depth_head[scale_idx](out), dim=1
             )  # [BV, D, H, W]
+            
+            regressor_end = time.perf_counter()
+            regressor_elapsed = regressor_end - regressor_start
+            print(f"          [MultiViewUniMatch] Scale {scale_idx+1} regressor + depth head: {regressor_elapsed:.3f}s")
+            
             match_probs.append(match_prob)
 
             if scale_idx == 0:
@@ -720,6 +768,8 @@ class MultiViewUniMatch(nn.Module):
 
             # final output, learned upsampler
             if scale_idx == self.num_scales - 1:
+                upsampler_start = time.perf_counter()
+                
                 residual_depth = self.upsampler(
                     mono_intermediate_features,
                     # resolution high to low
@@ -739,18 +789,47 @@ class MultiViewUniMatch(nn.Module):
                 depth = (depth_bilinear + residual_depth).clamp(
                     min=min_depth.view(-1, 1, 1, 1), max=max_depth.view(-1, 1, 1, 1)
                 )
+                
+                upsampler_end = time.perf_counter()
+                upsampler_elapsed = upsampler_end - upsampler_start
+                print(f"          [MultiViewUniMatch] Final upsampler: {upsampler_elapsed:.3f}s")
 
                 depth_preds.append(depth)
+            
+            scale_end = time.perf_counter()
+            scale_elapsed = scale_end - scale_start
+            print(f"        [MultiViewUniMatch] Scale {scale_idx+1} total: {scale_elapsed:.3f}s")
+
+        multiscale_loop_end = time.perf_counter()
+        multiscale_loop_end_wall = time.time()
+        multiscale_loop_elapsed = multiscale_loop_end - multiscale_loop_start
+        print(f"      [MultiViewUniMatch] Multi-scale depth prediction loop end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(multiscale_loop_end_wall))} (elapsed: {multiscale_loop_elapsed:.3f}s)")
 
         # convert inverse depth to depth
+        depth_convert_start = time.perf_counter()
+        
         for i in range(len(depth_preds)):
             depth_pred = 1.0 / depth_preds[i].squeeze(1)  # [BV, H, W]
             depth_preds[i] = rearrange(
                 depth_pred, "(b v) ... -> b v ...", b=b, v=v
             )  # [B, V, H, W]
+        
+        depth_convert_end = time.perf_counter()
+        depth_convert_elapsed = depth_convert_end - depth_convert_start
+        print(f"      [MultiViewUniMatch] Depth conversion (inverse to depth): {depth_convert_elapsed:.3f}s")
 
         results_dict.update({"depth_preds": depth_preds})
         results_dict.update({"match_probs": match_probs})
+
+        # Print MultiViewUniMatch component timing summary
+        print(f"      [MultiViewUniMatch] Component timing summary:")
+        print(f"        CNN feature extraction: {cnn_feature_elapsed:.3f}s")
+        print(f"        Multi-view transformer: {mv_transformer_elapsed:.3f}s")
+        print(f"        Monocular feature extraction (DINOv2): {mono_feature_elapsed:.3f}s")
+        print(f"        Multi-scale depth prediction loop: {multiscale_loop_elapsed:.3f}s")
+        print(f"        Depth conversion: {depth_convert_elapsed:.3f}s")
+        total_mv_unimatch_time = cnn_feature_elapsed + mv_transformer_elapsed + mono_feature_elapsed + multiscale_loop_elapsed + depth_convert_elapsed
+        print(f"        Total MultiViewUniMatch time: {total_mv_unimatch_time:.3f}s")
 
         return results_dict
 
