@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+from contextlib import nullcontext
 
 # Patch xformers globally to use PyTorch's attention as fallback (for macOS compatibility)
 # This needs to happen before DINOv2 is loaded
@@ -564,241 +565,250 @@ class MultiViewUniMatch(nn.Module):
         results_dict.update({"features_mono": features_list_mono})
 
         depth = None
+        device_type = images.device.type
+        use_autocast = device_type in ("cuda", "mps")
+        autocast_dtype = torch.float16 if device_type == "cuda" else torch.float16
+        autocast_context = (
+            torch.autocast(device_type=device_type, dtype=autocast_dtype)
+            if use_autocast
+            else nullcontext()
+        )
 
         multiscale_loop_start = time.perf_counter()
         multiscale_loop_start_wall = time.time()
         print(f"      [MultiViewUniMatch] Multi-scale depth prediction loop start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(multiscale_loop_start_wall))} (num_scales={self.num_scales})")
 
-        for scale_idx in range(self.num_scales):
-            scale_start = time.perf_counter()
-            print(f"        [MultiViewUniMatch] Processing scale {scale_idx+1}/{self.num_scales}...")
-            downsample_factor = self.upsample_factor * (
-                2 ** (self.num_scales - 1 - scale_idx)
-            )
-
-            # scale intrinsics
-            intrinsics_curr = intrinsics.clone()  # [B, V, 3, 3]
-            intrinsics_curr[:, :, :2] = intrinsics_curr[:, :, :2] / downsample_factor
-
-            # build cost volume
-            features_mv = features_list_mv[scale_idx]  # [BV, C, H, W]
-
-            # list of [B, C, H, W]
-            features_mv_curr = list(
-                torch.unbind(
-                    rearrange(features_mv, "(b v) c h w -> b v c h w", b=b, v=v), dim=1
-                )
-            )
-
-            intrinsics_curr = list(
-                torch.unbind(intrinsics_curr, dim=1)
-            )  # list of [B, 3, 3]
-            extrinsics_curr = list(torch.unbind(extrinsics, dim=1))  # list of [B, 4, 4]
-
-            # ref: [BV, C, H, W], [BV, 3, 3], [BV, 4, 4]
-            # tgt: [BV, V-1, C, H, W], [BV, V-1, 3, 3], [BV, V-1, 4, 4]
-            (
-                ref_features,
-                ref_intrinsics,
-                ref_extrinsics,
-                tgt_features,
-                tgt_intrinsics,
-                tgt_extrinsics,
-            ) = batch_features_camera_parameters(
-                features_mv_curr,
-                intrinsics_curr,
-                extrinsics_curr,
-                nn_matrix=nn_matrix,
-            )
-
-            b_new, _, c, h, w = tgt_features.size()
-
-            # relative pose
-            # extrinsics: c2w
-            pose_curr = torch.matmul(
-                tgt_extrinsics.inverse(), ref_extrinsics.unsqueeze(1)
-            )  # [BV, V-1, 4, 4]
-
-            if scale_idx > 0:
-                # 2x upsample depth
-                assert depth is not None
-                depth = F.interpolate(
-                    depth, scale_factor=2, mode="bilinear", align_corners=True
-                ).detach()
-
-            num_depth_candidates = self.num_depth_candidates // (4**scale_idx)
-
-            # generate depth candidates
-            if scale_idx == 0:
-                # min_depth, max_depth: [BV]
-                depth_interval = (max_depth - min_depth) / (
-                    self.num_depth_candidates - 1
-                )  # [BV]
-
-                linear_space = (
-                    torch.linspace(0, 1, num_depth_candidates)
-                    .type_as(features_list_cnn[0])
-                    .view(1, num_depth_candidates, 1, 1)
-                )  # [1, D, 1, 1]
-
-                depth_candidates = min_depth.view(-1, 1, 1, 1) + linear_space * (
-                    max_depth - min_depth
-                ).view(
-                    -1, 1, 1, 1
-                )  # [BV, D, 1, 1]
-            else:
-                # half interval each scale
-                depth_interval = (
-                    (max_depth - min_depth)
-                    / (self.num_depth_candidates - 1)
-                    / (2**scale_idx)
-                )  # [BV]
-                # [BV, 1, 1, 1]
-                depth_interval = depth_interval.view(-1, 1, 1, 1)
-
-                # [BV, 1, H, W]
-                depth_range_min = (
-                    depth - depth_interval * (num_depth_candidates // 2)
-                ).clamp(min=min_depth.view(-1, 1, 1, 1))
-                depth_range_max = (
-                    depth + depth_interval * (num_depth_candidates // 2 - 1)
-                ).clamp(max=max_depth.view(-1, 1, 1, 1))
-
-                linear_space = (
-                    torch.linspace(0, 1, num_depth_candidates)
-                    .type_as(features_list_cnn[0])
-                    .view(1, num_depth_candidates, 1, 1)
-                )  # [1, D, 1, 1]
-                depth_candidates = depth_range_min + linear_space * (
-                    depth_range_max - depth_range_min
-                )  # [BV, D, H, W]
-
-            if scale_idx == 0:
-                # [BV*(V-1), D, H, W]
-                depth_candidates_curr = (
-                    depth_candidates.unsqueeze(1)
-                    .repeat(1, tgt_features.size(1), 1, h, w)
-                    .view(-1, num_depth_candidates, h, w)
-                )
-            else:
-                depth_candidates_curr = (
-                    depth_candidates.unsqueeze(1)
-                    .repeat(1, tgt_features.size(1), 1, 1, 1)
-                    .view(-1, num_depth_candidates, h, w)
+        with autocast_context:
+            for scale_idx in range(self.num_scales):
+                scale_start = time.perf_counter()
+                print(f"        [MultiViewUniMatch] Processing scale {scale_idx+1}/{self.num_scales}...")
+                downsample_factor = self.upsample_factor * (
+                    2 ** (self.num_scales - 1 - scale_idx)
                 )
 
-            intrinsics_input = torch.stack(intrinsics_curr, dim=1).view(
-                -1, 3, 3
-            )  # [BV, 3, 3]
-            intrinsics_input = intrinsics_input.unsqueeze(1).repeat(
-                1, tgt_features.size(1), 1, 1
-            )  # [BV, V-1, 3, 3]
+                # scale intrinsics
+                intrinsics_curr = intrinsics.clone()  # [B, V, 3, 3]
+                intrinsics_curr[:, :, :2] = intrinsics_curr[:, :, :2] / downsample_factor
 
-            cost_volume_start = time.perf_counter()
-            
-            warped_tgt_features = warp_with_pose_depth_candidates(
-                rearrange(tgt_features, "b v ... -> (b v) ..."),
-                rearrange(intrinsics_input, "b v ... -> (b v) ..."),
-                rearrange(pose_curr, "b v ... -> (b v) ..."),
-                1.0 / depth_candidates_curr,  # convert inverse depth to depth
-                grid_sample_disable_cudnn=self.grid_sample_disable_cudnn,
-            )  # [BV*(V-1), C, D, H, W]
+                # build cost volume
+                features_mv = features_list_mv[scale_idx]  # [BV, C, H, W]
 
-            # ref: [BV, C, H, W]
-            # warped: [BV*(V-1), C, D, H, W] -> [BV, V-1, C, D, H, W]
-            warped_tgt_features = rearrange(
-                warped_tgt_features,
-                "(b v) ... -> b v ...",
-                b=b_new,
-                v=tgt_features.size(1),
-            )
-            # [BV, V-1, D, H, W] -> [BV, D, H, W]
-            # average cross other views
-            cost_volume = (
-                (ref_features.unsqueeze(-3).unsqueeze(1) * warped_tgt_features).sum(2)
-                / (c**0.5)
-            ).mean(1)
-            
-            cost_volume_end = time.perf_counter()
-            cost_volume_elapsed = cost_volume_end - cost_volume_start
-            print(f"          [MultiViewUniMatch] Scale {scale_idx+1} cost volume building: {cost_volume_elapsed:.3f}s")
-
-            # regressor
-            features_cnn = features_list_cnn[scale_idx]  # [BV, C, H, W]
-
-            features_mono = features_list_mono[scale_idx]  # [BV, C, H, W]
-
-            concat = torch.cat(
-                (cost_volume, features_cnn, features_mv, features_mono), dim=1
-            )
-
-            regressor_start = time.perf_counter()
-            
-            out = self.regressor[scale_idx](concat) + self.regressor_residual[
-                scale_idx
-            ](concat)
-
-            # depth pred
-            match_prob = F.softmax(
-                self.depth_head[scale_idx](out), dim=1
-            )  # [BV, D, H, W]
-            
-            regressor_end = time.perf_counter()
-            regressor_elapsed = regressor_end - regressor_start
-            print(f"          [MultiViewUniMatch] Scale {scale_idx+1} regressor + depth head: {regressor_elapsed:.3f}s")
-            
-            match_probs.append(match_prob)
-
-            if scale_idx == 0:
-                # [BV, D, H, W]
-                depth_candidates = depth_candidates.repeat(1, 1, h, w)
-            depth = (match_prob * depth_candidates).sum(
-                dim=1, keepdim=True
-            )  # [BV, 1, H, W]
-
-            # upsample to the original resolution for supervison at training time only
-            if self.training and scale_idx < self.num_scales - 1:
-                depth_bilinear = F.interpolate(
-                    depth,
-                    scale_factor=downsample_factor,
-                    mode="bilinear",
-                    align_corners=True,
-                )
-                depth_preds.append(depth_bilinear)
-
-            # final output, learned upsampler
-            if scale_idx == self.num_scales - 1:
-                upsampler_start = time.perf_counter()
-                
-                residual_depth = self.upsampler(
-                    mono_intermediate_features,
-                    # resolution high to low
-                    cnn_features=features_list_cnn_all_scales[::-1],
-                    mv_features=(
-                        features_mv if self.num_scales == 1 else features_list_mv[::-1]
-                    ),
-                    depth=depth,
+                # list of [B, C, H, W]
+                features_mv_curr = list(
+                    torch.unbind(
+                        rearrange(features_mv, "(b v) c h w -> b v c h w", b=b, v=v), dim=1
+                    )
                 )
 
-                depth_bilinear = F.interpolate(
-                    depth,
-                    scale_factor=self.upsample_factor,
-                    mode="bilinear",
-                    align_corners=True,
-                )
-                depth = (depth_bilinear + residual_depth).clamp(
-                    min=min_depth.view(-1, 1, 1, 1), max=max_depth.view(-1, 1, 1, 1)
-                )
-                
-                upsampler_end = time.perf_counter()
-                upsampler_elapsed = upsampler_end - upsampler_start
-                print(f"          [MultiViewUniMatch] Final upsampler: {upsampler_elapsed:.3f}s")
+                intrinsics_curr = list(
+                    torch.unbind(intrinsics_curr, dim=1)
+                )  # list of [B, 3, 3]
+                extrinsics_curr = list(torch.unbind(extrinsics, dim=1))  # list of [B, 4, 4]
 
-                depth_preds.append(depth)
-            
-            scale_end = time.perf_counter()
-            scale_elapsed = scale_end - scale_start
-            print(f"        [MultiViewUniMatch] Scale {scale_idx+1} total: {scale_elapsed:.3f}s")
+                # ref: [BV, C, H, W], [BV, 3, 3], [BV, 4, 4]
+                # tgt: [BV, V-1, C, H, W], [BV, V-1, 3, 3], [BV, V-1, 4, 4]
+                (
+                    ref_features,
+                    ref_intrinsics,
+                    ref_extrinsics,
+                    tgt_features,
+                    tgt_intrinsics,
+                    tgt_extrinsics,
+                ) = batch_features_camera_parameters(
+                    features_mv_curr,
+                    intrinsics_curr,
+                    extrinsics_curr,
+                    nn_matrix=nn_matrix,
+                )
+
+                b_new, _, c, h, w = tgt_features.size()
+
+                # relative pose
+                # extrinsics: c2w
+                pose_curr = torch.matmul(
+                    tgt_extrinsics.inverse(), ref_extrinsics.unsqueeze(1)
+                )  # [BV, V-1, 4, 4]
+
+                if scale_idx > 0:
+                    # 2x upsample depth
+                    assert depth is not None
+                    depth = F.interpolate(
+                        depth, scale_factor=2, mode="bilinear", align_corners=True
+                    ).detach()
+
+                num_depth_candidates = self.num_depth_candidates // (4**scale_idx)
+
+                # generate depth candidates
+                if scale_idx == 0:
+                    # min_depth, max_depth: [BV]
+                    depth_interval = (max_depth - min_depth) / (
+                        self.num_depth_candidates - 1
+                    )  # [BV]
+
+                    linear_space = (
+                        torch.linspace(0, 1, num_depth_candidates)
+                        .type_as(features_list_cnn[0])
+                        .view(1, num_depth_candidates, 1, 1)
+                    )  # [1, D, 1, 1]
+
+                    depth_candidates = min_depth.view(-1, 1, 1, 1) + linear_space * (
+                        max_depth - min_depth
+                    ).view(
+                        -1, 1, 1, 1
+                    )  # [BV, D, 1, 1]
+                else:
+                    # half interval each scale
+                    depth_interval = (
+                        (max_depth - min_depth)
+                        / (self.num_depth_candidates - 1)
+                        / (2**scale_idx)
+                    )  # [BV]
+                    # [BV, 1, 1, 1]
+                    depth_interval = depth_interval.view(-1, 1, 1, 1)
+
+                    # [BV, 1, H, W]
+                    depth_range_min = (
+                        depth - depth_interval * (num_depth_candidates // 2)
+                    ).clamp(min=min_depth.view(-1, 1, 1, 1))
+                    depth_range_max = (
+                        depth + depth_interval * (num_depth_candidates // 2 - 1)
+                    ).clamp(max=max_depth.view(-1, 1, 1, 1))
+
+                    linear_space = (
+                        torch.linspace(0, 1, num_depth_candidates)
+                        .type_as(features_list_cnn[0])
+                        .view(1, num_depth_candidates, 1, 1)
+                    )  # [1, D, 1, 1]
+                    depth_candidates = depth_range_min + linear_space * (
+                        depth_range_max - depth_range_min
+                    )  # [BV, D, H, W]
+
+                if scale_idx == 0:
+                    # [BV*(V-1), D, H, W]
+                    depth_candidates_curr = (
+                        depth_candidates.unsqueeze(1)
+                        .repeat(1, tgt_features.size(1), 1, h, w)
+                        .view(-1, num_depth_candidates, h, w)
+                    )
+                else:
+                    depth_candidates_curr = (
+                        depth_candidates.unsqueeze(1)
+                        .repeat(1, tgt_features.size(1), 1, 1, 1)
+                        .view(-1, num_depth_candidates, h, w)
+                    )
+
+                intrinsics_input = torch.stack(intrinsics_curr, dim=1).view(
+                    -1, 3, 3
+                )  # [BV, 3, 3]
+                intrinsics_input = intrinsics_input.unsqueeze(1).repeat(
+                    1, tgt_features.size(1), 1, 1
+                )  # [BV, V-1, 3, 3]
+
+                cost_volume_start = time.perf_counter()
+
+                warped_tgt_features = warp_with_pose_depth_candidates(
+                    rearrange(tgt_features, "b v ... -> (b v) ..."),
+                    rearrange(intrinsics_input, "b v ... -> (b v) ..."),
+                    rearrange(pose_curr, "b v ... -> (b v) ..."),
+                    1.0 / depth_candidates_curr,  # convert inverse depth to depth
+                    grid_sample_disable_cudnn=self.grid_sample_disable_cudnn,
+                )  # [BV*(V-1), C, D, H, W]
+
+                # ref: [BV, C, H, W]
+                # warped: [BV*(V-1), C, D, H, W] -> [BV, V-1, C, D, H, W]
+                warped_tgt_features = rearrange(
+                    warped_tgt_features,
+                    "(b v) ... -> b v ...",
+                    b=b_new,
+                    v=tgt_features.size(1),
+                )
+                # [BV, V-1, D, H, W] -> [BV, D, H, W]
+                # average cross other views
+                cost_volume = (
+                    (ref_features.unsqueeze(-3).unsqueeze(1) * warped_tgt_features).sum(2)
+                    / (c**0.5)
+                ).mean(1)
+
+                cost_volume_end = time.perf_counter()
+                cost_volume_elapsed = cost_volume_end - cost_volume_start
+                print(f"          [MultiViewUniMatch] Scale {scale_idx+1} cost volume building: {cost_volume_elapsed:.3f}s")
+
+                # regressor
+                features_cnn = features_list_cnn[scale_idx]  # [BV, C, H, W]
+
+                features_mono = features_list_mono[scale_idx]  # [BV, C, H, W]
+
+                concat = torch.cat(
+                    (cost_volume, features_cnn, features_mv, features_mono), dim=1
+                )
+
+                regressor_start = time.perf_counter()
+
+                out = self.regressor[scale_idx](concat) + self.regressor_residual[
+                    scale_idx
+                ](concat)
+
+                # depth pred
+                match_prob = F.softmax(
+                    self.depth_head[scale_idx](out), dim=1
+                ).to(torch.float32)  # [BV, D, H, W]
+
+                regressor_end = time.perf_counter()
+                regressor_elapsed = regressor_end - regressor_start
+                print(f"          [MultiViewUniMatch] Scale {scale_idx+1} regressor + depth head: {regressor_elapsed:.3f}s")
+
+                match_probs.append(match_prob)
+
+                if scale_idx == 0:
+                    # [BV, D, H, W]
+                    depth_candidates = depth_candidates.repeat(1, 1, h, w)
+                depth = (match_prob * depth_candidates).sum(
+                    dim=1, keepdim=True
+                ).to(torch.float32)  # [BV, 1, H, W]
+
+                # upsample to the original resolution for supervison at training time only
+                if self.training and scale_idx < self.num_scales - 1:
+                    depth_bilinear = F.interpolate(
+                        depth,
+                        scale_factor=downsample_factor,
+                        mode="bilinear",
+                        align_corners=True,
+                    )
+                    depth_preds.append(depth_bilinear)
+
+                # final output, learned upsampler
+                if scale_idx == self.num_scales - 1:
+                    upsampler_start = time.perf_counter()
+
+                    residual_depth = self.upsampler(
+                        mono_intermediate_features,
+                        # resolution high to low
+                        cnn_features=features_list_cnn_all_scales[::-1],
+                        mv_features=(
+                            features_mv if self.num_scales == 1 else features_list_mv[::-1]
+                        ),
+                        depth=depth,
+                    )
+
+                    depth_bilinear = F.interpolate(
+                        depth,
+                        scale_factor=self.upsample_factor,
+                        mode="bilinear",
+                        align_corners=True,
+                    )
+                    depth = (depth_bilinear + residual_depth).clamp(
+                        min=min_depth.view(-1, 1, 1, 1), max=max_depth.view(-1, 1, 1, 1)
+                    ).to(torch.float32)
+
+                    upsampler_end = time.perf_counter()
+                    upsampler_elapsed = upsampler_end - upsampler_start
+                    print(f"          [MultiViewUniMatch] Final upsampler: {upsampler_elapsed:.3f}s")
+
+                    depth_preds.append(depth)
+
+                scale_end = time.perf_counter()
+                scale_elapsed = scale_end - scale_start
+                print(f"        [MultiViewUniMatch] Scale {scale_idx+1} total: {scale_elapsed:.3f}s")
 
         multiscale_loop_end = time.perf_counter()
         multiscale_loop_end_wall = time.time()
