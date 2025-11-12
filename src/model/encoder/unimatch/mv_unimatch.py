@@ -573,6 +573,32 @@ class MultiViewUniMatch(nn.Module):
             if use_autocast
             else nullcontext()
         )
+        downsample_factors = [
+            self.upsample_factor * (2 ** (self.num_scales - 1 - idx))
+            for idx in range(self.num_scales)
+        ]
+        intrinsics_per_scale = []
+        for factor in downsample_factors:
+            scaled_intrinsics = intrinsics.clone()
+            scaled_intrinsics[:, :, :2] = scaled_intrinsics[:, :, :2] / factor
+            intrinsics_per_scale.append(list(torch.unbind(scaled_intrinsics, dim=1)))
+        extrinsics_per_view = list(torch.unbind(extrinsics, dim=1))
+        num_depth_candidates_per_scale = [
+            self.num_depth_candidates // (4**idx) for idx in range(self.num_scales)
+        ]
+        linear_space_per_scale = [
+            torch.linspace(
+                0,
+                1,
+                num_depth_candidates_per_scale[idx],
+                device=features_list_cnn[0].device,
+                dtype=features_list_cnn[0].dtype,
+            ).view(1, num_depth_candidates_per_scale[idx], 1, 1)
+            for idx in range(self.num_scales)
+        ]
+        base_depth_interval = (max_depth - min_depth) / (
+            self.num_depth_candidates - 1
+        )
 
         multiscale_loop_start = time.perf_counter()
         multiscale_loop_start_wall = time.time()
@@ -582,13 +608,10 @@ class MultiViewUniMatch(nn.Module):
             for scale_idx in range(self.num_scales):
                 scale_start = time.perf_counter()
                 print(f"        [MultiViewUniMatch] Processing scale {scale_idx+1}/{self.num_scales}...")
-                downsample_factor = self.upsample_factor * (
-                    2 ** (self.num_scales - 1 - scale_idx)
-                )
+                downsample_factor = downsample_factors[scale_idx]
 
                 # scale intrinsics
-                intrinsics_curr = intrinsics.clone()  # [B, V, 3, 3]
-                intrinsics_curr[:, :, :2] = intrinsics_curr[:, :, :2] / downsample_factor
+                intrinsics_curr_list = intrinsics_per_scale[scale_idx]
 
                 # build cost volume
                 features_mv = features_list_mv[scale_idx]  # [BV, C, H, W]
@@ -600,10 +623,7 @@ class MultiViewUniMatch(nn.Module):
                     )
                 )
 
-                intrinsics_curr = list(
-                    torch.unbind(intrinsics_curr, dim=1)
-                )  # list of [B, 3, 3]
-                extrinsics_curr = list(torch.unbind(extrinsics, dim=1))  # list of [B, 4, 4]
+                extrinsics_curr = extrinsics_per_view  # list of [B, 4, 4]
 
                 # ref: [BV, C, H, W], [BV, 3, 3], [BV, 4, 4]
                 # tgt: [BV, V-1, C, H, W], [BV, V-1, 3, 3], [BV, V-1, 4, 4]
@@ -616,7 +636,7 @@ class MultiViewUniMatch(nn.Module):
                     tgt_extrinsics,
                 ) = batch_features_camera_parameters(
                     features_mv_curr,
-                    intrinsics_curr,
+                    intrinsics_curr_list,
                     extrinsics_curr,
                     nn_matrix=nn_matrix,
                 )
@@ -636,20 +656,12 @@ class MultiViewUniMatch(nn.Module):
                         depth, scale_factor=2, mode="bilinear", align_corners=True
                     ).detach()
 
-                num_depth_candidates = self.num_depth_candidates // (4**scale_idx)
+                num_depth_candidates = num_depth_candidates_per_scale[scale_idx]
 
                 # generate depth candidates
                 if scale_idx == 0:
                     # min_depth, max_depth: [BV]
-                    depth_interval = (max_depth - min_depth) / (
-                        self.num_depth_candidates - 1
-                    )  # [BV]
-
-                    linear_space = (
-                        torch.linspace(0, 1, num_depth_candidates)
-                        .type_as(features_list_cnn[0])
-                        .view(1, num_depth_candidates, 1, 1)
-                    )  # [1, D, 1, 1]
+                    linear_space = linear_space_per_scale[scale_idx]
 
                     depth_candidates = min_depth.view(-1, 1, 1, 1) + linear_space * (
                         max_depth - min_depth
@@ -658,11 +670,7 @@ class MultiViewUniMatch(nn.Module):
                     )  # [BV, D, 1, 1]
                 else:
                     # half interval each scale
-                    depth_interval = (
-                        (max_depth - min_depth)
-                        / (self.num_depth_candidates - 1)
-                        / (2**scale_idx)
-                    )  # [BV]
+                    depth_interval = base_depth_interval / (2**scale_idx)  # [BV]
                     # [BV, 1, 1, 1]
                     depth_interval = depth_interval.view(-1, 1, 1, 1)
 
@@ -674,11 +682,7 @@ class MultiViewUniMatch(nn.Module):
                         depth + depth_interval * (num_depth_candidates // 2 - 1)
                     ).clamp(max=max_depth.view(-1, 1, 1, 1))
 
-                    linear_space = (
-                        torch.linspace(0, 1, num_depth_candidates)
-                        .type_as(features_list_cnn[0])
-                        .view(1, num_depth_candidates, 1, 1)
-                    )  # [1, D, 1, 1]
+                    linear_space = linear_space_per_scale[scale_idx]
                     depth_candidates = depth_range_min + linear_space * (
                         depth_range_max - depth_range_min
                     )  # [BV, D, H, W]
@@ -697,7 +701,7 @@ class MultiViewUniMatch(nn.Module):
                         .view(-1, num_depth_candidates, h, w)
                     )
 
-                intrinsics_input = torch.stack(intrinsics_curr, dim=1).view(
+                intrinsics_input = torch.stack(intrinsics_curr_list, dim=1).view(
                     -1, 3, 3
                 )  # [BV, 3, 3]
                 intrinsics_input = intrinsics_input.unsqueeze(1).repeat(
