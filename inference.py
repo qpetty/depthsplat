@@ -33,6 +33,14 @@ ENCODER_OVERRIDES = {
 # Leave disabled for fastest export.
 PLY_EXPORT_VALIDATION = False
 
+# Torch compile / encoder benchmarking options
+# Set to True to compile the encoder with torch.compile for faster repeated inference.
+ENABLE_TORCH_COMPILE = False
+
+# Number of times to run the encoder for timing/benchmarking.
+# Set >1 to measure average runtime; the final run's output is used for export.
+NUM_ENCODER_RUNS = 4
+
 import numpy as np
 
 # Camera intrinsics and extrinsics are loaded from metadata files
@@ -624,6 +632,18 @@ def main():
     encoder, encoder_visualizer = get_encoder(encoder_cfg)
     encoder = encoder.to(device)
     encoder.eval()
+
+    # Optionally compile the encoder for faster repeated inference.
+    if ENABLE_TORCH_COMPILE:
+        if hasattr(torch, "compile"):
+            try:
+                encoder = torch.compile(encoder, mode="reduce-overhead")
+                print("Encoder compiled with torch.compile (mode='reduce-overhead').")
+            except Exception as e:
+                print(f"Warning: torch.compile failed: {e}. Continuing without compilation.")
+        else:
+            print("Warning: torch.compile is not available in this PyTorch version; skipping compilation.")
+
     print("Encoder initialized successfully!")
 
     # Load checkpoint if provided
@@ -1132,28 +1152,40 @@ def main():
     # Prepare visualization dump to capture scales and rotations for PLY export
     visualization_dump = {}
 
-    # Run encoder
+    # Run encoder (optionally multiple times for benchmarking)
     print("\n" + "="*70)
     print("Running Encoder Inference")
     print("="*70)
-    encoder_start_time = time.perf_counter()
-    encoder_start_wall_time = time.time()
-    print(f"  Encoder start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
-    
-    with torch.no_grad():
-        result = encoder(
-            context=context,
-            global_step=0,
-            deterministic=False,
-            visualization_dump=visualization_dump,
-            scene_names=None,
-        )
-    
-    encoder_end_time = time.perf_counter()
-    encoder_end_wall_time = time.time()
-    encoder_elapsed = encoder_end_time - encoder_start_time
-    print(f"  Encoder end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
-    print(f"  Encoder elapsed time: {encoder_elapsed:.3f} seconds ({encoder_elapsed/60:.2f} minutes)")
+    print(f"  Encoder will run {NUM_ENCODER_RUNS} time(s)")
+
+    result = None
+    total_encoder_elapsed = 0.0
+
+    for run_idx in range(NUM_ENCODER_RUNS):
+        print(f"\n  ----- Encoder run {run_idx + 1}/{NUM_ENCODER_RUNS} -----")
+        encoder_start_time = time.perf_counter()
+        encoder_start_wall_time = time.time()
+        print(f"    Run start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
+
+        with torch.no_grad():
+            result = encoder(
+                context=context,
+                global_step=0,
+                deterministic=False,
+                visualization_dump=visualization_dump,
+                scene_names=None,
+            )
+
+        encoder_end_time = time.perf_counter()
+        encoder_end_wall_time = time.time()
+        encoder_elapsed = encoder_end_time - encoder_start_time
+        total_encoder_elapsed += encoder_elapsed
+        print(f"    Run end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
+        print(f"    Run elapsed time: {encoder_elapsed:.3f} seconds")
+
+    avg_encoder_elapsed = total_encoder_elapsed / max(NUM_ENCODER_RUNS, 1)
+    print(f"\n  Encoder total time over {NUM_ENCODER_RUNS} run(s): {total_encoder_elapsed:.3f} seconds")
+    print(f"  Encoder average time per run: {avg_encoder_elapsed:.3f} seconds ({avg_encoder_elapsed/60:.2f} minutes)")
 
     # Handle both dict and direct gaussians return
     if isinstance(result, dict):
