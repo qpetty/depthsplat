@@ -29,6 +29,10 @@ ENCODER_OVERRIDES = {
     }
 }
 
+# Toggle detailed validation and diagnostics during PLY export.
+# Leave disabled for fastest export.
+PLY_EXPORT_VALIDATION = False
+
 import numpy as np
 
 # Camera intrinsics and extrinsics are loaded from metadata files
@@ -242,6 +246,29 @@ def create_camera_pose(rotation: torch.Tensor, translation: torch.Tensor = None)
     return pose
 
 
+def quat_mul_xyzw(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """
+    Multiply two xyzw-format quaternions elementwise.
+
+    Args:
+        q1: Tensor of shape [..., 4] in xyzw format.
+        q2: Tensor of shape [..., 4] in xyzw format.
+
+    Returns:
+        Tensor of shape [..., 4] representing the product q1 * q2 in xyzw format.
+    """
+    x1, y1, z1, w1 = q1.unbind(-1)
+    x2, y2, z2, w2 = q2.unbind(-1)
+
+    # Hamilton product q = q1 * q2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+
+    return torch.stack((x, y, z, w), dim=-1)
+
+
 def get_image_dimensions(image_path: str) -> tuple[int, int]:
     """
     Get the dimensions of an image without loading the full image data.
@@ -332,6 +359,205 @@ def load_encoder_config(config_root: str, overrides: dict = None) -> EncoderDept
     print(f"  gaussian_scale_max: {encoder_cfg.gaussian_adapter.gaussian_scale_max}")
 
     return encoder_cfg
+
+
+def validate_ply_export(
+    context: dict,
+    gaussians,
+    means_world: torch.Tensor,
+    num_views: int,
+    num_gaussians_per_view: int,
+    camera_centers: list[torch.Tensor],
+) -> None:
+    """
+    Run detailed validation and diagnostics for exported Gaussians.
+    Intended for debugging; guarded by PLY_EXPORT_VALIDATION flag.
+    """
+    print("\n" + "=" * 70)
+    print("Validating Gaussian Means Overlap Across Views")
+    print("=" * 70)
+    print(f"  Total gaussians: {means_world.shape[0]}")
+    print(f"  Gaussians per view: {num_gaussians_per_view}")
+    print(f"  Number of views: {num_views}")
+
+    print(f"\n  Sample Gaussian Positions (center pixels from each view):")
+    h, w = context["image"].shape[3:5]
+    center_h, center_w = h // 2, w // 2
+    center_pixel_idx = center_h * w + center_w
+
+    print(f"\n  Ray Intersection Test (center pixel with fixed depth=5.0):")
+    from src.geometry.projection import get_world_rays, sample_image_grid
+
+    xy_grid, _ = sample_image_grid((h, w), device=torch.device("cpu"))
+    center_xy = xy_grid[center_h, center_w:center_w + 1]
+    test_depth = 5.0
+
+    for v in range(num_views):
+        view_start = v * num_gaussians_per_view
+        center_gaussian_idx = view_start + center_pixel_idx
+        if center_gaussian_idx < means_world.shape[0]:
+            center_mean = means_world[center_gaussian_idx]
+            camera_pos = camera_centers[v]
+            distance = torch.norm(center_mean - camera_pos).item()
+            print(f"    View {v} center pixel gaussian:")
+            print(
+                f"      Position: [{center_mean[0].item():.3f}, "
+                f"{center_mean[1].item():.3f}, {center_mean[2].item():.3f}]"
+            )
+            print(
+                f"      Camera: [{camera_pos[0].item():.3f}, "
+                f"{camera_pos[1].item():.3f}, {camera_pos[2].item():.3f}]"
+            )
+            print(f"      Distance from camera: {distance:.3f}")
+
+            ext = context["extrinsics"][0, v:v + 1].cpu()
+            intr = context["intrinsics"][0, v:v + 1].cpu()
+            origins, directions = get_world_rays(
+                center_xy.unsqueeze(0),
+                ext,
+                intr,
+            )
+            origins = origins[0, 0]
+            directions = directions[0, 0]
+            test_point = origins + directions * test_depth
+            print(
+                f"      Test point (depth={test_depth}): "
+                f"[{test_point[0].item():.3f}, "
+                f"{test_point[1].item():.3f}, {test_point[2].item():.3f}]"
+            )
+
+    test_points = []
+    for v in range(num_views):
+        ext = context["extrinsics"][0, v:v + 1].cpu()
+        intr = context["intrinsics"][0, v:v + 1].cpu()
+        origins, directions = get_world_rays(
+            center_xy.unsqueeze(0),
+            ext,
+            intr,
+        )
+        origins = origins[0, 0]
+        directions = directions[0, 0]
+        test_point = origins + directions * test_depth
+        test_points.append(test_point)
+
+    if len(test_points) >= 2:
+        print(f"\n    Test point distances (should be ~0 if rays intersect):")
+        for i in range(len(test_points)):
+            for j in range(i + 1, len(test_points)):
+                dist = torch.norm(test_points[i] - test_points[j]).item()
+                print(f"      View {i} <-> View {j}: {dist:.3f}")
+                if dist > 1.0:
+                    print(
+                        f"        WARNING: Rays don't intersect! "
+                        f"This suggests a coordinate system issue."
+                    )
+                else:
+                    print(
+                        f"        ✓ Rays intersect correctly "
+                        f"(within numerical precision)"
+                    )
+
+    print(f"\n  Depth Prediction Consistency Analysis:")
+    print(f"    The median depths are very different across views:")
+    print(f"      View 0: 117.391 (very far)")
+    print(f"      View 1: 14.161 (medium)")
+    print(f"      View 2: 6.279 (close)")
+    print(f"    This suggests the depth predictor is producing inconsistent results.")
+    print(f"    Possible causes:")
+    print(f"      1. Depth predictor not trained for this camera setup")
+    print(f"      2. Intrinsics/extrinsics mismatch with training data")
+    print(f"      3. Scene scale mismatch")
+    print(f"      4. Coordinate system convention mismatch")
+    print(
+        f"\n    The ray intersection test shows rays are ~1 unit apart,\n"
+        f"    which is relatively small but indicates a coordinate system issue."
+    )
+    print(
+        f"    However, the depth prediction inconsistency (50-110 unit separation)\n"
+        f"    is the main problem causing gaussians not to overlap."
+    )
+
+    for v in range(num_views):
+        view_start = v * num_gaussians_per_view
+        view_end = (v + 1) * num_gaussians_per_view
+        view_means = means_world[view_start:view_end]
+        sample_indices = torch.arange(0, view_means.shape[0], 100)
+        sampled_means = view_means[sample_indices]
+
+        print(f"\n  View {v} (gaussians {view_start} to {view_end - 1}):")
+        print(f"    Position range (from {len(sampled_means)} sampled gaussians):")
+        print(
+            f"      X: [{sampled_means[:, 0].min().item():.3f}, "
+            f"{sampled_means[:, 0].max().item():.3f}]"
+        )
+        print(
+            f"      Y: [{sampled_means[:, 1].min().item():.3f}, "
+            f"{sampled_means[:, 1].max().item():.3f}]"
+        )
+        print(
+            f"      Z: [{sampled_means[:, 2].min().item():.3f}, "
+            f"{sampled_means[:, 2].max().item():.3f}]"
+        )
+        print(
+            f"    Mean center: "
+            f"[{sampled_means.mean(0)[0].item():.3f}, "
+            f"{sampled_means.mean(0)[1].item():.3f}, "
+            f"{sampled_means.mean(0)[2].item():.3f}]"
+        )
+        print(
+            f"    Camera position (from extrinsics): "
+            f"[{camera_centers[v][0].item():.3f}, "
+            f"{camera_centers[v][1].item():.3f}, "
+            f"{camera_centers[v][2].item():.3f}]"
+        )
+        print(
+            f"    Distance from camera to mean center: "
+            f"{torch.norm(sampled_means.mean(0) - camera_centers[v]).item():.3f}"
+        )
+
+    print(f"\n  Overlap Analysis:")
+    view_centers = []
+    for v in range(num_views):
+        view_start = v * num_gaussians_per_view
+        view_end = (v + 1) * num_gaussians_per_view
+        view_means = means_world[view_start:view_end]
+        sample_indices = torch.arange(0, view_means.shape[0], 100)
+        sampled_means = view_means[sample_indices]
+        view_centers.append(sampled_means.mean(0))
+
+    for i in range(num_views):
+        for j in range(i + 1, num_views):
+            center_distance = torch.norm(view_centers[i] - view_centers[j]).item()
+            print(f"    View {i} <-> View {j} center distance: {center_distance:.3f}")
+            if center_distance > 10.0:
+                print(
+                    f"      WARNING: Views {i} and {j} have very different centers - "
+                    f"gaussians may not overlap!"
+                )
+
+    print(f"\n  Bounding Box Analysis:")
+    all_means_min = means_world.min(0)[0]
+    all_means_max = means_world.max(0)[0]
+    all_means_center = means_world.mean(0)
+    print(f"    Overall bounding box:")
+    print(
+        f"      Min: [{all_means_min[0].item():.3f}, "
+        f"{all_means_min[1].item():.3f}, {all_means_min[2].item():.3f}]"
+    )
+    print(
+        f"      Max: [{all_means_max[0].item():.3f}, "
+        f"{all_means_max[1].item():.3f}, {all_means_max[2].item():.3f}]"
+    )
+    print(
+        f"      Center: [{all_means_center[0].item():.3f}, "
+        f"{all_means_center[1].item():.3f}, {all_means_center[2].item():.3f}]"
+    )
+    print(
+        f"      Size: [{all_means_max[0].item() - all_means_min[0].item():.3f}, "
+        f"{all_means_max[1].item() - all_means_min[1].item():.3f}, "
+        f"{all_means_max[2].item() - all_means_min[2].item():.3f}]"
+    )
+    print("=" * 70)
 
 
 def main():
@@ -980,222 +1206,100 @@ def main():
 
     # Check if visualization dump contains required data
     if "scales" in visualization_dump and "rotations" in visualization_dump:
+        # Dictionary to store timing for each step
+        step_timings = {}
+        
+        # Extract scales and rotations from visualization_dump
+        extract_start_time = time.perf_counter()
         scales = visualization_dump["scales"][0]  # [num_gaussians, 3]
         rotations = visualization_dump["rotations"][0]  # [num_gaussians, 4] (xyzw format)
+        extract_end_time = time.perf_counter()
+        step_timings["extract_scales_rotations"] = extract_end_time - extract_start_time
 
         # Use the first view's extrinsics as reference for the PLY export
         # This matches save_gaussian_ply and encoder_visualizer which use view 0
+        extrinsics_start_time = time.perf_counter()
         reference_extrinsics = context["extrinsics"][0, 0].detach().cpu()  # Use first view
+        extrinsics_end_time = time.perf_counter()
+        step_timings["get_reference_extrinsics"] = extrinsics_end_time - extrinsics_start_time
 
         # Convert rotations from camera space to world space
         # The gaussians are flattened across views as: [v, r, srf, spp] -> [v*r*srf*spp]
         # We need to convert each view's rotations using that view's C2W matrix
+        rotation_conv_start_time = time.perf_counter()
         total_gaussians = rotations.shape[0]
         num_gaussians_per_view = total_gaussians // num_views
-        
+
         # Verify the division is exact
         if total_gaussians % num_views != 0:
             raise ValueError(
                 f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
             )
-        
-        # Reshape rotations to separate by view: [num_views, num_gaussians_per_view, 4]
-        rotations_per_view = rotations.view(num_views, num_gaussians_per_view, 4)
-        
-        # Get C2W rotation matrices for each view
-        c2w_rotations = context["extrinsics"][0, :, :3, :3].detach().cpu()  # [num_views, 3, 3]
-        
-        # Convert rotations from camera space to world space
-        # This matches the approach in save_gaussian_ply: world_rotation = c2w @ cam_rotation
-        world_rotations_list = []
-        for v in range(num_views):
-            # Get camera-space rotations for this view
-            cam_rotations_np = R.from_quat(
-                rotations_per_view[v].detach().cpu().numpy()
-            ).as_matrix()  # [num_gaussians_per_view, 3, 3]
-            
-            # Get C2W rotation for this view
-            c2w_rot = c2w_rotations[v].detach().cpu().numpy()  # [3, 3]
-            
-            # Convert to world space: world_rotation = c2w @ cam_rotation
-            # Expand c2w_rot to match batch dimension for element-wise matrix multiplication
-            # [3, 3] -> [num_gaussians_per_view, 3, 3] then @ [num_gaussians_per_view, 3, 3] -> [num_gaussians_per_view, 3, 3]
-            c2w_rot_expanded = np.broadcast_to(
-                c2w_rot[None, :, :], 
-                (num_gaussians_per_view, 3, 3)
-            )  # [num_gaussians_per_view, 3, 3]
-            world_rotations_mat = c2w_rot_expanded @ cam_rotations_np  # Element-wise: [n, 3, 3] @ [n, 3, 3] -> [n, 3, 3]
-            
-            # Convert back to quaternion (scipy uses xyzw format)
-            world_rotations_quat = R.from_matrix(world_rotations_mat).as_quat()  # [num_gaussians_per_view, 4] (xyzw)
-            # Convert to float32 explicitly to avoid float64 issues with MPS
-            world_rotations_list.append(torch.from_numpy(world_rotations_quat).float())
-        
-        # Flatten back to [num_gaussians, 4]
-        # Ensure float32 dtype before moving to device (MPS doesn't support float64)
-        world_rotations = torch.cat(world_rotations_list, dim=0).float().to(rotations.device)
+
+        # Convert per-view C2W rotation matrices to quaternions once (small V)
+        c2w_rotations = context["extrinsics"][0, :, :3, :3]  # [V, 3, 3] torch
+        c2w_rotations_np = c2w_rotations.detach().cpu().numpy()  # [V, 3, 3]
+        c2w_quats_np = R.from_matrix(c2w_rotations_np).as_quat().astype(np.float32)  # [V, 4], xyzw, float32
+        c2w_quats = torch.from_numpy(c2w_quats_np).to(rotations.device)  # [V, 4]
+
+        # Build per-Gaussian view indices in torch
+        view_ids = torch.repeat_interleave(
+            torch.arange(num_views, device=rotations.device),
+            num_gaussians_per_view,
+        )  # [N]
+        if view_ids.shape[0] != total_gaussians:
+            raise ValueError(
+                f"view_ids length ({view_ids.shape[0]}) does not match total_gaussians ({total_gaussians})"
+            )
+
+        # Per-Gaussian C2W quaternions: [N, 4]
+        c2w_gauss_quats = c2w_quats[view_ids]  # [N, 4]
+
+        # Compose rotations in quaternion space (world = C2W * cam)
+        world_rotations = quat_mul_xyzw(c2w_gauss_quats, rotations)  # [N, 4], xyzw
+
+        rotation_conv_end_time = time.perf_counter()
+        step_timings["convert_rotations_to_world_space"] = rotation_conv_end_time - rotation_conv_start_time
 
         # Export to PLY directly in world space (avoiding export_ply's coordinate transformations)
         # All gaussians are already in world space from the encoder, so we can export them directly
+        extract_props_start_time = time.perf_counter()
         means_world = gaussians.means[0].detach().cpu()  # [num_gaussians, 3] (world space)
         
-        # Debug: Validate gaussian means overlap across views
-        print("\n" + "="*70)
-        print("Validating Gaussian Means Overlap Across Views")
-        print("="*70)
-        print(f"  Total gaussians: {means_world.shape[0]}")
-        print(f"  Gaussians per view: {num_gaussians_per_view}")
-        print(f"  Number of views: {num_views}")
-        
-        # Debug: Check a sample of means to see their distribution
-        # Sample a few gaussians from the center of each view's image
-        print(f"\n  Sample Gaussian Positions (center pixels from each view):")
-        h, w = context["image"].shape[3:5]
-        center_h, center_w = h // 2, w // 2
-        center_pixel_idx = center_h * w + center_w
-        
-        # Also test ray intersection: if we use the same depth for all views' center pixels,
-        # they should intersect at the same 3D point
-        print(f"\n  Ray Intersection Test (center pixel with fixed depth=5.0):")
-        from src.geometry.projection import get_world_rays, sample_image_grid
-        # Use the same coordinate generation as the encoder (pixel centers)
-        xy_grid, _ = sample_image_grid((h, w), device=torch.device("cpu"))
-        center_xy = xy_grid[center_h, center_w:center_w+1]  # [1, 2] - use exact same method as encoder
-        test_depth = 5.0
-        
-        for v in range(num_views):
-            view_start = v * num_gaussians_per_view
-            # Get gaussians from center pixel area (assuming num_surfaces=1, num_samples=1)
-            # The flattening order is [v, r, srf, spp] where r = h*w
-            center_gaussian_idx = view_start + center_pixel_idx
-            if center_gaussian_idx < means_world.shape[0]:
-                center_mean = means_world[center_gaussian_idx]
-                camera_pos = camera_centers[v]
-                distance = torch.norm(center_mean - camera_pos).item()
-                print(f"    View {v} center pixel gaussian:")
-                print(f"      Position: [{center_mean[0].item():.3f}, {center_mean[1].item():.3f}, {center_mean[2].item():.3f}]")
-                print(f"      Camera: [{camera_pos[0].item():.3f}, {camera_pos[1].item():.3f}, {camera_pos[2].item():.3f}]")
-                print(f"      Distance from camera: {distance:.3f}")
-                
-                # Test with fixed depth
-                ext = context["extrinsics"][0, v:v+1].cpu()  # [1, 4, 4]
-                intr = context["intrinsics"][0, v:v+1].cpu()  # [1, 3, 3]
-                origins, directions = get_world_rays(
-                    center_xy.unsqueeze(0),  # [1, 1, 2]
-                    ext,  # [1, 4, 4]
-                    intr,  # [1, 3, 3]
-                )
-                origins = origins[0, 0]  # [3]
-                directions = directions[0, 0]  # [3]
-                test_point = origins + directions * test_depth
-                print(f"      Test point (depth={test_depth}): [{test_point[0].item():.3f}, {test_point[1].item():.3f}, {test_point[2].item():.3f}]")
-        
-        # Check if test points are close (they should intersect)
-        test_points = []
-        for v in range(num_views):
-            ext = context["extrinsics"][0, v:v+1].cpu()
-            intr = context["intrinsics"][0, v:v+1].cpu()
-            origins, directions = get_world_rays(
-                center_xy.unsqueeze(0),
-                ext,
-                intr,
+        if PLY_EXPORT_VALIDATION:
+            validate_ply_export(
+                context=context,
+                gaussians=gaussians,
+                means_world=means_world,
+                num_views=num_views,
+                num_gaussians_per_view=num_gaussians_per_view,
+                camera_centers=camera_centers,
             )
-            origins = origins[0, 0]
-            directions = directions[0, 0]
-            test_point = origins + directions * test_depth
-            test_points.append(test_point)
-        
-        if len(test_points) >= 2:
-            # Check distances between test points
-            print(f"\n    Test point distances (should be ~0 if rays intersect):")
-            for i in range(len(test_points)):
-                for j in range(i + 1, len(test_points)):
-                    dist = torch.norm(test_points[i] - test_points[j]).item()
-                    print(f"      View {i} <-> View {j}: {dist:.3f}")
-                    if dist > 1.0:
-                        print(f"        WARNING: Rays don't intersect! This suggests a coordinate system issue.")
-                    else:
-                        print(f"        ✓ Rays intersect correctly (within numerical precision)")
-        
-        # Additional diagnostic: Check if the issue is depth prediction inconsistency
-        print(f"\n  Depth Prediction Consistency Analysis:")
-        print(f"    The median depths are very different across views:")
-        print(f"      View 0: 117.391 (very far)")
-        print(f"      View 1: 14.161 (medium)")
-        print(f"      View 2: 6.279 (close)")
-        print(f"    This suggests the depth predictor is producing inconsistent results.")
-        print(f"    Possible causes:")
-        print(f"      1. Depth predictor not trained for this camera setup")
-        print(f"      2. Intrinsics/extrinsics mismatch with training data")
-        print(f"      3. Scene scale mismatch")
-        print(f"      4. Coordinate system convention mismatch")
-        print(f"\n    The ray intersection test shows rays are ~1 unit apart,")
-        print(f"    which is relatively small but indicates a coordinate system issue.")
-        print(f"    However, the depth prediction inconsistency (50-110 unit separation)")
-        print(f"    is the main problem causing gaussians not to overlap.")
-        
-        for v in range(num_views):
-            view_start = v * num_gaussians_per_view
-            view_end = (v + 1) * num_gaussians_per_view
-            view_means = means_world[view_start:view_end]
-            
-            # Sample a subset for faster computation (every 100th gaussian)
-            sample_indices = torch.arange(0, view_means.shape[0], 100)
-            sampled_means = view_means[sample_indices]
-            
-            print(f"\n  View {v} (gaussians {view_start} to {view_end-1}):")
-            print(f"    Position range (from {len(sampled_means)} sampled gaussians):")
-            print(f"      X: [{sampled_means[:, 0].min().item():.3f}, {sampled_means[:, 0].max().item():.3f}]")
-            print(f"      Y: [{sampled_means[:, 1].min().item():.3f}, {sampled_means[:, 1].max().item():.3f}]")
-            print(f"      Z: [{sampled_means[:, 2].min().item():.3f}, {sampled_means[:, 2].max().item():.3f}]")
-            print(f"    Mean center: [{sampled_means.mean(0)[0].item():.3f}, {sampled_means.mean(0)[1].item():.3f}, {sampled_means.mean(0)[2].item():.3f}]")
-            print(f"    Camera position (from extrinsics): [{camera_centers[v][0].item():.3f}, {camera_centers[v][1].item():.3f}, {camera_centers[v][2].item():.3f}]")
-            print(f"    Distance from camera to mean center: {torch.norm(sampled_means.mean(0) - camera_centers[v]).item():.3f}")
-        
-        # Check if means from different views overlap
-        print(f"\n  Overlap Analysis:")
-        view_centers = []
-        for v in range(num_views):
-            view_start = v * num_gaussians_per_view
-            view_end = (v + 1) * num_gaussians_per_view
-            view_means = means_world[view_start:view_end]
-            sample_indices = torch.arange(0, view_means.shape[0], 100)
-            sampled_means = view_means[sample_indices]
-            view_centers.append(sampled_means.mean(0))
-        
-        for i in range(num_views):
-            for j in range(i + 1, num_views):
-                center_distance = torch.norm(view_centers[i] - view_centers[j]).item()
-                print(f"    View {i} <-> View {j} center distance: {center_distance:.3f}")
-                if center_distance > 10.0:
-                    print(f"      WARNING: Views {i} and {j} have very different centers - gaussians may not overlap!")
-        
-        # Check bounding boxes
-        print(f"\n  Bounding Box Analysis:")
-        all_means_min = means_world.min(0)[0]
-        all_means_max = means_world.max(0)[0]
-        all_means_center = means_world.mean(0)
-        print(f"    Overall bounding box:")
-        print(f"      Min: [{all_means_min[0].item():.3f}, {all_means_min[1].item():.3f}, {all_means_min[2].item():.3f}]")
-        print(f"      Max: [{all_means_max[0].item():.3f}, {all_means_max[1].item():.3f}, {all_means_max[2].item():.3f}]")
-        print(f"      Center: [{all_means_center[0].item():.3f}, {all_means_center[1].item():.3f}, {all_means_center[2].item():.3f}]")
-        print(f"      Size: [{all_means_max[0].item() - all_means_min[0].item():.3f}, {all_means_max[1].item() - all_means_min[1].item():.3f}, {all_means_max[2].item() - all_means_min[2].item():.3f}]")
-        
-        print("="*70)
+            print("="*70)
+
         scales_world = scales.detach().cpu()  # [num_gaussians, 3] (world space)
         rotations_world = world_rotations.detach().cpu()  # [num_gaussians, 4] (world space, xyzw format)
         harmonics_world = gaussians.harmonics[0].detach().cpu()  # [num_gaussians, 3, d_sh]
         opacities_world = gaussians.opacities[0].detach().cpu()  # [num_gaussians]
+        extract_props_end_time = time.perf_counter()
+        step_timings["extract_gaussian_properties"] = extract_props_end_time - extract_props_start_time
         
         # Convert quaternions from xyzw (scipy format) to wxyz (PLY format)
+        quaternion_conv_start_time = time.perf_counter()
         x, y, z, w = rearrange(rotations_world.numpy(), "g xyzw -> xyzw g")
         rotations_ply = np.stack((w, x, y, z), axis=-1)  # [num_gaussians, 4] (wxyz format)
+        quaternion_conv_end_time = time.perf_counter()
+        step_timings["convert_quaternion_format"] = quaternion_conv_end_time - quaternion_conv_start_time
         
         # Extract DC component of spherical harmonics (view-independent color)
+        harmonics_start_time = time.perf_counter()
         harmonics_dc = harmonics_world[..., 0].numpy()  # [num_gaussians, 3]
+        harmonics_end_time = time.perf_counter()
+        step_timings["extract_harmonics_dc"] = harmonics_end_time - harmonics_start_time
         
         # Construct PLY attributes (matching export_ply format)
         # Format: x, y, z, nx, ny, nz, f_dc_0, f_dc_1, f_dc_2, opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3
+        attributes_start_time = time.perf_counter()
         attributes_list = [
             means_world.numpy(),  # x, y, z
             np.zeros_like(means_world.numpy()),  # nx, ny, nz (normals - unused, set to zero)
@@ -1207,8 +1311,11 @@ def main():
         
         # Concatenate all attributes
         attributes = np.concatenate(attributes_list, axis=1)  # [num_gaussians, 3+3+3+1+3+4 = 17]
+        attributes_end_time = time.perf_counter()
+        step_timings["construct_ply_attributes"] = attributes_end_time - attributes_start_time
         
         # Define PLY data type
+        structured_array_start_time = time.perf_counter()
         dtype_full = [
             ("x", "f4"), ("y", "f4"), ("z", "f4"),
             ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
@@ -1218,13 +1325,19 @@ def main():
             ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
         ]
         
-        # Create structured array
+        # Create structured array without per-row Python tuple construction
         elements = np.empty(means_world.shape[0], dtype=dtype_full)
-        elements[:] = list(map(tuple, attributes))
+        for i, name in enumerate(elements.dtype.names):
+            elements[name] = attributes[:, i]
+        structured_array_end_time = time.perf_counter()
+        step_timings["create_structured_array"] = structured_array_end_time - structured_array_start_time
         
-        # Write PLY file
+        # Write PLY file with timing
+        ply_write_start_time = time.perf_counter()
         ply_path.parent.mkdir(parents=True, exist_ok=True)
         PlyData([PlyElement.describe(elements, "vertex")]).write(ply_path)
+        ply_write_end_time = time.perf_counter()
+        step_timings["write_ply_file"] = ply_write_end_time - ply_write_start_time
         
         ply_export_end_time = time.perf_counter()
         ply_export_end_wall_time = time.time()
@@ -1233,6 +1346,21 @@ def main():
         print(f"  File size: {ply_path.stat().st_size / (1024*1024):.2f} MB")
         print(f"  PLY export end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_end_wall_time))}")
         print(f"  PLY export elapsed time: {ply_export_elapsed:.3f} seconds ({ply_export_elapsed/60:.2f} minutes)")
+        
+        # Print detailed step timings
+        print("\n" + "="*70)
+        print("PLY Conversion Step Timings")
+        print("="*70)
+        # Sort by time descending to show slowest steps first
+        sorted_timings = sorted(step_timings.items(), key=lambda x: x[1], reverse=True)
+        total_step_time = sum(step_timings.values())
+        for step_name, elapsed_time in sorted_timings:
+            percentage = (elapsed_time / total_step_time * 100) if total_step_time > 0 else 0
+            # Format step name for display
+            display_name = step_name.replace("_", " ").title()
+            print(f"  {display_name:35s}: {elapsed_time:8.3f} seconds ({percentage:5.1f}%)")
+        print(f"\n  {'Total (all steps)':35s}: {total_step_time:8.3f} seconds")
+        print("="*70)
     else:
         print("✗ Warning: visualization_dump does not contain scales/rotations.")
         print("  Cannot export to PLY without this information.")
