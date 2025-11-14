@@ -41,6 +41,7 @@ ENABLE_TORCH_COMPILE = False
 # Set >1 to measure average runtime; the final run's output is used for export.
 NUM_ENCODER_RUNS = 1
 
+from ast import Set
 import numpy as np
 
 # Camera intrinsics and extrinsics are loaded from metadata files
@@ -80,13 +81,6 @@ import json
 @dataclass
 class SetupResult:
     encoder: torch.nn.Module
-    context: Dict[str, torch.Tensor]
-    num_views: int
-    output_dir: Path
-    camera_centers: List[torch.Tensor]
-    camera_distances: List[float]
-    num_encoder_runs: int
-    ply_export_validation: bool
     device: str
 
 
@@ -641,120 +635,19 @@ def validate_ply_export(
     )
     print("=" * 70)
 
-
-def setup(
-    checkpoint_path: Optional[Union[str, Path]] = None,
+def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
     config_root: Union[str, Path] = CONFIG_ROOT,
-    image_base_path: Optional[Union[str, Path]] = IMAGE_BASE_PATH,
-    image_manifest: Optional[List[Tuple[Union[str, Path], Union[str, Path]]]] = None,
-    encoder_overrides: Optional[Dict[str, Any]] = None,
-    output_dir: Union[str, Path] = OUTPUT_DIR,
-    num_encoder_runs: Optional[int] = None,
-    enable_torch_compile: Optional[bool] = None,
-    ply_export_validation: Optional[bool] = None,
-    device: Optional[str] = None,
-) -> SetupResult:
-    if checkpoint_path is None:
-        checkpoint_path = CHECKPOINT_PATH
-    if encoder_overrides is None:
-        encoder_overrides = ENCODER_OVERRIDES
-    if num_encoder_runs is None:
-        num_encoder_runs = NUM_ENCODER_RUNS
-    if enable_torch_compile is None:
-        enable_torch_compile = ENABLE_TORCH_COMPILE
-    if ply_export_validation is None:
-        ply_export_validation = PLY_EXPORT_VALIDATION
-
-    config_root = Path(config_root)
-    output_dir = Path(output_dir)
-    image_base_path = Path(image_base_path) if image_base_path is not None else None
-    checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
-
-    resolved_manifest: Optional[List[Tuple[Path, Path]]] = None
-    if image_manifest:
-        resolved_manifest = []
-        for metadata_entry, image_entry in image_manifest:
-            metadata_path = Path(metadata_entry)
-            image_path = Path(image_entry)
-
-            if not metadata_path.exists():
-                raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
-            if not image_path.exists():
-                raise FileNotFoundError(f"Image file not found: {image_path}")
-
-            metadata_path = metadata_path.resolve()
-            image_path = image_path.resolve()
-
-            resolved_manifest.append((metadata_path, image_path))
-
-        manifest_dirs = {metadata_path.parent for metadata_path, _ in resolved_manifest}
-        if len(manifest_dirs) != 1:
-            raise ValueError("All metadata files in image_manifest must share the same parent directory.")
-
-        manifest_base = manifest_dirs.pop()
-
-        if image_base_path is None:
-            image_base_path = manifest_base
-        elif image_base_path != manifest_base:
-            raise ValueError(
-                f"image_base_path ({image_base_path}) does not match metadata directory ({manifest_base}) from image_manifest."
-            )
+    encoder_overrides: Optional[Dict[str, Any]] = ENCODER_OVERRIDES,
+    enable_torch_compile: Optional[bool] = ENABLE_TORCH_COMPILE) -> SetupResult:
 
     # Device selection: prefer CUDA, then MPS (Apple Silicon), then CPU
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"Using device: {device}")
-    
-    # Load intrinsics and extrinsics from JSON metadata files
-    print("\n" + "="*70)
-    print("Loading Camera Metadata")
-    print("="*70)
-    
-    if resolved_manifest is not None:
-        intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_manifest_entries(
-            resolved_manifest
-        )
-    else:
-        intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_metadata(image_base_path)
-    
-    if intrinsics_from_metadata is None or extrinsics_from_metadata is None:
-        if image_base_path is not None:
-            raise FileNotFoundError(
-                f"No metadata files found in {image_base_path}. "
-                f"Please ensure metadata files (e.g., '*_metadata.json') are present."
-            )
-        else:
-            raise ValueError(
-                "IMAGE_BASE_PATH is None. Please set IMAGE_BASE_PATH to a directory containing images and metadata files."
-            )
-    
-    print(f"  Found {len(extrinsics_from_metadata)} metadata file(s) in {image_base_path}")
-    print(f"  Loaded extrinsics for {len(extrinsics_from_metadata)} image(s)")
-    
-    # For intrinsics, we need to handle per-image intrinsics
-    # If all images have the same intrinsics, use the first one
-    # Otherwise, we'll need to handle per-image intrinsics later
-    intrinsics_values = list(intrinsics_from_metadata.values())
-    if len(set(tuple(v) for v in intrinsics_values)) == 1:
-        # All images have the same intrinsics
-        intrinsics_loaded = intrinsics_values[0]
-        print(f"  Loaded intrinsics: fx={intrinsics_loaded[0]:.2f}, fy={intrinsics_loaded[1]:.2f}, "
-              f"cx={intrinsics_loaded[2]:.2f}, cy={intrinsics_loaded[3]:.2f}")
-    else:
-        # Different intrinsics per image - use first one and warn
-        intrinsics_loaded = intrinsics_values[0]
-        first_image = list(intrinsics_from_metadata.keys())[0]
-        print(f"  WARNING: Images have different intrinsics. Using intrinsics from {first_image}")
-        print(f"  Loaded intrinsics: fx={intrinsics_loaded[0]:.2f}, fy={intrinsics_loaded[1]:.2f}, "
-              f"cx={intrinsics_loaded[2]:.2f}, cy={intrinsics_loaded[3]:.2f}")
-    
-    # Store extrinsics for later use
-    extrinsics_loaded = extrinsics_from_metadata
 
     # Load encoder config
     print("\n" + "="*70)
@@ -783,6 +676,7 @@ def setup(
 
     print("Encoder initialized successfully!")
 
+    checkpoint_path = Path(checkpoint_path)
     # Load checkpoint if provided
     if checkpoint_path and checkpoint_path.exists():
         print(f"\nLoading checkpoint from {checkpoint_path}")
@@ -803,6 +697,87 @@ def setup(
         print(f"\nWarning: Checkpoint path '{checkpoint_path}' does not exist. Using randomly initialized weights.")
     else:
         print("\nNo checkpoint path provided. Using randomly initialized weights.")
+    return SetupResult(encoder=encoder, device=device)
+
+
+def run_encoder(
+    setup_result: SetupResult,
+    images: List[str],
+    num_runs: Optional[int] = NUM_ENCODER_RUNS,
+    output_dir: Optional[Union[str, Path]] = OUTPUT_DIR,
+    visualization_dump: Optional[Dict[str, Any]] = {},
+    ply_export_validation: Optional[bool] = PLY_EXPORT_VALIDATION,
+) -> Dict[str, Any]:
+
+    device = setup_result.device
+    output_dir = Path(output_dir)
+
+    resolved_manifest: Optional[List[Tuple[Path, Path]]] = []
+    for image_entry in images:
+        image_path = Path(image_entry)
+
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        
+        image_stem = image_path.stem
+        metadata_name = f"{image_stem}_metadata.json"
+        metadata_path = image_path.parent / metadata_name
+
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+
+        metadata_path = metadata_path.resolve()
+        image_path = image_path.resolve()
+
+        resolved_manifest.append((metadata_path, image_path))
+
+    manifest_dirs = {metadata_path.parent for metadata_path, _ in resolved_manifest}
+    if len(manifest_dirs) != 1:
+        raise ValueError("All metadata files in image_manifest must share the same parent directory.")
+
+    manifest_base = manifest_dirs.pop()
+    
+    # Load intrinsics and extrinsics from JSON metadata files
+    print("\n" + "="*70)
+    print("Loading Camera Metadata")
+    print("="*70)
+    
+    if resolved_manifest is not None:
+        intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_manifest_entries(
+            resolved_manifest
+        )
+    else:
+        intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_metadata(image_base_path)
+    
+    if intrinsics_from_metadata is None or extrinsics_from_metadata is None:
+        raise FileNotFoundError(
+                f"No metadata files found. "
+                f"Please ensure metadata files (e.g., '*_metadata.json') are present."
+            )
+    
+    print(f"  Found {len(extrinsics_from_metadata)} metadata file(s)")
+    print(f"  Loaded extrinsics for {len(extrinsics_from_metadata)} image(s)")
+    
+    # For intrinsics, we need to handle per-image intrinsics
+    # If all images have the same intrinsics, use the first one
+    # Otherwise, we'll need to handle per-image intrinsics later
+    intrinsics_values = list(intrinsics_from_metadata.values())
+    if len(set(tuple(v) for v in intrinsics_values)) == 1:
+        # All images have the same intrinsics
+        intrinsics_loaded = intrinsics_values[0]
+        print(f"  Loaded intrinsics: fx={intrinsics_loaded[0]:.2f}, fy={intrinsics_loaded[1]:.2f}, "
+              f"cx={intrinsics_loaded[2]:.2f}, cy={intrinsics_loaded[3]:.2f}")
+    else:
+        # Different intrinsics per image - use first one and warn
+        intrinsics_loaded = intrinsics_values[0]
+        first_image = list(intrinsics_from_metadata.keys())[0]
+        print(f"  WARNING: Images have different intrinsics. Using intrinsics from {first_image}")
+        print(f"  Loaded intrinsics: fx={intrinsics_loaded[0]:.2f}, fy={intrinsics_loaded[1]:.2f}, "
+              f"cx={intrinsics_loaded[2]:.2f}, cy={intrinsics_loaded[3]:.2f}")
+    
+    # Store extrinsics for later use
+    extrinsics_loaded = extrinsics_from_metadata
+
 
     # Determine number of views and image paths from loaded extrinsics
     batch_size = 1
@@ -1295,26 +1270,7 @@ def setup(
         print("  No obvious issues detected.")
     
     print("="*70)
-    
-    return SetupResult(
-        encoder=encoder,
-        context=context,
-        num_views=num_views,
-        output_dir=output_dir,
-        camera_centers=camera_centers,
-        camera_distances=camera_distances,
-        num_encoder_runs=num_encoder_runs,
-        ply_export_validation=ply_export_validation,
-        device=device,
-    )
 
-
-def run_encoder(
-    setup_result: SetupResult,
-    num_runs: Optional[int] = None,
-    output_dir: Optional[Union[str, Path]] = None,
-    visualization_dump: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
     """
     Run the encoder inference loop and export the resulting Gaussians to a PLY file.
 
@@ -1328,20 +1284,10 @@ def run_encoder(
         Dictionary containing the encoder result, PLY path (if exported), visualization dump, and timing info.
     """
     encoder = setup_result.encoder
-    context = setup_result.context
-    num_views = setup_result.num_views
     output_dir_path = Path(output_dir) if output_dir is not None else setup_result.output_dir
     num_runs = num_runs if num_runs is not None else setup_result.num_encoder_runs
     if num_runs <= 0:
         raise ValueError("num_runs must be a positive integer")
-
-    ply_export_validation = setup_result.ply_export_validation
-    camera_centers = setup_result.camera_centers
-    camera_distances = setup_result.camera_distances
-    device = setup_result.device
-
-    if visualization_dump is None:
-        visualization_dump = {}
 
     near = context["near"]
     far = context["far"]
@@ -1605,8 +1551,24 @@ def run_encoder(
 
 
 def main() -> None:
-    setup_result = setup()
-    run_encoder(setup_result)
+    setup_result = setup_encoder()
+    # INSERT_YOUR_CODE
+    # Get list of all image files in IMAGE_BASE_PATH directory (common image extensions)
+    import os
+
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+    image_dir = IMAGE_BASE_PATH if isinstance(IMAGE_BASE_PATH, str) else str(IMAGE_BASE_PATH)
+    all_files = os.listdir(image_dir)
+    images = [
+        os.path.join(image_dir, f)
+        for f in all_files
+        if os.path.splitext(f)[1].lower() in image_extensions
+           and os.path.isfile(os.path.join(image_dir, f))
+    ]
+    print(f"Found {len(images)} image(s) in {image_dir}:")
+    for img_path in images:
+        print(f"  {img_path}")
+    run_encoder(setup_result, images)
 
 
 if __name__ == "__main__":
