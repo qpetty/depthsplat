@@ -61,7 +61,7 @@ FAR_DISPARITY = 0.1    # Pixel disparity for far plane computation (far objects)
 import torch
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from omegaconf import OmegaConf
 from src.config import load_typed_config
 from src.model.encoder import EncoderDepthSplatCfg, get_encoder
@@ -193,6 +193,65 @@ def load_intrinsics_extrinsics_from_metadata(image_base_path: str) -> tuple:
     if len(intrinsics_dict) == 0:
         return None, None
     
+    return intrinsics_dict, extrinsics_dict
+
+
+def load_intrinsics_extrinsics_from_manifest_entries(
+    image_entries: List[Tuple[Union[str, Path], Union[str, Path]]],
+) -> Tuple[Dict[str, List[float]], Dict[str, np.ndarray]]:
+    """
+    Load intrinsics and extrinsics from explicit metadata/image path pairs.
+
+    Args:
+        image_entries: List of (metadata_path, image_path) tuples.
+
+    Returns:
+        Tuple of dictionaries keyed by image filename.
+    """
+    if not image_entries:
+        raise ValueError("image_manifest must include at least one entry.")
+
+    intrinsics_dict: Dict[str, List[float]] = {}
+    extrinsics_dict: Dict[str, np.ndarray] = {}
+
+    for metadata_path, image_path in image_entries:
+        metadata_path = Path(metadata_path)
+        image_path = Path(image_path)
+
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        image_filename = image_path.name
+
+        if image_filename in intrinsics_dict:
+            raise ValueError(f"Duplicate image entry detected for {image_filename}")
+
+        intrinsics_flat = metadata.get("intrinsics", [])
+        if len(intrinsics_flat) != 9:
+            raise ValueError(
+                f"Invalid intrinsics format in {metadata_path.name}, expected 9 elements, got {len(intrinsics_flat)}"
+            )
+
+        fx = intrinsics_flat[0]
+        fy = intrinsics_flat[4]
+        cx = intrinsics_flat[2]
+        cy = intrinsics_flat[5]
+        intrinsics_dict[image_filename] = [fx, fy, cx, cy]
+
+        extrinsics_flat = metadata.get("extrinsics", [])
+        if len(extrinsics_flat) != 16:
+            raise ValueError(
+                f"Invalid extrinsics format in {metadata_path.name}, expected 16 elements, got {len(extrinsics_flat)}"
+            )
+
+        extrinsics_matrix = np.array(extrinsics_flat, dtype=np.float32).reshape(4, 4)
+        extrinsics_dict[image_filename] = extrinsics_matrix
+
     return intrinsics_dict, extrinsics_dict
 
 
@@ -587,6 +646,7 @@ def setup(
     checkpoint_path: Optional[Union[str, Path]] = None,
     config_root: Union[str, Path] = CONFIG_ROOT,
     image_base_path: Optional[Union[str, Path]] = IMAGE_BASE_PATH,
+    image_manifest: Optional[List[Tuple[Union[str, Path], Union[str, Path]]]] = None,
     encoder_overrides: Optional[Dict[str, Any]] = None,
     output_dir: Union[str, Path] = OUTPUT_DIR,
     num_encoder_runs: Optional[int] = None,
@@ -610,6 +670,36 @@ def setup(
     image_base_path = Path(image_base_path) if image_base_path is not None else None
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
 
+    resolved_manifest: Optional[List[Tuple[Path, Path]]] = None
+    if image_manifest:
+        resolved_manifest = []
+        for metadata_entry, image_entry in image_manifest:
+            metadata_path = Path(metadata_entry)
+            image_path = Path(image_entry)
+
+            if not metadata_path.exists():
+                raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+            if not image_path.exists():
+                raise FileNotFoundError(f"Image file not found: {image_path}")
+
+            metadata_path = metadata_path.resolve()
+            image_path = image_path.resolve()
+
+            resolved_manifest.append((metadata_path, image_path))
+
+        manifest_dirs = {metadata_path.parent for metadata_path, _ in resolved_manifest}
+        if len(manifest_dirs) != 1:
+            raise ValueError("All metadata files in image_manifest must share the same parent directory.")
+
+        manifest_base = manifest_dirs.pop()
+
+        if image_base_path is None:
+            image_base_path = manifest_base
+        elif image_base_path != manifest_base:
+            raise ValueError(
+                f"image_base_path ({image_base_path}) does not match metadata directory ({manifest_base}) from image_manifest."
+            )
+
     # Device selection: prefer CUDA, then MPS (Apple Silicon), then CPU
     if device is None:
         if torch.cuda.is_available():
@@ -625,7 +715,12 @@ def setup(
     print("Loading Camera Metadata")
     print("="*70)
     
-    intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_metadata(image_base_path)
+    if resolved_manifest is not None:
+        intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_manifest_entries(
+            resolved_manifest
+        )
+    else:
+        intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_metadata(image_base_path)
     
     if intrinsics_from_metadata is None or extrinsics_from_metadata is None:
         if image_base_path is not None:
@@ -712,14 +807,19 @@ def setup(
     # Determine number of views and image paths from loaded extrinsics
     batch_size = 1
     if isinstance(extrinsics_loaded, dict):
-        # Extract image filenames from dictionary keys
-        image_filenames = list(extrinsics_loaded.keys())
-        num_views = len(image_filenames)
-        if image_base_path is not None:
-            image_base = image_base_path
-            image_paths = [str(image_base / filename) for filename in image_filenames]
+        if resolved_manifest is not None:
+            image_filenames = [image_path.name for _, image_path in resolved_manifest]
+            num_views = len(image_filenames)
+            image_paths = [str(image_path) for _, image_path in resolved_manifest]
         else:
-            raise ValueError("IMAGE_BASE_PATH is None but extrinsics were loaded from metadata.")
+            # Extract image filenames from dictionary keys
+            image_filenames = list(extrinsics_loaded.keys())
+            num_views = len(image_filenames)
+            if image_base_path is not None:
+                image_base = image_base_path
+                image_paths = [str(image_base / filename) for filename in image_filenames]
+            else:
+                raise ValueError("IMAGE_BASE_PATH is None but extrinsics were loaded from metadata.")
     else:
         raise TypeError(f"Extrinsics from metadata must be a dict, got {type(extrinsics_loaded)}")
 
@@ -727,6 +827,11 @@ def setup(
     print("\n" + "="*70)
     print("Loading Images")
     print("="*70)
+
+    if image_paths:
+        print(f"  Encoder will use {len(image_paths)} image(s):")
+        for idx, (filename, path) in enumerate(zip(image_filenames, image_paths), start=1):
+            print(f"    [{idx:02d}] {filename} -> {path}")
     
     # Expected dimensions: 960 × 512 (width × height)
     EXPECTED_WIDTH = 960
