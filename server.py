@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from flask import Flask, jsonify, request
 
-from inference import SetupResult, run_encoder, setup
+from inference import SetupResult, run_encoder, setup_encoder
 
 
 app = Flask(__name__)
@@ -19,8 +19,6 @@ app = Flask(__name__)
 _SETUP_LOCK = threading.Lock()
 _SETUP_RESULT: Optional[SetupResult] = None
 _SETUP_ERROR: Optional[str] = None
-_SETUP_CONTEXT_PATH: Optional[Path] = None
-_SETUP_IMAGE_KEY: Optional[Tuple[str, ...]] = None
 
 _APP_ROOT = Path(__file__).resolve().parent
 
@@ -33,81 +31,28 @@ def _resolve_path(path_value: Union[str, Path]) -> Path:
     return path
 
 
-def _build_manifest_key(image_entries: Optional[List[Tuple[Path, Path]]]) -> Optional[Tuple[str, ...]]:
-    """Create a stable cache key for a collection of image/metadata path pairs."""
-    if not image_entries:
-        return None
-
-    normalized = [
-        f"{metadata_path.resolve()}::{image_path.resolve()}"
-        for metadata_path, image_path in image_entries
-    ]
-    normalized.sort()
-    return tuple(normalized)
-
-
-def _initialize_encoder(
-    image_base_path: Optional[Union[str, Path]] = None,
-    *,
-    force: bool = False,
-    image_entries: Optional[List[Tuple[Path, Path]]] = None,
-) -> None:
-    """Initialize the encoder for a specific image base path."""
-    global _SETUP_RESULT, _SETUP_ERROR, _SETUP_CONTEXT_PATH, _SETUP_IMAGE_KEY
+def _initialize_encoder() -> None:
+    """Initialize the encoder exactly once for the process lifetime."""
+    global _SETUP_RESULT, _SETUP_ERROR
 
     with _SETUP_LOCK:
-        requested_path: Optional[Path] = None
-        if image_base_path is not None:
-            requested_path = _resolve_path(image_base_path)
-
-        manifest_key = _build_manifest_key(image_entries)
-
-        # Already initialized for this path.
-        cache_match = (
-            _SETUP_RESULT is not None
-            and _SETUP_CONTEXT_PATH == requested_path
-            and _SETUP_IMAGE_KEY == manifest_key
-        )
-
-        if not force and cache_match:
-            return
-
-        # If we have a cached result for a different path and the caller did not force re-init,
-        # reinitialize automatically so the cached context matches the requested path.
-        if _SETUP_RESULT is not None and not cache_match:
-            force = True
-
-        if not force and _SETUP_RESULT is not None and requested_path is None:
+        if _SETUP_RESULT is not None:
             return
 
         try:
-            setup_kwargs: Dict[str, Any] = {}
-            if requested_path is not None:
-                setup_kwargs["image_base_path"] = requested_path
-            if image_entries:
-                setup_kwargs["image_manifest"] = [
-                    (metadata_path, image_path) for metadata_path, image_path in image_entries
-                ]
-            app.logger.info(
-                "Initializing encoder via inference.setup() for path: %s (images: %s)",
-                str(requested_path) if requested_path is not None else "<default>",
-                "payload-provided" if image_entries else "directory-default",
-            )
-            _SETUP_RESULT = setup(**setup_kwargs)
-            _SETUP_CONTEXT_PATH = requested_path
-            _SETUP_IMAGE_KEY = manifest_key
+            app.logger.info("Initializing encoder via inference.setup_encoder()")
+            _SETUP_RESULT = setup_encoder()
             _SETUP_ERROR = None
-            app.logger.info("Encoder initialized successfully for path: %s", _SETUP_CONTEXT_PATH or "<default>")
+            app.logger.info("Encoder initialized successfully.")
         except Exception as exc:  # noqa: BLE001 - we want to surface any failure.
             _SETUP_RESULT = None
-            _SETUP_CONTEXT_PATH = None
-            _SETUP_IMAGE_KEY = None
             _SETUP_ERROR = str(exc)
             app.logger.exception("Failed to initialize encoder: %s", exc)
+            raise
 
 
-def _extract_payload_image_base(payload: Dict[str, Any]) -> Tuple[str, Path, List[Tuple[Path, Path]]]:
-    """Validate POST payload and extract capture ID, base path, and image entries."""
+def _extract_payload_image_base(payload: Dict[str, Any]) -> Tuple[str, List[Tuple[Path, Path]]]:
+    """Validate POST payload and extract capture ID with resolved image entries."""
     capture_id = payload.get("capture_id")
     if not capture_id or not isinstance(capture_id, str):
         raise ValueError("`capture_id` must be provided as a non-empty string.")
@@ -146,8 +91,7 @@ def _extract_payload_image_base(payload: Dict[str, Any]) -> Tuple[str, Path, Lis
     if len(metadata_dirs) != 1:
         raise ValueError("All metadata files must share a single parent directory.")
 
-    image_base_path = metadata_dirs.pop()
-    return capture_id, image_base_path, resolved_entries
+    return capture_id, resolved_entries
 
 
 @app.route("/healthz", methods=["GET"])
@@ -161,8 +105,6 @@ def healthcheck():
         message = _SETUP_ERROR
 
     response: Dict[str, Any] = {"status": status, "message": message}
-    if _SETUP_CONTEXT_PATH is not None:
-        response["image_base_path"] = str(_SETUP_CONTEXT_PATH)
     return jsonify(response)
 
 
@@ -180,46 +122,33 @@ def process_route():
     output_dir = payload.get("output_dir")
 
     try:
-        capture_id, image_base_path, image_entries = _extract_payload_image_base(payload)
+        capture_id, image_entries = _extract_payload_image_base(payload)
     except (ValueError, FileNotFoundError) as payload_error:
         app.logger.warning("Invalid /process payload: %s", payload_error)
         return jsonify({"status": "error", "message": str(payload_error)}), 400
 
-    try:
-        _initialize_encoder(image_base_path, image_entries=image_entries)
-    except Exception as exc:  # noqa: BLE001
-        return (
-            jsonify(
-                {
-                    "status": "error",
-                    "message": "Encoder failed to initialize for requested path.",
-                    "details": str(exc),
-                }
-            ),
-            500,
-        )
 
     try:
-        run_kwargs: Dict[str, Any] = {}
-        if isinstance(num_runs, int) and num_runs > 0:
-            run_kwargs["num_runs"] = num_runs
-
-        if isinstance(output_dir, str) and output_dir:
-            resolved_output_dir = _resolve_path(output_dir)
-            run_kwargs["output_dir"] = resolved_output_dir
-            app.logger.info("Overriding output directory via payload: %s", resolved_output_dir)
-        else:
-            resolved_output_dir = _resolve_path(os.environ.get("DEPTHSPLAT_OUTPUT_ROOT", "run-output"))
-            run_kwargs["output_dir"] = resolved_output_dir
-            app.logger.info("Using shared output directory: %s", resolved_output_dir)
-
+        _initialize_encoder()
         if _SETUP_RESULT is None:
-            raise RuntimeError("Encoder initialization missing after setup.")
+            raise RuntimeError("Encoder is not initialized.")
 
+        images = [str(image_path) for _, image_path in image_entries]
+        run_kwargs: Dict[str, Any] = {"images": images}
+
+        if num_runs is not None:
+            run_kwargs["num_runs"] = num_runs
+        if output_dir is not None:
+            run_kwargs["output_dir"] = _resolve_path(output_dir)
+
+        app.logger.info(
+            "Starting encoder run for capture %s with %d images", capture_id, len(images)
+        )
         inference_result = run_encoder(_SETUP_RESULT, **run_kwargs)
 
         response_body = {
             "status": "success",
+            "capture_id": capture_id,
             "encoder_total_time": inference_result.get("encoder_total_time"),
             "encoder_average_time": inference_result.get("encoder_average_time"),
             "ply_export_time": inference_result.get("ply_export_time"),
@@ -236,12 +165,10 @@ def process_route():
 
 def create_app() -> Flask:
     """Factory for WSGI servers."""
-    default_image_base = os.environ.get("DEPTHSPLAT_IMAGE_BASE_PATH")
-    if default_image_base:
-        try:
-            _initialize_encoder(default_image_base)
-        except Exception as exc:  # noqa: BLE001
-            app.logger.warning("Deferred encoder initialization failed during app creation: %s", exc)
+    try:
+        _initialize_encoder()
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("Deferred encoder initialization failed during app creation: %s", exc)
     return app
 
 
@@ -250,8 +177,7 @@ if __name__ == "__main__":
     host = os.environ.get("FLASK_RUN_HOST", "0.0.0.0")
     port = int(os.environ.get("FLASK_RUN_PORT", "8081"))
 
-    default_image_base = os.environ.get("DEPTHSPLAT_IMAGE_BASE_PATH")
-    if default_image_base:
-        _initialize_encoder(default_image_base)
+
+    _initialize_encoder()
     app.run(host=host, port=port)
 
