@@ -39,7 +39,7 @@ ENABLE_TORCH_COMPILE = False
 
 # Number of times to run the encoder for timing/benchmarking.
 # Set >1 to measure average runtime; the final run's output is used for export.
-NUM_ENCODER_RUNS = 4
+NUM_ENCODER_RUNS = 1
 
 import numpy as np
 
@@ -60,6 +60,8 @@ FAR_DISPARITY = 0.1    # Pixel disparity for far plane computation (far objects)
 
 import torch
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 from omegaconf import OmegaConf
 from src.config import load_typed_config
 from src.model.encoder import EncoderDepthSplatCfg, get_encoder
@@ -73,6 +75,19 @@ from src.geometry.projection import get_fov
 from src.dataset.shims.bounds_shim import compute_depth_for_disparity
 from scipy.spatial.transform import Rotation as R
 import json
+
+
+@dataclass
+class SetupResult:
+    encoder: torch.nn.Module
+    context: Dict[str, torch.Tensor]
+    num_views: int
+    output_dir: Path
+    camera_centers: List[torch.Tensor]
+    camera_distances: List[float]
+    num_encoder_runs: int
+    ply_export_validation: bool
+    device: str
 
 
 def load_metadata_from_json(image_base_path: str, image_filename: str) -> dict:
@@ -568,14 +583,41 @@ def validate_ply_export(
     print("=" * 70)
 
 
-def main():
+def setup(
+    checkpoint_path: Optional[Union[str, Path]] = None,
+    config_root: Union[str, Path] = CONFIG_ROOT,
+    image_base_path: Optional[Union[str, Path]] = IMAGE_BASE_PATH,
+    encoder_overrides: Optional[Dict[str, Any]] = None,
+    output_dir: Union[str, Path] = OUTPUT_DIR,
+    num_encoder_runs: Optional[int] = None,
+    enable_torch_compile: Optional[bool] = None,
+    ply_export_validation: Optional[bool] = None,
+    device: Optional[str] = None,
+) -> SetupResult:
+    if checkpoint_path is None:
+        checkpoint_path = CHECKPOINT_PATH
+    if encoder_overrides is None:
+        encoder_overrides = ENCODER_OVERRIDES
+    if num_encoder_runs is None:
+        num_encoder_runs = NUM_ENCODER_RUNS
+    if enable_torch_compile is None:
+        enable_torch_compile = ENABLE_TORCH_COMPILE
+    if ply_export_validation is None:
+        ply_export_validation = PLY_EXPORT_VALIDATION
+
+    config_root = Path(config_root)
+    output_dir = Path(output_dir)
+    image_base_path = Path(image_base_path) if image_base_path is not None else None
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
+
     # Device selection: prefer CUDA, then MPS (Apple Silicon), then CPU
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
     print(f"Using device: {device}")
     
     # Load intrinsics and extrinsics from JSON metadata files
@@ -583,12 +625,12 @@ def main():
     print("Loading Camera Metadata")
     print("="*70)
     
-    intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_metadata(IMAGE_BASE_PATH)
+    intrinsics_from_metadata, extrinsics_from_metadata = load_intrinsics_extrinsics_from_metadata(image_base_path)
     
     if intrinsics_from_metadata is None or extrinsics_from_metadata is None:
-        if IMAGE_BASE_PATH is not None:
+        if image_base_path is not None:
             raise FileNotFoundError(
-                f"No metadata files found in {IMAGE_BASE_PATH}. "
+                f"No metadata files found in {image_base_path}. "
                 f"Please ensure metadata files (e.g., '*_metadata.json') are present."
             )
         else:
@@ -596,7 +638,7 @@ def main():
                 "IMAGE_BASE_PATH is None. Please set IMAGE_BASE_PATH to a directory containing images and metadata files."
             )
     
-    print(f"  Found {len(extrinsics_from_metadata)} metadata file(s) in {IMAGE_BASE_PATH}")
+    print(f"  Found {len(extrinsics_from_metadata)} metadata file(s) in {image_base_path}")
     print(f"  Loaded extrinsics for {len(extrinsics_from_metadata)} image(s)")
     
     # For intrinsics, we need to handle per-image intrinsics
@@ -623,7 +665,7 @@ def main():
     print("\n" + "="*70)
     print("Loading Encoder Config")
     print("="*70)
-    encoder_cfg = load_encoder_config(CONFIG_ROOT, ENCODER_OVERRIDES)
+    encoder_cfg = load_encoder_config(str(config_root), encoder_overrides)
 
     # Initialize encoder
     print("\n" + "="*70)
@@ -634,7 +676,7 @@ def main():
     encoder.eval()
 
     # Optionally compile the encoder for faster repeated inference.
-    if ENABLE_TORCH_COMPILE:
+    if enable_torch_compile:
         if hasattr(torch, "compile"):
             try:
                 encoder = torch.compile(encoder, mode="reduce-overhead")
@@ -647,9 +689,9 @@ def main():
     print("Encoder initialized successfully!")
 
     # Load checkpoint if provided
-    if CHECKPOINT_PATH and Path(CHECKPOINT_PATH).exists():
-        print(f"\nLoading checkpoint from {CHECKPOINT_PATH}")
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    if checkpoint_path and checkpoint_path.exists():
+        print(f"\nLoading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
 
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
@@ -662,8 +704,8 @@ def main():
         else:
             encoder.load_state_dict(checkpoint, strict=False)
         print("Checkpoint loaded successfully!")
-    elif CHECKPOINT_PATH:
-        print(f"\nWarning: Checkpoint path '{CHECKPOINT_PATH}' does not exist. Using randomly initialized weights.")
+    elif checkpoint_path:
+        print(f"\nWarning: Checkpoint path '{checkpoint_path}' does not exist. Using randomly initialized weights.")
     else:
         print("\nNo checkpoint path provided. Using randomly initialized weights.")
 
@@ -673,8 +715,8 @@ def main():
         # Extract image filenames from dictionary keys
         image_filenames = list(extrinsics_loaded.keys())
         num_views = len(image_filenames)
-        if IMAGE_BASE_PATH is not None:
-            image_base = Path(IMAGE_BASE_PATH)
+        if image_base_path is not None:
+            image_base = image_base_path
             image_paths = [str(image_base / filename) for filename in image_filenames]
         else:
             raise ValueError("IMAGE_BASE_PATH is None but extrinsics were loaded from metadata.")
@@ -1148,21 +1190,70 @@ def main():
         print("  No obvious issues detected.")
     
     print("="*70)
+    
+    return SetupResult(
+        encoder=encoder,
+        context=context,
+        num_views=num_views,
+        output_dir=output_dir,
+        camera_centers=camera_centers,
+        camera_distances=camera_distances,
+        num_encoder_runs=num_encoder_runs,
+        ply_export_validation=ply_export_validation,
+        device=device,
+    )
 
-    # Prepare visualization dump to capture scales and rotations for PLY export
-    visualization_dump = {}
 
-    # Run encoder (optionally multiple times for benchmarking)
-    print("\n" + "="*70)
+def run_encoder(
+    setup_result: SetupResult,
+    num_runs: Optional[int] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    visualization_dump: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Run the encoder inference loop and export the resulting Gaussians to a PLY file.
+
+    Args:
+        setup_result: Output of `setup()` containing encoder, context, and metadata.
+        num_runs: Optional override for the number of encoder runs.
+        output_dir: Optional override for the directory where the PLY will be saved.
+        visualization_dump: Optional dictionary to populate with visualization tensors.
+
+    Returns:
+        Dictionary containing the encoder result, PLY path (if exported), visualization dump, and timing info.
+    """
+    encoder = setup_result.encoder
+    context = setup_result.context
+    num_views = setup_result.num_views
+    output_dir_path = Path(output_dir) if output_dir is not None else setup_result.output_dir
+    num_runs = num_runs if num_runs is not None else setup_result.num_encoder_runs
+    if num_runs <= 0:
+        raise ValueError("num_runs must be a positive integer")
+
+    ply_export_validation = setup_result.ply_export_validation
+    camera_centers = setup_result.camera_centers
+    camera_distances = setup_result.camera_distances
+    device = setup_result.device
+
+    if visualization_dump is None:
+        visualization_dump = {}
+
+    near = context["near"]
+    far = context["far"]
+
+    print("\n" + "=" * 70)
     print("Running Encoder Inference")
-    print("="*70)
-    print(f"  Encoder will run {NUM_ENCODER_RUNS} time(s)")
+    print("=" * 70)
+    print(f"  Encoder will run {num_runs} time(s)")
 
-    result = None
+    result: Any = None
     total_encoder_elapsed = 0.0
+    encoder_elapsed = 0.0
+    encoder_start_wall_time = time.time()
+    encoder_end_wall_time = encoder_start_wall_time
 
-    for run_idx in range(NUM_ENCODER_RUNS):
-        print(f"\n  ----- Encoder run {run_idx + 1}/{NUM_ENCODER_RUNS} -----")
+    for run_idx in range(num_runs):
+        print(f"\n  ----- Encoder run {run_idx + 1}/{num_runs} -----")
         encoder_start_time = time.perf_counter()
         encoder_start_wall_time = time.time()
         print(f"    Run start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
@@ -1183,11 +1274,10 @@ def main():
         print(f"    Run end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
         print(f"    Run elapsed time: {encoder_elapsed:.3f} seconds")
 
-    avg_encoder_elapsed = total_encoder_elapsed / max(NUM_ENCODER_RUNS, 1)
-    print(f"\n  Encoder total time over {NUM_ENCODER_RUNS} run(s): {total_encoder_elapsed:.3f} seconds")
+    avg_encoder_elapsed = total_encoder_elapsed / max(num_runs, 1)
+    print(f"\n  Encoder total time over {num_runs} run(s): {total_encoder_elapsed:.3f} seconds")
     print(f"  Encoder average time per run: {avg_encoder_elapsed:.3f} seconds ({avg_encoder_elapsed/60:.2f} minutes)")
 
-    # Handle both dict and direct gaussians return
     if isinstance(result, dict):
         gaussians = result["gaussians"]
         depths = result.get("depths", None)
@@ -1203,102 +1293,87 @@ def main():
     print(f"  Covariances: {gaussians.covariances.shape}")
     print(f"  Harmonics: {gaussians.harmonics.shape}")
     print(f"  Opacities: {gaussians.opacities.shape}")
-    
-    # Debug: Check depth values if available
+
     if "depth" in visualization_dump:
         depth_values = visualization_dump["depth"]  # [B, V, H, W, srf, s]
         print(f"\n  Depth Statistics:")
         print(f"    Depth shape: {depth_values.shape}")
         for v in range(num_views):
             view_depth = depth_values[0, v]  # [H, W, srf, s]
-            # Flatten to get all depth values for this view
             view_depth_flat = view_depth.flatten()
             print(f"    View {v}:")
             print(f"      Min depth: {view_depth_flat.min().item():.3f}")
             print(f"      Max depth: {view_depth_flat.max().item():.3f}")
             print(f"      Mean depth: {view_depth_flat.mean().item():.3f}")
             print(f"      Median depth: {view_depth_flat.median().item():.3f}")
-            print(f"      Expected range: [{near[0, v].item():.3f}, {far[0, v].item():.3f}]")
-            if view_depth_flat.min().item() < near[0, v].item() * 0.5:
-                print(f"      WARNING: Min depth ({view_depth_flat.min().item():.3f}) is much less than near plane ({near[0, v].item():.3f})")
-            if view_depth_flat.max().item() > far[0, v].item() * 2.0:
-                print(f"      WARNING: Max depth ({view_depth_flat.max().item():.3f}) is much greater than far plane ({far[0, v].item():.3f})")
+            expected_near = near[0, v].item()
+            expected_far = far[0, v].item()
+            print(f"      Expected range: [{expected_near:.3f}, {expected_far:.3f}]")
+            if view_depth_flat.min().item() < expected_near * 0.5:
+                print(f"      WARNING: Min depth ({view_depth_flat.min().item():.3f}) is much less than near plane ({expected_near:.3f})")
+            if view_depth_flat.max().item() > expected_far * 2.0:
+                print(f"      WARNING: Max depth ({view_depth_flat.max().item():.3f}) is much greater than far plane ({expected_far:.3f})")
 
-    # Export to PLY
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Exporting to PLY")
-    print("="*70)
+    print("=" * 70)
     ply_export_start_time = time.perf_counter()
     ply_export_start_wall_time = time.time()
     print(f"  PLY export start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_start_wall_time))}")
-    
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ply_path = output_dir / "gaussians.ply"
 
-    # Check if visualization dump contains required data
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    ply_path = output_dir_path / "gaussians.ply"
+
+    ply_export_elapsed: Optional[float] = None
+    ply_export_end_wall_time: Optional[float] = None
+
     if "scales" in visualization_dump and "rotations" in visualization_dump:
-        # Dictionary to store timing for each step
-        step_timings = {}
-        
-        # Extract scales and rotations from visualization_dump
+        step_timings: Dict[str, float] = {}
+
         extract_start_time = time.perf_counter()
         scales = visualization_dump["scales"][0]  # [num_gaussians, 3]
         rotations = visualization_dump["rotations"][0]  # [num_gaussians, 4] (xyzw format)
         extract_end_time = time.perf_counter()
         step_timings["extract_scales_rotations"] = extract_end_time - extract_start_time
 
-        # Use the first view's extrinsics as reference for the PLY export
-        # This matches save_gaussian_ply and encoder_visualizer which use view 0
         extrinsics_start_time = time.perf_counter()
-        reference_extrinsics = context["extrinsics"][0, 0].detach().cpu()  # Use first view
+        reference_extrinsics = context["extrinsics"][0, 0].detach().cpu()
         extrinsics_end_time = time.perf_counter()
         step_timings["get_reference_extrinsics"] = extrinsics_end_time - extrinsics_start_time
 
-        # Convert rotations from camera space to world space
-        # The gaussians are flattened across views as: [v, r, srf, spp] -> [v*r*srf*spp]
-        # We need to convert each view's rotations using that view's C2W matrix
         rotation_conv_start_time = time.perf_counter()
         total_gaussians = rotations.shape[0]
         num_gaussians_per_view = total_gaussians // num_views
 
-        # Verify the division is exact
         if total_gaussians % num_views != 0:
             raise ValueError(
                 f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
             )
 
-        # Convert per-view C2W rotation matrices to quaternions once (small V)
-        c2w_rotations = context["extrinsics"][0, :, :3, :3]  # [V, 3, 3] torch
-        c2w_rotations_np = c2w_rotations.detach().cpu().numpy()  # [V, 3, 3]
-        c2w_quats_np = R.from_matrix(c2w_rotations_np).as_quat().astype(np.float32)  # [V, 4], xyzw, float32
-        c2w_quats = torch.from_numpy(c2w_quats_np).to(rotations.device)  # [V, 4]
+        c2w_rotations = context["extrinsics"][0, :, :3, :3]
+        c2w_rotations_np = c2w_rotations.detach().cpu().numpy()
+        c2w_quats_np = R.from_matrix(c2w_rotations_np).as_quat().astype(np.float32)
+        c2w_quats = torch.from_numpy(c2w_quats_np).to(rotations.device)
 
-        # Build per-Gaussian view indices in torch
         view_ids = torch.repeat_interleave(
             torch.arange(num_views, device=rotations.device),
             num_gaussians_per_view,
-        )  # [N]
+        )
         if view_ids.shape[0] != total_gaussians:
             raise ValueError(
                 f"view_ids length ({view_ids.shape[0]}) does not match total_gaussians ({total_gaussians})"
             )
 
-        # Per-Gaussian C2W quaternions: [N, 4]
-        c2w_gauss_quats = c2w_quats[view_ids]  # [N, 4]
-
-        # Compose rotations in quaternion space (world = C2W * cam)
-        world_rotations = quat_mul_xyzw(c2w_gauss_quats, rotations)  # [N, 4], xyzw
+        c2w_gauss_quats = c2w_quats[view_ids]
+        world_rotations = quat_mul_xyzw(c2w_gauss_quats, rotations)
 
         rotation_conv_end_time = time.perf_counter()
         step_timings["convert_rotations_to_world_space"] = rotation_conv_end_time - rotation_conv_start_time
 
-        # Export to PLY directly in world space (avoiding export_ply's coordinate transformations)
-        # All gaussians are already in world space from the encoder, so we can export them directly
         extract_props_start_time = time.perf_counter()
-        means_world = gaussians.means[0].detach().cpu()  # [num_gaussians, 3] (world space)
-        
-        if PLY_EXPORT_VALIDATION:
+        means_world = gaussians.means[0].detach().cpu()
+
+        if ply_export_validation:
             validate_ply_export(
                 context=context,
                 gaussians=gaussians,
@@ -1307,46 +1382,39 @@ def main():
                 num_gaussians_per_view=num_gaussians_per_view,
                 camera_centers=camera_centers,
             )
-            print("="*70)
+            print("=" * 70)
 
-        scales_world = scales.detach().cpu()  # [num_gaussians, 3] (world space)
-        rotations_world = world_rotations.detach().cpu()  # [num_gaussians, 4] (world space, xyzw format)
-        harmonics_world = gaussians.harmonics[0].detach().cpu()  # [num_gaussians, 3, d_sh]
-        opacities_world = gaussians.opacities[0].detach().cpu()  # [num_gaussians]
+        scales_world = scales.detach().cpu()
+        rotations_world = world_rotations.detach().cpu()
+        harmonics_world = gaussians.harmonics[0].detach().cpu()
+        opacities_world = gaussians.opacities[0].detach().cpu()
         extract_props_end_time = time.perf_counter()
         step_timings["extract_gaussian_properties"] = extract_props_end_time - extract_props_start_time
-        
-        # Convert quaternions from xyzw (scipy format) to wxyz (PLY format)
+
         quaternion_conv_start_time = time.perf_counter()
         x, y, z, w = rearrange(rotations_world.numpy(), "g xyzw -> xyzw g")
-        rotations_ply = np.stack((w, x, y, z), axis=-1)  # [num_gaussians, 4] (wxyz format)
+        rotations_ply = np.stack((w, x, y, z), axis=-1)
         quaternion_conv_end_time = time.perf_counter()
         step_timings["convert_quaternion_format"] = quaternion_conv_end_time - quaternion_conv_start_time
-        
-        # Extract DC component of spherical harmonics (view-independent color)
+
         harmonics_start_time = time.perf_counter()
-        harmonics_dc = harmonics_world[..., 0].numpy()  # [num_gaussians, 3]
+        harmonics_dc = harmonics_world[..., 0].numpy()
         harmonics_end_time = time.perf_counter()
         step_timings["extract_harmonics_dc"] = harmonics_end_time - harmonics_start_time
-        
-        # Construct PLY attributes (matching export_ply format)
-        # Format: x, y, z, nx, ny, nz, f_dc_0, f_dc_1, f_dc_2, opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3
+
         attributes_start_time = time.perf_counter()
         attributes_list = [
-            means_world.numpy(),  # x, y, z
-            np.zeros_like(means_world.numpy()),  # nx, ny, nz (normals - unused, set to zero)
-            harmonics_dc,  # f_dc_0, f_dc_1, f_dc_2
-            torch.logit(opacities_world[..., None]).numpy(),  # opacity (as logit)
-            scales_world.log().numpy(),  # scale_0, scale_1, scale_2 (log of scales)
-            rotations_ply,  # rot_0, rot_1, rot_2, rot_3 (wxyz quaternion)
+            means_world.numpy(),
+            np.zeros_like(means_world.numpy()),
+            harmonics_dc,
+            torch.logit(opacities_world[..., None]).numpy(),
+            scales_world.log().numpy(),
+            rotations_ply,
         ]
-        
-        # Concatenate all attributes
-        attributes = np.concatenate(attributes_list, axis=1)  # [num_gaussians, 3+3+3+1+3+4 = 17]
+        attributes = np.concatenate(attributes_list, axis=1)
         attributes_end_time = time.perf_counter()
         step_timings["construct_ply_attributes"] = attributes_end_time - attributes_start_time
-        
-        # Define PLY data type
+
         structured_array_start_time = time.perf_counter()
         dtype_full = [
             ("x", "f4"), ("y", "f4"), ("z", "f4"),
@@ -1356,21 +1424,19 @@ def main():
             ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
             ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
         ]
-        
-        # Create structured array without per-row Python tuple construction
+
         elements = np.empty(means_world.shape[0], dtype=dtype_full)
         for i, name in enumerate(elements.dtype.names):
             elements[name] = attributes[:, i]
         structured_array_end_time = time.perf_counter()
         step_timings["create_structured_array"] = structured_array_end_time - structured_array_start_time
-        
-        # Write PLY file with timing
+
         ply_write_start_time = time.perf_counter()
         ply_path.parent.mkdir(parents=True, exist_ok=True)
         PlyData([PlyElement.describe(elements, "vertex")]).write(ply_path)
         ply_write_end_time = time.perf_counter()
         step_timings["write_ply_file"] = ply_write_end_time - ply_write_start_time
-        
+
         ply_export_end_time = time.perf_counter()
         ply_export_end_wall_time = time.time()
         ply_export_elapsed = ply_export_end_time - ply_export_start_time
@@ -1378,44 +1444,34 @@ def main():
         print(f"  File size: {ply_path.stat().st_size / (1024*1024):.2f} MB")
         print(f"  PLY export end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_end_wall_time))}")
         print(f"  PLY export elapsed time: {ply_export_elapsed:.3f} seconds ({ply_export_elapsed/60:.2f} minutes)")
-        
-        # Print detailed step timings
-        print("\n" + "="*70)
+
+        print("\n" + "=" * 70)
         print("PLY Conversion Step Timings")
-        print("="*70)
-        # Sort by time descending to show slowest steps first
+        print("=" * 70)
         sorted_timings = sorted(step_timings.items(), key=lambda x: x[1], reverse=True)
         total_step_time = sum(step_timings.values())
         for step_name, elapsed_time in sorted_timings:
             percentage = (elapsed_time / total_step_time * 100) if total_step_time > 0 else 0
-            # Format step name for display
             display_name = step_name.replace("_", " ").title()
             print(f"  {display_name:35s}: {elapsed_time:8.3f} seconds ({percentage:5.1f}%)")
         print(f"\n  {'Total (all steps)':35s}: {total_step_time:8.3f} seconds")
-        print("="*70)
+        print("=" * 70)
     else:
         print("✗ Warning: visualization_dump does not contain scales/rotations.")
         print("  Cannot export to PLY without this information.")
         print("  This may happen if the encoder config has certain settings.")
         print(f"  Available keys in visualization_dump: {list(visualization_dump.keys())}")
-
-        # Try to export with scales/rotations from gaussians if available
-        # Note: The gaussians object from the adapter should have scales and rotations
-        # But they're not in world space, so this is a fallback
         print("\n  Note: The visualization_dump should be populated by the encoder.")
         print("  If this is missing, check that the encoder is configured correctly.")
-        # PLY export didn't complete, so we don't have end time
-        ply_export_elapsed = None
 
-    # Print timing summary
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Timing Summary")
-    print("="*70)
+    print("=" * 70)
     print(f"  Encoder inference:")
     print(f"    Start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
     print(f"    End: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
     print(f"    Elapsed: {encoder_elapsed:.3f} seconds ({encoder_elapsed/60:.2f} minutes)")
-    if ply_export_elapsed is not None:
+    if ply_export_elapsed is not None and ply_export_end_wall_time is not None:
         print(f"  PLY export:")
         print(f"    Start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_start_wall_time))}")
         print(f"    End: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ply_export_end_wall_time))}")
@@ -1423,12 +1479,29 @@ def main():
         total_elapsed = encoder_elapsed + ply_export_elapsed
         print(f"  Total time: {total_elapsed:.3f} seconds ({total_elapsed/60:.2f} minutes)")
     else:
-        print(f"  PLY export: Not completed (missing visualization data)")
+        print("  PLY export: Not completed (missing visualization data)")
         print(f"  Total time (encoder only): {encoder_elapsed:.3f} seconds ({encoder_elapsed/60:.2f} minutes)")
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Done!")
-    print("="*70)
+    print("=" * 70)
+
+    return {
+        "result": result,
+        "ply_path": ply_path if ply_export_elapsed is not None else None,
+        "visualization_dump": visualization_dump,
+        "encoder_total_time": total_encoder_elapsed,
+        "encoder_average_time": avg_encoder_elapsed,
+        "ply_export_time": ply_export_elapsed,
+        "device": device,
+        "num_runs": num_runs,
+        "camera_distances": camera_distances,
+    }
+
+
+def main() -> None:
+    setup_result = setup()
+    run_encoder(setup_result)
 
 
 if __name__ == "__main__":
