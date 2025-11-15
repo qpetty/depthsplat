@@ -41,7 +41,23 @@ def transform_world2cam(
     extrinsics: Float[Tensor, "*#batch dim dim"],
 ) -> Float[Tensor, "*batch dim"]:
     """Transform points from 3D world coordinates to 3D camera coordinates."""
-    return transform_rigid(homogeneous_coordinates, extrinsics.inverse())
+    # NOTE: We avoid generic matrix inversion here in favor of an analytical
+    # rigid-transform inverse when exporting to ONNX, since torch.inverse /
+    # torch.linalg.inv decompose to aten.linalg_inv_ex, which currently has no
+    # ONNX decomposition.
+    if torch.onnx.is_in_onnx_export():
+        # Assume extrinsics is a rigid 4x4 transform [[R, t], [0, 1]].
+        R = extrinsics[..., :3, :3]
+        t = extrinsics[..., :3, 3]
+        R_inv = R.transpose(-1, -2)
+        t_inv = -einsum(R_inv, t, "... i j, ... j -> ... i")
+        world2cam = torch.zeros_like(extrinsics)
+        world2cam[..., :3, :3] = R_inv
+        world2cam[..., :3, 3] = t_inv
+        world2cam[..., 3, 3] = 1.0
+    else:
+        world2cam = extrinsics.inverse()
+    return transform_rigid(homogeneous_coordinates, world2cam)
 
 
 def project_camera_space(
@@ -71,6 +87,31 @@ def project(
     return project_camera_space(points, intrinsics, epsilon=epsilon), in_front_of_camera
 
 
+def _invert_camera_intrinsics(
+    intrinsics: Float[Tensor, "*#batch 3 3"],
+) -> Float[Tensor, "*batch 3 3"]:
+    """Analytically invert standard pinhole intrinsics matrices.
+
+    Assumes intrinsics of the form:
+        [[fx, 0,  cx],
+         [0,  fy, cy],
+         [0,  0,  1 ]]
+    which is true for all intrinsics constructed in this codebase.
+    """
+    fx = intrinsics[..., 0, 0]
+    fy = intrinsics[..., 1, 1]
+    cx = intrinsics[..., 0, 2]
+    cy = intrinsics[..., 1, 2]
+
+    inv = torch.zeros_like(intrinsics)
+    inv[..., 0, 0] = 1.0 / fx
+    inv[..., 1, 1] = 1.0 / fy
+    inv[..., 0, 2] = -cx / fx
+    inv[..., 1, 2] = -cy / fy
+    inv[..., 2, 2] = 1.0
+    return inv
+
+
 def unproject(
     coordinates: Float[Tensor, "*#batch dim"],
     z: Float[Tensor, "*#batch"],
@@ -78,10 +119,12 @@ def unproject(
 ) -> Float[Tensor, "*batch dim+1"]:
     """Unproject 2D camera coordinates with the given Z values."""
 
-    # Apply the inverse intrinsics to the coordinates.
+    # Apply the inverse intrinsics to the coordinates using the analytical
+    # inverse to keep ONNX export free of matrix-inverse ops.
     coordinates = homogenize_points(coordinates)
+    intrinsics_inv = _invert_camera_intrinsics(intrinsics)
     ray_directions = einsum(
-        intrinsics.inverse(), coordinates, "... i j, ... j -> ... i"
+        intrinsics_inv, coordinates, "... i j, ... j -> ... i"
     )
 
     # Apply the supplied depth values.
@@ -231,7 +274,7 @@ def intersect_rays(
 
 
 def get_fov(intrinsics: Float[Tensor, "batch 3 3"]) -> Float[Tensor, "batch 2"]:
-    intrinsics_inv = intrinsics.inverse()
+    intrinsics_inv = _invert_camera_intrinsics(intrinsics)
 
     def process_vector(vector):
         vector = torch.tensor(vector, dtype=torch.float32, device=intrinsics.device)

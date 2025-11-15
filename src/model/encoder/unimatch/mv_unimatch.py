@@ -615,13 +615,25 @@ class MultiViewUniMatch(nn.Module):
 
             # relative pose
             # extrinsics: c2w
-            # Example for pose_curr line (and similar)
+            # NOTE: Avoid generic matrix inverse (torch.inverse / torch.linalg.inv)
+            # when exporting to ONNX, since they decompose to aten.linalg_inv_ex,
+            # which currently has no ONNX decomposition. Use an analytical rigid
+            # transform inverse instead.
             if torch.onnx.is_in_onnx_export():
-                # Export: Use linalg.inv (traces to aten.linalg_inv → ONNX Inverse)
-                pose_curr = torch.matmul(torch.linalg.inv(tgt_extrinsics), ref_extrinsics.unsqueeze(1))
+                R = tgt_extrinsics[..., :3, :3]
+                t = tgt_extrinsics[..., :3, 3]
+                R_inv = R.transpose(-1, -2)
+                t_inv = -torch.matmul(R_inv, t.unsqueeze(-1)).squeeze(-1)
+                tgt_extrinsics_inv = torch.zeros_like(tgt_extrinsics)
+                tgt_extrinsics_inv[..., :3, :3] = R_inv
+                tgt_extrinsics_inv[..., :3, 3] = t_inv
+                tgt_extrinsics_inv[..., 3, 3] = 1.0
             else:
-                # Runtime: .inverse() (inv_ex backend for safety)
-                pose_curr = torch.matmul(tgt_extrinsics.inverse(), ref_extrinsics.unsqueeze(1))  # [BV, V-1, 4, 4]
+                tgt_extrinsics_inv = tgt_extrinsics.inverse()
+
+            pose_curr = torch.matmul(
+                tgt_extrinsics_inv, ref_extrinsics.unsqueeze(1)
+            )  # [BV, V-1, 4, 4]
 
             if scale_idx > 0:
                 # 2x upsample depth

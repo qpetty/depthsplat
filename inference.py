@@ -1451,15 +1451,14 @@ def run_encoder(
                                         args=(),
                                         kwargs={"context": context_for_export},
                                         export_params=True,         # Store trained parameters within the model
-                                        opset_version=11,           # ONNX opset version (use 11+ for broader compatibility)
                                         # do_constant_folding=True,   # Optimize by folding constants
                                         input_names=input_names,
                                         output_names=output_names,    # Name for the output node (assuming single output)
                                         dynamo=True,
                                         verbose=True,
                                         operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,  # Fallback for custom Functions
-                                        do_constant_folding=False,  # Avoid folding errors in checkpoint remnants
-                                        optimize=False,  # Skip JIT optimizations that trigger 'Subgraph' pass
+                                        do_constant_folding=True,  # Avoid folding errors in checkpoint remnants
+                                        optimize=True,  # Skip JIT optimizations that trigger 'Subgraph' pass
                                         report=True,
                                         )
         onnx_program.save("depthsplat_encoder.onnx")

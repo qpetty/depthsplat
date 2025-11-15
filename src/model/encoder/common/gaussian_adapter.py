@@ -6,7 +6,7 @@ from jaxtyping import Float
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from ....geometry.projection import get_world_rays
+from ....geometry.projection import get_world_rays, _invert_camera_intrinsics
 from ....misc.sh_rotation import rotate_sh
 from .gaussians import build_covariance
 
@@ -114,10 +114,9 @@ class GaussianAdapter(nn.Module):
         pixel_size: Float[Tensor, "*#batch 2"],
         multiplier: float = 0.1,
     ) -> Float[Tensor, " *batch"]:
-        if torch.onnx.is_in_onnx_export():
-            intrinsics_inv = torch.linalg.inv(intrinsics)
-        else:
-            intrinsics_inv = intrinsics.inverse()
+        # NOTE: Use analytical intrinsics inverse so that ONNX export does not
+        # introduce aten.linalg_inv_ex.
+        intrinsics_inv = _invert_camera_intrinsics(intrinsics)
         xy_multipliers = multiplier * einsum(
             intrinsics_inv,
             pixel_size,

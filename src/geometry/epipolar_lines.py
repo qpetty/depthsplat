@@ -164,7 +164,9 @@ def project_rays(
     epsilon: float = 1e-6,
 ) -> RaySegmentProjection:
     # Transform the rays into camera space.
-    world_to_cam = torch.linalg.inv(extrinsics)
+    # NOTE: Use .inverse() instead of torch.linalg.inv to avoid aten.linalg_inv_ex
+    # when tracing / exporting to ONNX.
+    world_to_cam = extrinsics.inverse()
     origins = homogenize_points(origins)
     origins = einsum(world_to_cam, origins, "... i j, ... j -> ... i")
     directions = homogenize_vectors(directions)

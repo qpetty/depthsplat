@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from ....geometry.projection import _invert_camera_intrinsics
+
 
 def coords_grid(b, h, w, homogeneous=False, device=None):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w))  # [H, W]
@@ -49,11 +51,10 @@ def warp_with_pose_depth_candidates(
             b, h, w, homogeneous=True, device=depth.device
         )  # [B, 3, H, W]
         # back project to 3D and transform viewpoint
-        
-        if torch.onnx.is_in_onnx_export():
-            points = torch.torch.linalg.inv(intrinsics).bmm(grid.view(b, 3, -1))  # [B, 3, H*W]
-        else:
-            points = torch.inverse(intrinsics).bmm(grid.view(b, 3, -1))  # [B, 3, H*W]
+        # NOTE: Use analytical intrinsics inverse to avoid matrix-inverse ops that
+        # decompose to aten.linalg_inv_ex in ONNX export.
+        intrinsics_inv = _invert_camera_intrinsics(intrinsics)
+        points = intrinsics_inv.bmm(grid.view(b, 3, -1))  # [B, 3, H*W]
         points = torch.bmm(pose[:, :3, :3], points).unsqueeze(2).repeat(
             1, 1, d, 1
         ) * depth.view(
