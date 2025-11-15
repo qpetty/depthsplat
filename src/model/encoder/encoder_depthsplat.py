@@ -427,7 +427,8 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
             return {
                 "gaussians": gaussians,
-                "depths": depths
+                "depths": depths,
+                "visualization_dump": visualization_dump
             }
 
         return gaussians

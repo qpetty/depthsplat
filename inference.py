@@ -643,10 +643,28 @@ def validate_ply_export(
     )
     print("=" * 70)
 
+onnx_model_name = "depthsplat_encoder.onnx"
+generate_onnx = False
+run_onnx = True
+ort_session = None
+
+
 def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
     config_root: Union[str, Path] = CONFIG_ROOT,
     encoder_overrides: Optional[Dict[str, Any]] = ENCODER_OVERRIDES,
     enable_torch_compile: Optional[bool] = ENABLE_TORCH_COMPILE) -> SetupResult:
+
+    global ort_session
+    if run_onnx:
+        # Create an ONNX Runtime session; on macOS this will usually be CPUExecutionProvider
+        ort_session = onnxruntime.InferenceSession(
+            onnx_model_name,
+            providers=[('CoreMLExecutionProvider', {
+                        "ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU", 
+                        "RequireStaticInputShapes": "0", "EnableOnSubgraphs": "0", "ModelCacheDirectory": "onnx_cache",
+                    })],
+        )
+        print("ONNX Runtime InferenceSession created")
 
     # Device selection: prefer CUDA, then MPS (Apple Silicon), then CPU
     if torch.cuda.is_available():
@@ -1317,10 +1335,7 @@ def run_encoder(
         encoder_start_wall_time = time.time()
         print(f"    Run start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
         
-        generate_onnx = True
-        run_onnx = False
         if generate_onnx or run_onnx:
-            onnx_model_name = "depthsplat_encoder.onnx"
             class ExportableEncoder(nn.Module):
                 def __init__(self, encoder: nn.Module, global_step: int = 0):
                     super().__init__()
@@ -1328,34 +1343,62 @@ def run_encoder(
                     self.global_step = global_step  # Fixed value; adjust if needed
 
                 def forward(self, context: Dict, visualization_dump: Optional[dict] = None):
+                    # Always provide a dict so the underlying encoder populates visualization data.
+                    if visualization_dump is None:
+                        visualization_dump = {}
+
                     # Call original forward with fixed args for inference/export
                     raw_output = self.encoder(
                         context=context,
                         global_step=self.global_step,
                         deterministic=True,
                         visualization_dump=visualization_dump,
-                        scene_names=None
+                        scene_names=None,
                     )
 
                     # Flatten to dict of tensors only
-                    flat_output = {}
+                    flat_output: Dict[str, torch.Tensor] = {}
                     if isinstance(raw_output, dict):
                         for key, value in raw_output.items():
+                            # Special handling for visualization_dump dict
+                            if key == "visualization_dump" and isinstance(value, dict):
+                                depth_viz = value.get("depth", None)
+                                scales_viz = value.get("scales", None)
+                                rotations_viz = value.get("rotations", None)
+
+                                if isinstance(depth_viz, torch.Tensor):
+                                    flat_output["visualization_dump_depth"] = depth_viz
+                                if isinstance(scales_viz, torch.Tensor):
+                                    flat_output["visualization_dump_scales"] = scales_viz
+                                if isinstance(rotations_viz, torch.Tensor):
+                                    assert rotations_viz.shape[-1] == 4, f"Expected viz rotations last dim=4, got {rotations_viz.shape}"
+                                    flat_output["visualization_dump_rotations"] = rotations_viz
+                                continue
+
                             if isinstance(value, torch.Tensor):
-                                flat_output[key] = value  # e.g., 'depths'
-                            else:  # Gaussians object
-                                # Extract exact attributes from inspection
-                                flat_output[f'{key}_means'] = getattr(value, 'means', None)
-                                flat_output[f'{key}_covariances'] = getattr(value, 'covariances', None)
-                                flat_output[f'{key}_opacities'] = getattr(value, 'opacities', None)
-                                flat_output[f'{key}_harmonics'] = getattr(value, 'harmonics', None)
-                                # Filter out any None (though none expected)
-                                flat_output = {k: v for k, v in flat_output.items() if v is not None}
+                                # e.g., 'depths'
+                                flat_output[key] = value
+                            else:
+                                # Treat as Gaussians-like object
+                                means = getattr(value, "means", None)
+                                covariances = getattr(value, "covariances", None)
+                                opacities = getattr(value, "opacities", None)
+                                harmonics = getattr(value, "harmonics", None)
+
+                                if isinstance(means, torch.Tensor):
+                                    flat_output[f"{key}_means"] = means
+                                if isinstance(covariances, torch.Tensor):
+                                    flat_output[f"{key}_covariances"] = covariances
+                                if isinstance(opacities, torch.Tensor):
+                                    flat_output[f"{key}_opacities"] = opacities
+                                if isinstance(harmonics, torch.Tensor):
+                                    flat_output[f"{key}_harmonics"] = harmonics
                     else:
                         # Fallback (unlikely)
-                        flat_output = {'raw_output': raw_output} if isinstance(raw_output, torch.Tensor) else {}
+                        if isinstance(raw_output, torch.Tensor):
+                            flat_output = {"raw_output": raw_output}
 
-                    return flat_output  # e.g., {'gaussians_means': tensor, ..., 'depths': tensor}
+                    return flat_output  # e.g., {'gaussians_means': tensor, ..., 'depths': tensor, 'visualization_dump_*': tensor}
         
             def prepare_context_for_export(context: Dict) -> Dict:
                 export_context = copy.deepcopy(context)  # Deep copy to preserve original
@@ -1428,13 +1471,16 @@ def run_encoder(
                         print(f"  {key}: {value.shape}")
 
                 input_names = [f'context.{key}' for key in context_for_export if isinstance(context_for_export[key], torch.Tensor)]
-                print(f"ONNX input names: {input_names}")
+                print(f"ONNX contextinput names: {input_names}")
 
                 output_names = [
                     'gaussians_means',
                     'gaussians_covariances',
                     'gaussians_opacities',
                     'gaussians_harmonics',
+                    'visualization_dump_depth',
+                    'visualization_dump_scales',
+                    'visualization_dump_rotations',
                     'depths'
                 ]
 
@@ -1449,7 +1495,6 @@ def run_encoder(
                                                 args=(),
                                                 kwargs={"context": context_for_export},
                                                 export_params=True,         # Store trained parameters within the model
-                                                # do_constant_folding=True,   # Optimize by folding constants
                                                 input_names=input_names,
                                                 output_names=output_names,    # Name for the output node (assuming single output)
                                                 dynamo=True,
@@ -1460,7 +1505,7 @@ def run_encoder(
                                                 report=True,
                                                 )
                 onnx_program.save(onnx_model_name)
-                print("Encoder exported successfully to depthsplat_encoder.onnx")
+                print(f"Encoder exported successfully to {onnx_model_name}")
 
                 import onnx
                 onnx_model = onnx.load(onnx_model_name)
@@ -1468,13 +1513,7 @@ def run_encoder(
                 return
 
             if run_onnx:
-                # Create an ONNX Runtime session; on macOS this will usually be CPUExecutionProvider
-                ort_session = onnxruntime.InferenceSession(
-                    onnx_model_name,
-                    providers=["CPUExecutionProvider"],
-                )
-                print("ONNX Runtime InferenceSession created")
-
+                global ort_session
                 # Build input_feed dict mapping ONNX input names to numpy arrays.
                 # Inputs were exported as f"context.{key}" for each tensor-valued entry in context_for_export.
                 ort_inputs: Dict[str, np.ndarray] = {}
@@ -1505,6 +1544,9 @@ def run_encoder(
                 gauss_covs_np = output_map["gaussians_covariances"]
                 gauss_opac_np = output_map["gaussians_opacities"]
                 gauss_harm_np = output_map["gaussians_harmonics"]
+                vd_depth_np = output_map["visualization_dump_depth"]
+                vd_scales_np = output_map["visualization_dump_scales"]
+                vd_rotations_np = output_map["visualization_dump_rotations"]
                 depths_np = output_map["depths"]
 
                 # Convert back to torch tensors
@@ -1512,6 +1554,9 @@ def run_encoder(
                 gauss_covs = torch.from_numpy(gauss_covs_np)
                 gauss_opac = torch.from_numpy(gauss_opac_np)
                 gauss_harm = torch.from_numpy(gauss_harm_np)
+                vd_depth = torch.from_numpy(vd_depth_np)
+                vd_scales = torch.from_numpy(vd_scales_np)
+                vd_rotations = torch.from_numpy(vd_rotations_np)
                 depths = torch.from_numpy(depths_np)
 
                 # Reconstruct a Gaussians-like object compatible with downstream code
@@ -1522,8 +1567,14 @@ def run_encoder(
                     opacities=gauss_opac,
                 )
 
+                visualization_dump_dict = {
+                    "depth": vd_depth,
+                    "scales": vd_scales,
+                    "rotations": vd_rotations,
+                }
+
                 # Keep result structure consistent with the native encoder path
-                result = {"gaussians": gaussians, "depths": depths}
+                result = {"gaussians": gaussians, "depths": depths, "visualization_dump": visualization_dump_dict}
 
         if not run_onnx:
             with torch.no_grad():
@@ -1545,6 +1596,7 @@ def run_encoder(
     if isinstance(result, dict):
         gaussians = result["gaussians"]
         depths = result.get("depths", None)
+        visualization_dump = result.get("visualization_dump", None)
         if depths is not None:
             print(f"  Depths: {depths.shape}")
         if gaussians is None:
@@ -1599,9 +1651,47 @@ def run_encoder(
     if "scales" in visualization_dump and "rotations" in visualization_dump:
         step_timings: Dict[str, float] = {}
 
+        # ------------------------------------------------------------------
+        # Recover per-Gaussian scales and world-space rotations directly
+        # from the exported covariance matrices.
+        #
+        # For each Gaussian, the covariance has the form:
+        #     cov = R @ diag(s^2) @ R^T
+        # where R is a 3x3 rotation matrix and s is the per-axis scale.
+        # Since cov is symmetric positive definite, eigen-decomposition:
+        #     cov = V diag(λ) V^T
+        # yields eigenvectors V (rotation) and eigenvalues λ (s^2).
+        # ------------------------------------------------------------------
         extract_start_time = time.perf_counter()
-        scales = visualization_dump["scales"][0]  # [num_gaussians, 3]
-        rotations = visualization_dump["rotations"][0]  # [num_gaussians, 4] (xyzw format)
+
+        cov_world = gaussians.covariances[0].detach().cpu()  # [num_gaussians, 3, 3]
+        eigvals, eigvecs = torch.linalg.eigh(cov_world)      # eigvals: [N,3], eigvecs: [N,3,3]
+        eigvals = torch.clamp(eigvals, min=1e-12)
+
+        # Scales are sqrt of eigenvalues
+        scales = torch.sqrt(eigvals)  # [num_gaussians, 3]
+
+        # Eigenvectors give an orthonormal rotation matrix per Gaussian.
+        rot_mats = eigvecs  # [num_gaussians, 3, 3]
+
+        # Ensure right-handed coordinate system: if det < 0, flip the last column.
+        det = torch.det(rot_mats)
+        if (det < 0).any():
+            flip_mask = det < 0
+            rot_mats[flip_mask, :, 2] *= -1.0
+
+        # Convert rotation matrices to xyzw quaternions using SciPy's convention.
+        rot_quats_np = R.from_matrix(rot_mats.numpy()).as_quat().astype(np.float32)
+        world_rotations = torch.from_numpy(rot_quats_np)  # [num_gaussians, 4] (x, y, z, w)
+
+        total_gaussians = world_rotations.shape[0]
+        num_gaussians_per_view = total_gaussians // num_views
+
+        if total_gaussians % num_views != 0:
+            raise ValueError(
+                f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
+            )
+
         extract_end_time = time.perf_counter()
         step_timings["extract_scales_rotations"] = extract_end_time - extract_start_time
 
@@ -1611,31 +1701,6 @@ def run_encoder(
         step_timings["get_reference_extrinsics"] = extrinsics_end_time - extrinsics_start_time
 
         rotation_conv_start_time = time.perf_counter()
-        total_gaussians = rotations.shape[0]
-        num_gaussians_per_view = total_gaussians // num_views
-
-        if total_gaussians % num_views != 0:
-            raise ValueError(
-                f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
-            )
-
-        c2w_rotations = context["extrinsics"][0, :, :3, :3]
-        c2w_rotations_np = c2w_rotations.detach().cpu().numpy()
-        c2w_quats_np = R.from_matrix(c2w_rotations_np).as_quat().astype(np.float32)
-        c2w_quats = torch.from_numpy(c2w_quats_np).to(rotations.device)
-
-        view_ids = torch.repeat_interleave(
-            torch.arange(num_views, device=rotations.device),
-            num_gaussians_per_view,
-        )
-        if view_ids.shape[0] != total_gaussians:
-            raise ValueError(
-                f"view_ids length ({view_ids.shape[0]}) does not match total_gaussians ({total_gaussians})"
-            )
-
-        c2w_gauss_quats = c2w_quats[view_ids]
-        world_rotations = quat_mul_xyzw(c2w_gauss_quats, rotations)
-
         rotation_conv_end_time = time.perf_counter()
         step_timings["convert_rotations_to_world_space"] = rotation_conv_end_time - rotation_conv_start_time
 
