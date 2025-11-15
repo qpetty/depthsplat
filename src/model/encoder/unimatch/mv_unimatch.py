@@ -615,9 +615,13 @@ class MultiViewUniMatch(nn.Module):
 
             # relative pose
             # extrinsics: c2w
-            pose_curr = torch.matmul(
-                tgt_extrinsics.inverse(), ref_extrinsics.unsqueeze(1)
-            )  # [BV, V-1, 4, 4]
+            # Example for pose_curr line (and similar)
+            if torch.onnx.is_in_onnx_export():
+                # Export: Use linalg.inv (traces to aten.linalg_inv → ONNX Inverse)
+                pose_curr = torch.matmul(torch.linalg.inv(tgt_extrinsics), ref_extrinsics.unsqueeze(1))
+            else:
+                # Runtime: .inverse() (inv_ex backend for safety)
+                pose_curr = torch.matmul(tgt_extrinsics.inverse(), ref_extrinsics.unsqueeze(1))  # [BV, V-1, 4, 4]
 
             if scale_idx > 0:
                 # 2x upsample depth

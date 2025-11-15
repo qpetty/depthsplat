@@ -49,7 +49,11 @@ def warp_with_pose_depth_candidates(
             b, h, w, homogeneous=True, device=depth.device
         )  # [B, 3, H, W]
         # back project to 3D and transform viewpoint
-        points = torch.inverse(intrinsics).bmm(grid.view(b, 3, -1))  # [B, 3, H*W]
+        
+        if torch.onnx.is_in_onnx_export():
+            points = torch.torch.linalg.inv(intrinsics).bmm(grid.view(b, 3, -1))  # [B, 3, H*W]
+        else:
+            points = torch.inverse(intrinsics).bmm(grid.view(b, 3, -1))  # [B, 3, H*W]
         points = torch.bmm(pose[:, :3, :3], points).unsqueeze(2).repeat(
             1, 1, d, 1
         ) * depth.view(

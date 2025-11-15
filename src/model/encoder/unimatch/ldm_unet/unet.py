@@ -362,7 +362,13 @@ class AttentionBlock(nn.Module):
         self.postnorm = postnorm
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        if torch.onnx.is_in_onnx_export():
+            print("Export mode: Direct _forward")
+            # During export: Run without checkpointing (traces the full _forward graph)
+            return self._forward(x)
+        else:
+            # During training/inference: Use checkpointing for memory efficiency
+            return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):

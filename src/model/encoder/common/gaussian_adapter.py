@@ -90,10 +90,17 @@ class GaussianAdapter(nn.Module):
         origins, directions = get_world_rays(coordinates, extrinsics, intrinsics)
         means = origins + directions * depths[..., None]
 
+        rotated_harmonics = sh  # Identity rotation
+        if torch.onnx.is_in_onnx_export():
+            # Export: Skip SH rotation (use unrotated harmonics; minimal impact for tracing)
+            print("ONNX export: Skipping rotate_sh for tracing")
+        else:
+            rotated_harmonics = rotate_sh(sh, c2w_rotations[..., None, :, :])
+
         return Gaussians(
             means=means,
             covariances=covariances,
-            harmonics=rotate_sh(sh, c2w_rotations[..., None, :, :]),
+            harmonics=rotated_harmonics,
             opacities=opacities,
             # NOTE: These aren't yet rotated into world space, but they're only used for
             # exporting Gaussians to ply files. This needs to be fixed...
@@ -107,8 +114,12 @@ class GaussianAdapter(nn.Module):
         pixel_size: Float[Tensor, "*#batch 2"],
         multiplier: float = 0.1,
     ) -> Float[Tensor, " *batch"]:
+        if torch.onnx.is_in_onnx_export():
+            intrinsics_inv = torch.linalg.inv(intrinsics)
+        else:
+            intrinsics_inv = intrinsics.inverse()
         xy_multipliers = multiplier * einsum(
-            intrinsics[..., :2, :2].inverse(),
+            intrinsics_inv,
             pixel_size,
             "... i j, j -> ... i",
         )
