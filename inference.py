@@ -58,6 +58,8 @@ FAR_DISPARITY = 0.1    # Pixel disparity for far plane computation (far objects)
 
 import torch
 import torch._dynamo  # For config
+import copy
+import torch.nn as nn
 
 # Enable scalar capture for data-dependent ops like allclose
 torch._dynamo.config.capture_scalar_outputs = True
@@ -70,6 +72,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from omegaconf import OmegaConf
 from src.config import load_typed_config
 from src.model.encoder import EncoderDepthSplatCfg, get_encoder
+from src.model.types import Gaussians as GaussiansOut
 from plyfile import PlyData, PlyElement
 from src.misc.image_io import load_image
 from einops import rearrange
@@ -80,6 +83,7 @@ from src.geometry.projection import get_fov
 from src.dataset.shims.bounds_shim import compute_depth_for_disparity
 from scipy.spatial.transform import Rotation as R
 import json
+import onnxruntime
 
 
 @dataclass
@@ -1313,170 +1317,223 @@ def run_encoder(
         encoder_start_wall_time = time.time()
         print(f"    Run start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
         
+        generate_onnx = True
+        run_onnx = False
+        if generate_onnx or run_onnx:
+            onnx_model_name = "depthsplat_encoder.onnx"
+            class ExportableEncoder(nn.Module):
+                def __init__(self, encoder: nn.Module, global_step: int = 0):
+                    super().__init__()
+                    self.encoder = encoder
+                    self.global_step = global_step  # Fixed value; adjust if needed
 
+                def forward(self, context: Dict, visualization_dump: Optional[dict] = None):
+                    # Call original forward with fixed args for inference/export
+                    raw_output = self.encoder(
+                        context=context,
+                        global_step=self.global_step,
+                        deterministic=True,
+                        visualization_dump=visualization_dump,
+                        scene_names=None
+                    )
+
+                    # Flatten to dict of tensors only
+                    flat_output = {}
+                    if isinstance(raw_output, dict):
+                        for key, value in raw_output.items():
+                            if isinstance(value, torch.Tensor):
+                                flat_output[key] = value  # e.g., 'depths'
+                            else:  # Gaussians object
+                                # Extract exact attributes from inspection
+                                flat_output[f'{key}_means'] = getattr(value, 'means', None)
+                                flat_output[f'{key}_covariances'] = getattr(value, 'covariances', None)
+                                flat_output[f'{key}_opacities'] = getattr(value, 'opacities', None)
+                                flat_output[f'{key}_harmonics'] = getattr(value, 'harmonics', None)
+                                # Filter out any None (though none expected)
+                                flat_output = {k: v for k, v in flat_output.items() if v is not None}
+                    else:
+                        # Fallback (unlikely)
+                        flat_output = {'raw_output': raw_output} if isinstance(raw_output, torch.Tensor) else {}
+
+                    return flat_output  # e.g., {'gaussians_means': tensor, ..., 'depths': tensor}
         
-        encoder.to('cpu')
-        encoder.eval()
-        import copy
-        import torch.nn as nn
-        class ExportableEncoder(nn.Module):
-            def __init__(self, encoder: nn.Module, global_step: int = 0):
-                super().__init__()
-                self.encoder = encoder
-                self.global_step = global_step  # Fixed value; adjust if needed
+            def prepare_context_for_export(context: Dict) -> Dict:
+                export_context = copy.deepcopy(context)  # Deep copy to preserve original
+                for key, value in export_context.items():
+                    if isinstance(value, torch.Tensor):
+                        export_context[key] = value.detach().cpu().clone().requires_grad_(False)
+                    # Non-tensors (e.g., strings, lists) are fine if not used in computations;
+                    # if forward() accesses them dynamically (e.g., if key in context), it may fail—simplify if needed
+                return export_context
 
-            def forward(self, context: Dict):
-                # Call original forward with fixed args for inference/export
-                raw_output = self.encoder(
-                    context=context,
-                    global_step=self.global_step,
-                    deterministic=True,
-                    visualization_dump=None,
-                    scene_names=None
+            context_for_export = prepare_context_for_export(context)  # Your real context, now export-ready
+
+            if generate_onnx:
+                encoder.to('cpu')
+                encoder.eval()
+                
+
+                export_model = ExportableEncoder(encoder, global_step=0)
+
+                import sys
+                # import torch.onnx
+                from e3nn import o3  # Trigger import if not already
+
+                # Find the exact loaded module for _rotation
+                rotation_module = sys.modules.get('e3nn.o3._rotation')
+                if rotation_module is None:
+                    # Fallback: Import directly to load it
+                    import e3nn.o3._rotation as rotation_module
+                    sys.modules['e3nn.o3._rotation'] = rotation_module
+
+                # Save original
+                original_func = rotation_module.matrix_to_angles
+                print("Global patch: Original func ID:", id(original_func))
+
+                def patched_matrix_to_angles(R):
+                    print("patched_matrix_to_angles called")
+                    if torch.onnx.is_in_onnx_export():
+                        # Export: Skip assert, compute angles (exact E3NN logic)
+                        R = R.clone().detach()  # Tracing-safe
+                        # Skip problematic assert
+                        alpha = torch.atan2(R[..., 2, 1], R[..., 2, 2])
+                        beta = torch.asin(-R[..., 2, 0])
+                        gamma = torch.atan2(R[..., 1, 0], R[..., 0, 0])
+                        return alpha, beta, gamma
+                    else:
+                        # Runtime: Original
+                        return original_func(R)
+
+                # Apply global patch
+                rotation_module.matrix_to_angles = patched_matrix_to_angles
+                print("Global patch applied: New func ID:", id(rotation_module.matrix_to_angles))
+                print("Patch active for gaussian_adapter/rotate_sh calls")
+
+                # Standalone test (with rotations matching your gaussian_adapter dims, e.g., [B, V, 3, 3])
+                test_R = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(1, 2, 1, 1)  # [1,2,3,3]
+                angles = rotation_module.matrix_to_angles(test_R)  # Now uses patched!
+                print("Global patch test success: Angles shapes", [a.shape for a in angles])
+
+                # with torch.no_grad():
+                #     flat_output = export_model(*export_args)
+                #     print("Flattened output keys:", list(flat_output.keys()))
+                #     for k, v in flat_output.items():
+                #         print(f"  {k}: {v.shape}")
+                #     # Expected: gaussians_means: [1,983040,3], etc., + depths: [1,2,512,960]
+
+                # Optional: Print shapes to verify (adjust keys to your actual ones)
+                print("Export input shapes:")
+                for key, value in context_for_export.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"  {key}: {value.shape}")
+
+                input_names = [f'context.{key}' for key in context_for_export if isinstance(context_for_export[key], torch.Tensor)]
+                print(f"ONNX input names: {input_names}")
+
+                output_names = [
+                    'gaussians_means',
+                    'gaussians_covariances',
+                    'gaussians_opacities',
+                    'gaussians_harmonics',
+                    'depths'
+                ]
+
+                # In run_encoder, after with torch.no_grad(): flat_output = export_model(context=context_for_export)
+                # Trace inv_ex calls (requires torch 2.1+)
+                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as prof:
+                    flat_output = export_model(context=context_for_export)
+                prof.export_chrome_trace("inv_trace.json")  # View in chrome://tracing
+                print("Inv ops in trace: Check inv_trace.json for 'inv_ex' nodes")
+
+                onnx_program = torch.onnx.export(export_model,
+                                                args=(),
+                                                kwargs={"context": context_for_export},
+                                                export_params=True,         # Store trained parameters within the model
+                                                # do_constant_folding=True,   # Optimize by folding constants
+                                                input_names=input_names,
+                                                output_names=output_names,    # Name for the output node (assuming single output)
+                                                dynamo=True,
+                                                verbose=True,
+                                                operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,  # Fallback for custom Functions
+                                                do_constant_folding=True,  # Avoid folding errors in checkpoint remnants
+                                                optimize=True,  # Skip JIT optimizations that trigger 'Subgraph' pass
+                                                report=True,
+                                                )
+                onnx_program.save(onnx_model_name)
+                print("Encoder exported successfully to depthsplat_encoder.onnx")
+
+                import onnx
+                onnx_model = onnx.load(onnx_model_name)
+                onnx.checker.check_model(onnx_model)
+                return
+
+            if run_onnx:
+                # Create an ONNX Runtime session; on macOS this will usually be CPUExecutionProvider
+                ort_session = onnxruntime.InferenceSession(
+                    onnx_model_name,
+                    providers=["CPUExecutionProvider"],
+                )
+                print("ONNX Runtime InferenceSession created")
+
+                # Build input_feed dict mapping ONNX input names to numpy arrays.
+                # Inputs were exported as f"context.{key}" for each tensor-valued entry in context_for_export.
+                ort_inputs: Dict[str, np.ndarray] = {}
+                for inp in ort_session.get_inputs():
+                    name = inp.name  # e.g., "context.image"
+                    if not name.startswith("context."):
+                        continue
+                    ctx_key = name.split(".", 1)[1]
+                    if ctx_key not in context_for_export:
+                        raise KeyError(
+                            f"ONNX input '{name}' expects context key '{ctx_key}', which is missing."
+                        )
+                    tensor = context_for_export[ctx_key]
+                    if hasattr(tensor, "detach"):
+                        tensor = tensor.detach().cpu()
+                    ort_inputs[name] = tensor.numpy()
+
+                onnx_outputs = ort_session.run(None, ort_inputs)
+                print("ONNXRuntime inference completed.")
+                print("ONNXRuntime output count:", len(onnx_outputs))
+
+                # Map outputs by name so we're robust to ordering
+                output_names = [out.name for out in ort_session.get_outputs()]
+                output_map = {name: onnx_outputs[i] for i, name in enumerate(output_names)}
+
+                # Expected outputs from export: gaussians_{means,covariances,opacities,harmonics}, depths
+                gauss_means_np = output_map["gaussians_means"]
+                gauss_covs_np = output_map["gaussians_covariances"]
+                gauss_opac_np = output_map["gaussians_opacities"]
+                gauss_harm_np = output_map["gaussians_harmonics"]
+                depths_np = output_map["depths"]
+
+                # Convert back to torch tensors
+                gauss_means = torch.from_numpy(gauss_means_np)
+                gauss_covs = torch.from_numpy(gauss_covs_np)
+                gauss_opac = torch.from_numpy(gauss_opac_np)
+                gauss_harm = torch.from_numpy(gauss_harm_np)
+                depths = torch.from_numpy(depths_np)
+
+                # Reconstruct a Gaussians-like object compatible with downstream code
+                gaussians = GaussiansOut(
+                    means=gauss_means,
+                    covariances=gauss_covs,
+                    harmonics=gauss_harm,
+                    opacities=gauss_opac,
                 )
 
-                # Flatten to dict of tensors only
-                flat_output = {}
-                if isinstance(raw_output, dict):
-                    for key, value in raw_output.items():
-                        if isinstance(value, torch.Tensor):
-                            flat_output[key] = value  # e.g., 'depths'
-                        else:  # Gaussians object
-                            # Extract exact attributes from inspection
-                            flat_output[f'{key}_means'] = getattr(value, 'means', None)
-                            flat_output[f'{key}_covariances'] = getattr(value, 'covariances', None)
-                            flat_output[f'{key}_opacities'] = getattr(value, 'opacities', None)
-                            flat_output[f'{key}_harmonics'] = getattr(value, 'harmonics', None)
-                            # Filter out any None (though none expected)
-                            flat_output = {k: v for k, v in flat_output.items() if v is not None}
-                else:
-                    # Fallback (unlikely)
-                    flat_output = {'raw_output': raw_output} if isinstance(raw_output, torch.Tensor) else {}
+                # Keep result structure consistent with the native encoder path
+                result = {"gaussians": gaussians, "depths": depths}
 
-                return flat_output  # e.g., {'gaussians_means': tensor, ..., 'depths': tensor}
-
-        export_model = ExportableEncoder(encoder, global_step=0)
-
-        import sys
-        # import torch.onnx
-        from e3nn import o3  # Trigger import if not already
-
-        # Find the exact loaded module for _rotation
-        rotation_module = sys.modules.get('e3nn.o3._rotation')
-        if rotation_module is None:
-            # Fallback: Import directly to load it
-            import e3nn.o3._rotation as rotation_module
-            sys.modules['e3nn.o3._rotation'] = rotation_module
-
-        # Save original
-        original_func = rotation_module.matrix_to_angles
-        print("Global patch: Original func ID:", id(original_func))
-
-        def patched_matrix_to_angles(R):
-            print("patched_matrix_to_angles called")
-            if torch.onnx.is_in_onnx_export():
-                # Export: Skip assert, compute angles (exact E3NN logic)
-                R = R.clone().detach()  # Tracing-safe
-                # Skip problematic assert
-                alpha = torch.atan2(R[..., 2, 1], R[..., 2, 2])
-                beta = torch.asin(-R[..., 2, 0])
-                gamma = torch.atan2(R[..., 1, 0], R[..., 0, 0])
-                return alpha, beta, gamma
-            else:
-                # Runtime: Original
-                return original_func(R)
-
-        # Apply global patch
-        rotation_module.matrix_to_angles = patched_matrix_to_angles
-        print("Global patch applied: New func ID:", id(rotation_module.matrix_to_angles))
-        print("Patch active for gaussian_adapter/rotate_sh calls")
-
-        # Standalone test (with rotations matching your gaussian_adapter dims, e.g., [B, V, 3, 3])
-        test_R = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(1, 2, 1, 1)  # [1,2,3,3]
-        angles = rotation_module.matrix_to_angles(test_R)  # Now uses patched!
-        print("Global patch test success: Angles shapes", [a.shape for a in angles])
-
-
-        def prepare_context_for_export(context: Dict) -> Dict:
-            export_context = copy.deepcopy(context)  # Deep copy to preserve original
-            for key, value in export_context.items():
-                if isinstance(value, torch.Tensor):
-                    export_context[key] = value.detach().cpu().clone().requires_grad_(False)
-                # Non-tensors (e.g., strings, lists) are fine if not used in computations;
-                # if forward() accesses them dynamically (e.g., if key in context), it may fail—simplify if needed
-            return export_context
-
-        context_for_export = prepare_context_for_export(context)  # Your real context, now export-ready
-
-        export_args = (
-            context_for_export['image'],
-            context_for_export['extrinsics'],
-            context_for_export['intrinsics'],
-            context_for_export['near'],
-            context_for_export['far']
-        )
-
-        # with torch.no_grad():
-        #     flat_output = export_model(*export_args)
-        #     print("Flattened output keys:", list(flat_output.keys()))
-        #     for k, v in flat_output.items():
-        #         print(f"  {k}: {v.shape}")
-        #     # Expected: gaussians_means: [1,983040,3], etc., + depths: [1,2,512,960]
-
-        # Optional: Print shapes to verify (adjust keys to your actual ones)
-        print("Export input shapes:")
-        for key, value in context_for_export.items():
-            if isinstance(value, torch.Tensor):
-                print(f"  {key}: {value.shape}")
-
-        input_names = [f'context.{key}' for key in context_for_export if isinstance(context_for_export[key], torch.Tensor)]
-        print(f"ONNX input names: {input_names}")
-
-        output_names = [
-            'gaussians_means',
-            'gaussians_covariances',
-            'gaussians_opacities',
-            'gaussians_harmonics',
-            'depths'
-        ]
-
-        # In run_encoder, after with torch.no_grad(): flat_output = export_model(context=context_for_export)
-        # Trace inv_ex calls (requires torch 2.1+)
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as prof:
-            flat_output = export_model(context=context_for_export)
-        prof.export_chrome_trace("inv_trace.json")  # View in chrome://tracing
-        print("Inv ops in trace: Check inv_trace.json for 'inv_ex' nodes")
-
-        onnx_program = torch.onnx.export(export_model,
-                                        args=(),
-                                        kwargs={"context": context_for_export},
-                                        export_params=True,         # Store trained parameters within the model
-                                        # do_constant_folding=True,   # Optimize by folding constants
-                                        input_names=input_names,
-                                        output_names=output_names,    # Name for the output node (assuming single output)
-                                        dynamo=True,
-                                        verbose=True,
-                                        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,  # Fallback for custom Functions
-                                        do_constant_folding=True,  # Avoid folding errors in checkpoint remnants
-                                        optimize=True,  # Skip JIT optimizations that trigger 'Subgraph' pass
-                                        report=True,
-                                        )
-        onnx_program.save("depthsplat_encoder.onnx")
-        print("Encoder exported successfully to depthsplat_encoder.onnx")
-
-        import onnx
-        onnx_model = onnx.load("depthsplat_encoder.onnx")
-        onnx.checker.check_model(onnx_model)
-        return
-
-        with torch.no_grad():
-            result = encoder(
-                context=context,
-                global_step=0,
-                deterministic=False,
-                visualization_dump=visualization_dump,
-                scene_names=None,
-            )
+        if not run_onnx:
+            with torch.no_grad():
+                result = encoder(
+                    context=context,
+                    global_step=0,
+                    deterministic=False,
+                    visualization_dump=visualization_dump,
+                    scene_names=None,
+                )
 
         encoder_end_time = time.perf_counter()
         encoder_end_wall_time = time.time()
@@ -1484,10 +1541,6 @@ def run_encoder(
         total_encoder_elapsed += encoder_elapsed
         print(f"    Run end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
         print(f"    Run elapsed time: {encoder_elapsed:.3f} seconds")
-
-    avg_encoder_elapsed = total_encoder_elapsed / max(num_runs, 1)
-    print(f"\n  Encoder total time over {num_runs} run(s): {total_encoder_elapsed:.3f} seconds")
-    print(f"  Encoder average time per run: {avg_encoder_elapsed:.3f} seconds ({avg_encoder_elapsed/60:.2f} minutes)")
 
     if isinstance(result, dict):
         gaussians = result["gaussians"]
@@ -1498,6 +1551,11 @@ def run_encoder(
             raise ValueError("Encoder returned None for gaussians. Check config (train_depth_only should be False).")
     else:
         gaussians = result
+
+    avg_encoder_elapsed = total_encoder_elapsed / max(num_runs, 1)
+    print(f"\n  Encoder total time over {num_runs} run(s): {total_encoder_elapsed:.3f} seconds")
+    print(f"  Encoder average time per run: {avg_encoder_elapsed:.3f} seconds ({avg_encoder_elapsed/60:.2f} minutes)")
+
 
     print(f"\nGaussian Splat Output:")
     print(f"  Means: {gaussians.means.shape}")
