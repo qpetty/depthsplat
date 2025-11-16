@@ -616,20 +616,17 @@ class MultiViewUniMatch(nn.Module):
             # relative pose
             # extrinsics: c2w
             # NOTE: Avoid generic matrix inverse (torch.inverse / torch.linalg.inv)
-            # when exporting to ONNX, since they decompose to aten.linalg_inv_ex,
-            # which currently has no ONNX decomposition. Use an analytical rigid
-            # transform inverse instead.
-            if torch.onnx.is_in_onnx_export():
-                R = tgt_extrinsics[..., :3, :3]
-                t = tgt_extrinsics[..., :3, 3]
-                R_inv = R.transpose(-1, -2)
-                t_inv = -torch.matmul(R_inv, t.unsqueeze(-1)).squeeze(-1)
-                tgt_extrinsics_inv = torch.zeros_like(tgt_extrinsics)
-                tgt_extrinsics_inv[..., :3, :3] = R_inv
-                tgt_extrinsics_inv[..., :3, 3] = t_inv
-                tgt_extrinsics_inv[..., 3, 3] = 1.0
-            else:
-                tgt_extrinsics_inv = tgt_extrinsics.inverse()
+            # when exporting (ONNX / torch.export / CoreML), since they can decompose
+            # to ops without converter support. Use an analytical rigid-transform
+            # inverse instead, assuming standard 4x4 [[R, t], [0, 1]] structure.
+            R = tgt_extrinsics[..., :3, :3]
+            t = tgt_extrinsics[..., :3, 3]
+            R_inv = R.transpose(-1, -2)
+            t_inv = -torch.matmul(R_inv, t.unsqueeze(-1)).squeeze(-1)
+            tgt_extrinsics_inv = torch.zeros_like(tgt_extrinsics)
+            tgt_extrinsics_inv[..., :3, :3] = R_inv
+            tgt_extrinsics_inv[..., :3, 3] = t_inv
+            tgt_extrinsics_inv[..., 3, 3] = 1.0
 
             pose_curr = torch.matmul(
                 tgt_extrinsics_inv, ref_extrinsics.unsqueeze(1)
@@ -673,12 +670,14 @@ class MultiViewUniMatch(nn.Module):
                 depth_interval = depth_interval.view(-1, 1, 1, 1)
 
                 # [BV, 1, H, W]
-                depth_range_min = (
-                    depth - depth_interval * (num_depth_candidates // 2)
-                ).clamp(min=min_depth.view(-1, 1, 1, 1))
-                depth_range_max = (
-                    depth + depth_interval * (num_depth_candidates // 2 - 1)
-                ).clamp(max=max_depth.view(-1, 1, 1, 1))
+                depth_range_min = torch.maximum(
+                    depth - depth_interval * (num_depth_candidates // 2),
+                    min_depth.view(-1, 1, 1, 1)
+                )
+                depth_range_max = torch.minimum(
+                    depth + depth_interval * (num_depth_candidates // 2 - 1),
+                    max_depth.view(-1, 1, 1, 1)
+                )
 
                 linear_space = (
                     torch.linspace(0, 1, num_depth_candidates)
@@ -712,7 +711,7 @@ class MultiViewUniMatch(nn.Module):
 
             cost_volume_start = time.perf_counter()
             
-            warped_tgt_features = warp_with_pose_depth_candidates(
+            warped_tgt_features_flat = warp_with_pose_depth_candidates(
                 rearrange(tgt_features, "b v ... -> (b v) ..."),
                 rearrange(intrinsics_input, "b v ... -> (b v) ..."),
                 rearrange(pose_curr, "b v ... -> (b v) ..."),
@@ -721,19 +720,21 @@ class MultiViewUniMatch(nn.Module):
             )  # [BV*(V-1), C, D, H, W]
 
             # ref: [BV, C, H, W]
-            # warped: [BV*(V-1), C, D, H, W] -> [BV, V-1, C, D, H, W]
-            warped_tgt_features = rearrange(
-                warped_tgt_features,
-                "(b v) ... -> b v ...",
-                b=b_new,
-                v=tgt_features.size(1),
-            )
-            # [BV, V-1, D, H, W] -> [BV, D, H, W]
-            # average cross other views
-            cost_volume = (
-                (ref_features.unsqueeze(-3).unsqueeze(1) * warped_tgt_features).sum(2)
-                / (c**0.5)
-            ).mean(1)
+            # warped: [BV*(V-1), C, D, H, W]
+            # AVOID 6D TENSORS: Don't rearrange to [BV, V-1, C, D, H, W]!
+            # Instead, chunk the batch dimension and process each view separately
+            num_views = tgt_features.size(1)
+            cost_volumes = []
+            for v_idx in range(num_views):
+                # Extract features for this target view: [BV, C, D, H, W] (5D)
+                warped_v = warped_tgt_features_flat[v_idx * b_new : (v_idx + 1) * b_new]
+                # ref: [BV, C, H, W] -> [BV, C, 1, H, W] (5D)
+                # warped_v: [BV, C, D, H, W] (5D)
+                # multiply and sum over C: [BV, D, H, W] (4D)
+                cost_v = (ref_features.unsqueeze(2) * warped_v).sum(1) / (c**0.5)
+                cost_volumes.append(cost_v)
+            # Stack and mean over views: [V-1, BV, D, H, W] -> [BV, D, H, W]
+            cost_volume = torch.stack(cost_volumes, dim=0).mean(0)
             
             cost_volume_end = time.perf_counter()
             cost_volume_elapsed = cost_volume_end - cost_volume_start
@@ -802,8 +803,9 @@ class MultiViewUniMatch(nn.Module):
                     mode="bilinear",
                     align_corners=True,
                 )
-                depth = (depth_bilinear + residual_depth).clamp(
-                    min=min_depth.view(-1, 1, 1, 1), max=max_depth.view(-1, 1, 1, 1)
+                depth = torch.minimum(
+                    torch.maximum(depth_bilinear + residual_depth, min_depth.view(-1, 1, 1, 1)),
+                    max_depth.view(-1, 1, 1, 1)
                 )
                 
                 upsampler_end = time.perf_counter()

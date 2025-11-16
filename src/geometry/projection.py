@@ -1,7 +1,7 @@
 from math import prod
 
 import torch
-from einops import einsum, rearrange, reduce, repeat
+from einops import rearrange, reduce, repeat
 from jaxtyping import Bool, Float, Int64
 from torch import Tensor
 
@@ -25,7 +25,9 @@ def transform_rigid(
     transformation: Float[Tensor, "*#batch dim dim"],
 ) -> Float[Tensor, "*batch dim"]:
     """Apply a rigid-body transformation to points or vectors."""
-    return einsum(transformation, homogeneous_coordinates, "... i j, ... j -> ... i")
+    # Replace einsum with matmul for CoreML compatibility
+    # einsum("... i j, ... j -> ... i") is matrix-vector multiplication
+    return torch.matmul(transformation, homogeneous_coordinates.unsqueeze(-1)).squeeze(-1)
 
 
 def transform_cam2world(
@@ -50,7 +52,8 @@ def transform_world2cam(
         R = extrinsics[..., :3, :3]
         t = extrinsics[..., :3, 3]
         R_inv = R.transpose(-1, -2)
-        t_inv = -einsum(R_inv, t, "... i j, ... j -> ... i")
+        # Replace einsum with matmul for CoreML compatibility
+        t_inv = -torch.matmul(R_inv, t.unsqueeze(-1)).squeeze(-1)
         world2cam = torch.zeros_like(extrinsics)
         world2cam[..., :3, :3] = R_inv
         world2cam[..., :3, 3] = t_inv
@@ -68,7 +71,8 @@ def project_camera_space(
 ) -> Float[Tensor, "*batch dim-1"]:
     points = points / (points[..., -1:] + epsilon)
     points = points.nan_to_num(posinf=infinity, neginf=-infinity)
-    points = einsum(intrinsics, points, "... i j, ... j -> ... i")
+    # Replace einsum with matmul for CoreML compatibility
+    points = torch.matmul(intrinsics, points.unsqueeze(-1)).squeeze(-1)
     return points[..., :-1]
 
 
@@ -123,9 +127,8 @@ def unproject(
     # inverse to keep ONNX export free of matrix-inverse ops.
     coordinates = homogenize_points(coordinates)
     intrinsics_inv = _invert_camera_intrinsics(intrinsics)
-    ray_directions = einsum(
-        intrinsics_inv, coordinates, "... i j, ... j -> ... i"
-    )
+    # Replace einsum with matmul for CoreML compatibility
+    ray_directions = torch.matmul(intrinsics_inv, coordinates.unsqueeze(-1)).squeeze(-1)
 
     # Apply the supplied depth values.
     return ray_directions * z[..., None]
@@ -241,7 +244,8 @@ def intersect_rays(
     directions_y = directions_y.broadcast_to(shape)
 
     # Detect and remove batch elements where the directions are parallel.
-    parallel = einsum(directions_x, directions_y, "... xyz, ... xyz -> ...") > 1 - eps
+    # Replace einsum with sum for CoreML compatibility (dot product)
+    parallel = (directions_x * directions_y).sum(dim=-1) > 1 - eps
     origins_x = origins_x[~parallel]
     directions_x = directions_x[~parallel]
     origins_y = origins_y[~parallel]
@@ -254,14 +258,18 @@ def intersect_rays(
     device = origins.device
 
     # Compute n_i * n_i^T - eye(3) from the equation.
-    n = einsum(directions, directions, "r b i, r b j -> r b i j")
+    # Replace einsum with outer product for CoreML compatibility
+    # einsum("r b i, r b j -> r b i j") computes outer product
+    n = directions.unsqueeze(-1) * directions.unsqueeze(-2)
     n = n - torch.eye(3, dtype=dtype, device=device).broadcast_to((2, 1, 3, 3))
 
     # Compute the left-hand side of the equation.
     lhs = reduce(n, "r b i j -> b i j", "sum")
 
     # Compute the right-hand side of the equation.
-    rhs = einsum(n, origins, "r b i j, r b j -> r b i")
+    # Replace einsum with matmul for CoreML compatibility
+    # einsum("r b i j, r b j -> r b i") is batched matrix-vector multiplication
+    rhs = torch.matmul(n, origins.unsqueeze(-1)).squeeze(-1)
     rhs = reduce(rhs, "r b i -> b i", "sum")
 
     # Left-matrix-multiply both sides by the pseudo-inverse of lhs to find p.
@@ -278,7 +286,8 @@ def get_fov(intrinsics: Float[Tensor, "batch 3 3"]) -> Float[Tensor, "batch 2"]:
 
     def process_vector(vector):
         vector = torch.tensor(vector, dtype=torch.float32, device=intrinsics.device)
-        vector = einsum(intrinsics_inv, vector, "b i j, j -> b i")
+        # Replace einsum with matmul for CoreML compatibility
+        vector = torch.matmul(intrinsics_inv, vector.unsqueeze(-1)).squeeze(-1)
         return vector / vector.norm(dim=-1, keepdim=True)
 
     left = process_vector([0, 0.5, 1])

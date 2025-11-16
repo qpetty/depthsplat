@@ -109,6 +109,11 @@ def checkpoint(func, inputs, params, flag):
                    explicitly take as arguments.
     :param flag: if False, disable gradient checkpointing.
     """
+    # During TorchScript tracing / ONNX export, avoid custom checkpointing logic,
+    # which is not compatible with export and can trigger internal errors.
+    if torch.jit.is_tracing() or torch.onnx.is_in_onnx_export():
+        return func(*inputs)
+
     if flag:
         args = tuple(inputs) + tuple(params)
         return CheckpointFunction.apply(func, len(inputs), *args)

@@ -84,6 +84,8 @@ from src.dataset.shims.bounds_shim import compute_depth_for_disparity
 from scipy.spatial.transform import Rotation as R
 import json
 import onnxruntime
+import coremltools as ct
+from torch.export import export
 
 
 @dataclass
@@ -645,7 +647,8 @@ def validate_ply_export(
 
 onnx_model_name = "depthsplat_encoder.onnx"
 generate_onnx = False
-run_onnx = True
+run_onnx = False
+generate_coreml = True
 ort_session = None
 
 
@@ -1335,7 +1338,7 @@ def run_encoder(
         encoder_start_wall_time = time.time()
         print(f"    Run start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
         
-        if generate_onnx or run_onnx:
+        if generate_onnx or run_onnx or generate_coreml:
             class ExportableEncoder(nn.Module):
                 def __init__(self, encoder: nn.Module, global_step: int = 0):
                     super().__init__()
@@ -1410,6 +1413,316 @@ def run_encoder(
                 return export_context
 
             context_for_export = prepare_context_for_export(context)  # Your real context, now export-ready
+
+            if generate_coreml:
+                # Use the ExportableEncoder wrapper so that we provide a fixed global_step and
+                # a clean tensor-only output dict, then wrap again to expose a simple
+                # tensor-in / tuple-of-tensors-out interface for CoreML.
+                encoder.to("cpu")
+                encoder.eval()
+
+                export_model = ExportableEncoder(encoder, global_step=0)
+                export_model.eval()
+
+                class CoreMLEncoderWrapper(nn.Module):
+                    def __init__(self, export_model: nn.Module, static_context: Dict[str, torch.Tensor]):
+                        super().__init__()
+                        self.export_model = export_model
+
+                        # Register static context entries (e.g., intrinsics, poses) as buffers.
+                        # These will be treated as constants by CoreML; the only runtime input
+                        # will be the image tensor.
+                        self._buffer_keys: List[str] = []
+                        for key, value in static_context.items():
+                            if isinstance(value, torch.Tensor):
+                                # Store as buffer; keys are expected to be simple strings.
+                                self.register_buffer(key, value)
+                                self._buffer_keys.append(key)
+
+                    def forward(self, image: torch.Tensor):
+                        # Reconstruct context dict from buffers, overriding the image with
+                        # the runtime-provided tensor.
+                        context: Dict[str, torch.Tensor] = {}
+                        for key in self._buffer_keys:
+                            context[key] = getattr(self, key)
+                        context["image"] = image
+
+                        flat_output = self.export_model(context=context)
+
+                        # Deterministic tuple of outputs for CoreML; order must be stable.
+                        # Visualization dumps are skipped during export, so use get() with defaults
+                        return (
+                            flat_output["gaussians_means"],
+                            flat_output["gaussians_covariances"],
+                            flat_output["gaussians_opacities"],
+                            flat_output["gaussians_harmonics"],
+                            flat_output.get("visualization_dump_depth", flat_output["depths"]),  # Fallback to depths
+                            flat_output.get("visualization_dump_scales", flat_output["gaussians_means"]),  # Fallback to means
+                            flat_output.get("visualization_dump_rotations", flat_output["gaussians_covariances"]),  # Fallback to covariances
+                            flat_output["depths"],
+                        )
+
+                # Instantiate wrapper with current static context.
+                coreml_wrapper = CoreMLEncoderWrapper(export_model, static_context=context_for_export)
+                coreml_wrapper.eval()
+
+                # Use the main image tensor to define CoreML input shape and trace to TorchScript.
+                image_tensor = context_for_export["image"]
+                # print(f"Running CoreML trace")
+                # with torch.no_grad():
+                #     traced_wrapper = torch.jit.trace(
+                #         coreml_wrapper,
+                #         (image_tensor,),
+                #         strict=False,
+                #         check_trace=False,  # Skip trace-vs-runtime sanity check; model has dynamic/non-deterministic behavior
+                #     )
+                # ExportedProgram instead of TorchScript
+
+                import sys
+                from e3nn import o3  # ensure e3nn.o3 is loaded
+
+                # Patch e3nn's rotation helpers to remove data-dependent asserts while
+                # preserving their numerical behavior.
+
+                # 1) matrix_to_angles (in e3nn.o3._rotation)
+                rotation_module = sys.modules.get("e3nn.o3._rotation")
+                if rotation_module is None:
+                    import e3nn.o3._rotation as rotation_module
+                    sys.modules["e3nn.o3._rotation"] = rotation_module
+
+                def patched_matrix_to_angles(R):
+                    # Drop the assert on det(R) == 1; compute angles directly using the
+                    # same formulas as the original implementation.
+                    alpha = torch.atan2(R[..., 2, 1], R[..., 2, 2])
+                    beta = torch.asin(-R[..., 2, 0])
+                    gamma = torch.atan2(R[..., 1, 0], R[..., 0, 0])
+                    return alpha, beta, gamma
+
+                rotation_module.matrix_to_angles = patched_matrix_to_angles
+
+                # Ensure the alias imported in sh_rotation uses the patched version.
+                from src.misc import sh_rotation
+                sh_rotation.matrix_to_angles = rotation_module.matrix_to_angles
+
+                # 2) so3_generators (in e3nn.o3._wigner), which is used by wigner_D.
+                wigner_module = sys.modules.get("e3nn.o3._wigner")
+                if wigner_module is None:
+                    import e3nn.o3._wigner as wigner_module
+                    sys.modules["e3nn.o3._wigner"] = wigner_module
+
+                def patched_so3_generators(l: int) -> torch.Tensor:
+                    # Same computation as the original so3_generators, but without the
+                    # data-dependent assert on the imaginary part.
+                    X = wigner_module.su2_generators(l)
+                    Q = wigner_module.change_basis_real_to_complex(l)
+                    X = torch.conj(Q.T) @ X @ Q
+                    return torch.real(X)
+
+                wigner_module.so3_generators = patched_so3_generators
+
+                # Set flag to skip export-incompatible operations (like rotate_sh with matrix_exp)
+                import src.model.encoder.common.gaussian_adapter as gaussian_adapter_module
+                gaussian_adapter_module._SKIP_EXPORT_INCOMPATIBLE_OPS = True
+                
+                print("\n" + "="*80)
+                print("DEBUG: Setting _SKIP_EXPORT_INCOMPATIBLE_OPS flag")
+                print(f"  Flag value: {gaussian_adapter_module._SKIP_EXPORT_INCOMPATIBLE_OPS}")
+                print(f"  Module ID: {id(gaussian_adapter_module)}")
+                print("="*80 + "\n")
+                
+                try:
+                    # Export via torch.export (ExportedProgram) after patching.
+                    print("Starting torch.export...")
+                    exported = export(coreml_wrapper, (image_tensor,))
+                    print("torch.export completed successfully")
+                    # Lower TRAINING dialect ops to ATEN/EDGE as required by coremltools.
+                    exported = exported.run_decompositions({})
+                    
+                    # DEBUG: Check for high-dimensional tensors in the exported graph
+                    print("\n" + "="*80)
+                    print("DEBUG: Checking exported graph for high-dimensional tensors")
+                    print("="*80)
+                    for node in exported.graph_module.graph.nodes:
+                        if hasattr(node, 'meta') and 'val' in node.meta:
+                            val = node.meta['val']
+                            if hasattr(val, 'shape') and len(val.shape) > 5:
+                                print(f"WARNING: Found {len(val.shape)}D tensor!")
+                                print(f"  Node: {node.name}")
+                                print(f"  Op: {node.op}")
+                                print(f"  Target: {node.target}")
+                                print(f"  Shape: {val.shape}")
+                                print()
+                finally:
+                    # Reset flag
+                    gaussian_adapter_module._SKIP_EXPORT_INCOMPATIBLE_OPS = False
+
+                # Debug: Find all diag operations in the exported graph
+                print("\n" + "="*80)
+                print("DEBUGGING: Searching for diag operations in exported graph")
+                print("="*80)
+                gm = exported.graph_module
+                diag_nodes = []
+                all_ops = set()
+                
+                def trace_back(node, depth=0, max_depth=10, visited=None):
+                    """Recursively trace back through the graph to find the origin."""
+                    if visited is None:
+                        visited = set()
+                    if depth >= max_depth or node in visited:
+                        return
+                    visited.add(node)
+                    
+                    indent = "  " * depth
+                    if hasattr(node, 'op') and node.op == "call_function":
+                        print(f"{indent}← {node.name}: {node.target}")
+                        for arg in node.args:
+                            if hasattr(arg, 'name') and hasattr(arg, 'op'):
+                                trace_back(arg, depth + 1, max_depth, visited)
+                
+                for node in gm.graph.nodes:
+                    if node.op == "call_function":
+                        target_str = str(node.target)
+                        all_ops.add(target_str)
+                        
+                        if "diag" in target_str.lower():
+                            diag_nodes.append((node, target_str))
+                            print(f"\n{'='*60}")
+                            print(f"Found diag operation #{len(diag_nodes)}:")
+                            print(f"  Node: {node.name}")
+                            print(f"  Target: {target_str}")
+                            print(f"  Args: {node.args}")
+                            print(f"  Kwargs: {node.kwargs}")
+                            print(f"\n  Tracing back (up to 10 levels):")
+                            trace_back(node, depth=0, max_depth=10)
+                
+                print(f"\n{'='*80}")
+                print(f"Total diag operations found: {len(diag_nodes)}")
+                
+                if diag_nodes:
+                    print("\n" + "="*80)
+                    print("WARNING: Found unsupported diag operations in the graph")
+                    print("="*80)
+                    
+                    # Look for common patterns in the traced operations
+                    print("\nSearching for matrix operations (linalg, svd, eig, qr, cholesky, etc.)...")
+                    matrix_ops = []
+                    for op in sorted(all_ops):
+                        if any(keyword in op.lower() for keyword in ['linalg', 'svd', 'eig', 'qr', 'cholesky', 'inv', 'solve', 'det', 'slogdet', 'pinv', 'matrix_exp', 'lu']):
+                            matrix_ops.append(op)
+                            print(f"  Found: {op}")
+                    
+                    if not matrix_ops:
+                        print("  No obvious matrix decomposition operations found.")
+                        print("  The diag operations may be coming from torch.export decompositions.")
+                    
+                    print("\nERROR: Cannot proceed with CoreML conversion due to unsupported diag operations")
+                    print("These typically come from operations like:")
+                    print("  - torch.linalg.matrix_exp (in e3nn's wigner_D for spherical harmonics)")
+                    print("  - Matrix decompositions (SVD, QR, Cholesky, etc.)")
+                    print("\nSuggestion: Check that torch.jit.is_tracing() is being used to skip these operations")
+                    
+                    # Save the graph for inspection
+                    try:
+                        graph_code = gm.code
+                        with open("exported_graph_debug.py", "w") as f:
+                            f.write(graph_code)
+                        print("\nGraph code saved to: exported_graph_debug.py")
+                    except Exception as e:
+                        print(f"\nCouldn't save graph code: {e}")
+                    
+                    return
+                else:
+                    print("✓ No diag operations found - graph is compatible with CoreML")
+                
+                print("="*80 + "\n")
+
+                # Replace bicubic upsampling with bilinear upsampling for CoreML compatibility.
+                # CoreML's Torch frontend does not support aten::upsample_bicubic2d, but it does
+                # support bilinear/nearest Resize. Here we surgically swap the aten op kind
+                # while keeping arguments identical.
+                print("Replacing bicubic operations with bilinear for CoreML compatibility...")
+                try:
+                    # Access the graph module directly from ExportedProgram
+                    gm = exported.graph_module
+                    modified = False
+                    
+                    # Check for torch.ops.aten.upsample_bicubic2d operations and corresponding bilinear op.
+                    try:
+                        bicubic_op = torch.ops.aten.upsample_bicubic2d.vec
+                    except AttributeError:
+                        bicubic_op = None
+                    try:
+                        bilinear_op = torch.ops.aten.upsample_bilinear2d.vec
+                    except AttributeError:
+                        bilinear_op = None
+                    
+                    for node in list(gm.graph.nodes):
+                        if node.op == "call_function":
+                            target = node.target
+                            target_str = str(target)
+                            
+                            # Check for upsample_bicubic2d operations.
+                            # Can appear as torch.ops.aten.upsample_bicubic2d.vec or similar.
+                            is_bicubic = False
+                            if bicubic_op is not None and target == bicubic_op:
+                                is_bicubic = True
+                            elif "upsample_bicubic2d" in target_str:
+                                is_bicubic = True
+                            
+                            if is_bicubic:
+                                modified = True
+                                print(f"    Found bicubic operation: {target_str}")
+                                
+                                if bilinear_op is None:
+                                    raise RuntimeError(
+                                        "aten::upsample_bilinear2d.vec is not available in this PyTorch build"
+                                    )
+
+                                # Replace with aten::upsample_bilinear2d.vec using the
+                                # exact same args/kwargs as the original bicubic op.
+                                with gm.graph.inserting_before(node):
+                                    new_node = gm.graph.call_function(
+                                        bilinear_op,
+                                        args=tuple(node.args),
+                                        kwargs=dict(node.kwargs),
+                                    )
+                                
+                                node.replace_all_uses_with(new_node)
+                                gm.graph.erase_node(node)
+                                print("    Replaced with aten.upsample_bilinear2d.vec")
+                    
+                    if modified:
+                        gm.graph.lint()
+                        gm.recompile()
+                        print("  ✓ Bicubic operations replaced with bilinear")
+                    else:
+                        print("  No bicubic operations found")
+                except Exception as e:
+                    print(f"  Warning: Could not replace bicubic operations: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("  Attempting to proceed anyway - CoreML conversion may fail if bicubic ops are present")
+
+                print("Converting to CoreML")
+                model = ct.convert(
+                    exported,
+                    source="pytorch",
+                    convert_to="mlprogram",
+                    inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
+                    outputs=[
+                        ct.TensorType(name="gaussians_means"),
+                        ct.TensorType(name="gaussians_covariances"),
+                        ct.TensorType(name="gaussians_opacities"),
+                        ct.TensorType(name="gaussians_harmonics"),
+                        ct.TensorType(name="visualization_dump_depth"),
+                        ct.TensorType(name="visualization_dump_scales"),
+                        ct.TensorType(name="visualization_dump_rotations"),
+                        ct.TensorType(name="depths"),
+                    ],
+                )
+                model.save("depthsplat.mlpackage")
+                print(f"Encoder exported successfully to depthsplat.mlpackage")
+                return
 
             if generate_onnx:
                 encoder.to('cpu')

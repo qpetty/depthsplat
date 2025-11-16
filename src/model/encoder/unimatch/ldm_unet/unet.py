@@ -562,11 +562,13 @@ class QKVAttentionLegacy(nn.Module):
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
+        # Replace einsum with bmm for CoreML compatibility
+        # einsum("bct,bcs->bts", q * scale, k * scale) = bmm(q.transpose(-1,-2), k)
+        weight = th.bmm((q * scale).transpose(-1, -2), k * scale)
+        # More stable with f16 than dividing afterwards
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v).reshape(bs, -1, length)
+        # einsum("bts,bcs->bct", weight, v) = bmm(v, weight.transpose(-1,-2))
+        a = th.bmm(v, weight.transpose(-1, -2)).reshape(bs, -1, length)
 
         # move view dim back to batch dim in original '(b v)' order
         if self.use_cross_view_self_attn:
@@ -599,13 +601,16 @@ class QKVAttention(nn.Module):
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.chunk(3, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts",
-            (q * scale).view(bs * self.n_heads, ch, length),
-            (k * scale).view(bs * self.n_heads, ch, length),
-        )  # More stable with f16 than dividing afterwards
+        # Replace einsum with bmm for CoreML compatibility
+        # einsum("bct,bcs->bts", q * scale, k * scale) = bmm(q.transpose(-1,-2), k)
+        q_scaled = (q * scale).view(bs * self.n_heads, ch, length)
+        k_scaled = (k * scale).view(bs * self.n_heads, ch, length)
+        weight = th.bmm(q_scaled.transpose(-1, -2), k_scaled)
+        # More stable with f16 than dividing afterwards
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        # einsum("bts,bcs->bct", weight, v) = bmm(v, weight.transpose(-1,-2))
+        v_reshaped = v.reshape(bs * self.n_heads, ch, length)
+        a = th.bmm(v_reshaped, weight.transpose(-1, -2))
         return a.reshape(bs, -1, length)
 
     @staticmethod

@@ -2,7 +2,7 @@ from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch import nn
 from einops import rearrange, repeat
 
 
@@ -88,8 +88,11 @@ class LinearAttention(nn.Module):
         qkv = self.to_qkv(x)
         q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', heads = self.heads, qkv=3)
         k = k.softmax(dim=-1)  
-        context = torch.einsum('bhdn,bhen->bhde', k, v)
-        out = torch.einsum('bhde,bhdn->bhen', context, q)
+        # Replace einsum with matmul for CoreML compatibility
+        # einsum('bhdn,bhen->bhde', k, v) computes: context[b,h,d,e] = sum_n k[b,h,d,n] * v[b,h,e,n]
+        context = torch.matmul(k, v.transpose(-1, -2))
+        # einsum('bhde,bhdn->bhen', context, q) computes: out[b,h,e,n] = sum_d context[b,h,d,e] * q[b,h,d,n]
+        out = torch.matmul(context.transpose(-1, -2), q)
         out = rearrange(out, 'b heads c (h w) -> b (heads c) h w', heads=self.heads, h=h, w=w)
         return self.to_out(out)
 
@@ -132,7 +135,9 @@ class SpatialSelfAttention(nn.Module):
         b,c,h,w = q.shape
         q = rearrange(q, 'b c h w -> b (h w) c')
         k = rearrange(k, 'b c h w -> b c (h w)')
-        w_ = torch.einsum('bij,bjk->bik', q, k)
+        # Replace einsum with bmm for CoreML compatibility
+        # einsum('bij,bjk->bik', q, k) is equivalent to bmm(q, k)
+        w_ = torch.bmm(q, k)
 
         w_ = w_ * (int(c)**(-0.5))
         w_ = torch.nn.functional.softmax(w_, dim=2)
@@ -140,7 +145,9 @@ class SpatialSelfAttention(nn.Module):
         # attend to values
         v = rearrange(v, 'b c h w -> b c (h w)')
         w_ = rearrange(w_, 'b i j -> b j i')
-        h_ = torch.einsum('bij,bjk->bik', v, w_)
+        # Replace einsum with bmm for CoreML compatibility
+        # einsum('bij,bjk->bik', v, w_) is equivalent to bmm(v, w_)
+        h_ = torch.bmm(v, w_)
         h_ = rearrange(h_, 'b c (h w) -> b c h w', h=h)
         h_ = self.proj_out(h_)
 
@@ -175,7 +182,9 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        # Replace einsum with bmm for CoreML compatibility
+        # einsum('b i d, b j d -> b i j', q, k) is equivalent to bmm(q, k.transpose(-1, -2))
+        sim = torch.bmm(q, k.transpose(-1, -2)) * self.scale
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -186,7 +195,9 @@ class CrossAttention(nn.Module):
         # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
+        # Replace einsum with bmm for CoreML compatibility
+        # einsum('b i j, b j d -> b i d', attn, v) is equivalent to bmm(attn, v)
+        out = torch.bmm(attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
 

@@ -34,11 +34,18 @@ def build_covariance(
     scale: Float[Tensor, "*#batch 3"],
     rotation_xyzw: Float[Tensor, "*#batch 4"],
 ) -> Float[Tensor, "*batch 3 3"]:
-    scale = scale.diag_embed()
-    rotation = quaternion_to_matrix(rotation_xyzw)
-    return (
-        rotation
-        @ scale
-        @ rearrange(scale, "... i j -> ... j i")
-        @ rearrange(rotation, "... i j -> ... j i")
-    )
+    # The formula is: R @ diag(s^2) @ R^T
+    # We can avoid creating the diagonal matrix by using broadcasting:
+    # R @ diag(s^2) @ R^T = (R * s^2.unsqueeze(-2)) @ R^T
+    # where the multiplication broadcasts s^2 across the rows of R
+    
+    scale_sq = scale * scale  # [..., 3] - element-wise square
+    rotation = quaternion_to_matrix(rotation_xyzw)  # [..., 3, 3]
+    
+    # Scale each column of R by the corresponding s^2 value
+    # rotation has shape [..., 3, 3], scale_sq has shape [..., 3]
+    # We want to scale column i by scale_sq[i]
+    scaled_rotation = rotation * scale_sq.unsqueeze(-2)  # [..., 3, 3]
+    
+    # Now compute (R * s^2) @ R^T
+    return scaled_rotation @ rearrange(rotation, "... i j -> ... j i")

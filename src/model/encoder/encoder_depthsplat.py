@@ -149,6 +149,11 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
 
+        # Determine if we're in export mode early (needed for conditional tensor shapes)
+        from .common.gaussian_adapter import _SKIP_EXPORT_INCOMPATIBLE_OPS
+        is_export_mode = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or _SKIP_EXPORT_INCOMPATIBLE_OPS
+        use_squeezed_shapes = is_export_mode  # In export mode, use squeezed shapes to avoid 6D/7D tensors
+
         if v > 3:
             with torch.no_grad():
                 xyzs = context["extrinsics"][:, :, :3, -1].detach()
@@ -330,6 +335,21 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         sh_input_images = context["image"]
 
+        # For export mode: squeeze tensors before passing to gaussian_adapter to avoid 6D/7D intermediates
+        if use_squeezed_shapes:
+            # depths: [B, V, H*W, 1, 1] -> [B, V, H*W]
+            while depths.ndim > 3:
+                depths = depths.squeeze(-1)
+            # opacities: [B, V, H*W, 1, 1] -> [B, V, H*W]
+            while opacities.ndim > 3:
+                opacities = opacities.squeeze(-1)
+            # gaussians: [B, V, H*W, srf=1, c] -> [B, V, H*W, c]
+            while gaussians.ndim > 4:
+                gaussians = gaussians.squeeze(-2)  # Squeeze srf dimension
+            # xy_ray: [B, V, H*W, srf=1, 2] -> [B, V, H*W, 2]
+            while xy_ray.ndim > 4:
+                xy_ray = xy_ray.squeeze(-2)  # Squeeze srf dimension
+        
         gaussian_adapter_start = time.perf_counter()
         gaussian_adapter_start_wall = time.time()
         print(f"    [Encoder] Gaussian adapter start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_adapter_start_wall))}")
@@ -340,37 +360,64 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             context_intrinsics = torch.cat(
                 [context["intrinsics"]] * len(depth_preds), dim=0)
 
-            gaussians = self.gaussian_adapter.forward(
-                rearrange(context_extrinsics, "b v i j -> b v () () () i j"),
-                rearrange(context_intrinsics, "b v i j -> b v () () () i j"),
-                rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
-                depths,
-                opacities,
-                rearrange(
-                    gaussians[..., 2:],
-                    "b v r srf c -> b v r srf () c",
-                ),
-                (h, w),
-                input_images=sh_input_images.repeat(
-                    len(depth_preds), 1, 1, 1, 1) if self.cfg.init_sh_input_img else None,
-            )
+            # For export mode: use 5D tensors (no extra singleton dims)
+            if use_squeezed_shapes:
+                gaussians = self.gaussian_adapter.forward(
+                    rearrange(context_extrinsics, "b v i j -> b v () i j"),  # [B, V, 1, 4, 4] (5D)
+                    rearrange(context_intrinsics, "b v i j -> b v () i j"),  # [B, V, 1, 3, 3] (5D)
+                    xy_ray,  # Already [B, V, H*W, 2] (4D) after broadcasting
+                    depths,  # [B, V, H*W] (3D) after squeezing
+                    opacities,  # [B, V, H*W] (3D) after squeezing
+                    gaussians[..., 2:],  # [B, V, H*W, c] (4D)
+                    (h, w),
+                    input_images=sh_input_images.repeat(
+                        len(depth_preds), 1, 1, 1, 1) if self.cfg.init_sh_input_img else None,
+                )
+            else:
+                gaussians = self.gaussian_adapter.forward(
+                    rearrange(context_extrinsics, "b v i j -> b v () () () i j"),  # [B, V, 1, 1, 1, 4, 4] (7D)
+                    rearrange(context_intrinsics, "b v i j -> b v () () () i j"),  # [B, V, 1, 1, 1, 3, 3] (7D)
+                    rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),  # [B, V, H*W, srf, 1, 2] (6D)
+                    depths,  # [B, V, H*W, 1, 1] (5D)
+                    opacities,  # [B, V, H*W, 1, 1] (5D)
+                    rearrange(
+                        gaussians[..., 2:],
+                        "b v r srf c -> b v r srf () c",  # [B, V, H*W, srf, 1, c] (6D)
+                    ),
+                    (h, w),
+                    input_images=sh_input_images.repeat(
+                        len(depth_preds), 1, 1, 1, 1) if self.cfg.init_sh_input_img else None,
+                )
 
         else:
-            gaussians = self.gaussian_adapter.forward(
-                rearrange(context["extrinsics"],
-                          "b v i j -> b v () () () i j"),
-                rearrange(context["intrinsics"],
-                          "b v i j -> b v () () () i j"),
-                rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
-                depths,
-                opacities,
-                rearrange(
-                    gaussians[..., 2:],
-                    "b v r srf c -> b v r srf () c",
-                ),
-                (h, w),
-                input_images=sh_input_images if self.cfg.init_sh_input_img else None,
-            )
+            # For export mode: use 5D tensors (no extra singleton dims)
+            if use_squeezed_shapes:
+                gaussians = self.gaussian_adapter.forward(
+                    rearrange(context["extrinsics"], "b v i j -> b v () i j"),  # [B, V, 1, 4, 4] (5D)
+                    rearrange(context["intrinsics"], "b v i j -> b v () i j"),  # [B, V, 1, 3, 3] (5D)
+                    xy_ray,  # Already [B, V, H*W, 2] (4D) after broadcasting
+                    depths,  # [B, V, H*W] (3D) after squeezing
+                    opacities,  # [B, V, H*W] (3D) after squeezing
+                    gaussians[..., 2:],  # [B, V, H*W, c] (4D)
+                    (h, w),
+                    input_images=sh_input_images if self.cfg.init_sh_input_img else None,
+                )
+            else:
+                gaussians = self.gaussian_adapter.forward(
+                    rearrange(context["extrinsics"],
+                              "b v i j -> b v () () () i j"),  # [B, V, 1, 1, 1, 4, 4] (7D)
+                    rearrange(context["intrinsics"],
+                              "b v i j -> b v () () () i j"),  # [B, V, 1, 1, 1, 3, 3] (7D)
+                    rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),  # [B, V, H*W, srf, 1, 2] (6D)
+                    depths,  # [B, V, H*W, 1, 1] (5D)
+                    opacities,  # [B, V, H*W, 1, 1] (5D)
+                    rearrange(
+                        gaussians[..., 2:],
+                        "b v r srf c -> b v r srf () c",  # [B, V, H*W, srf, 1, c] (6D)
+                    ),
+                    (h, w),
+                    input_images=sh_input_images if self.cfg.init_sh_input_img else None,
+                )
         
         gaussian_adapter_end = time.perf_counter()
         gaussian_adapter_end_wall = time.time()
@@ -378,7 +425,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         print(f"    [Encoder] Gaussian adapter end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_adapter_end_wall))} (elapsed: {gaussian_adapter_elapsed:.3f}s)")
 
         # Dump visualizations if needed.
-        if visualization_dump is not None:
+        # Skip if using squeezed dimensions (always in export mode)
+        # Note: use_squeezed_shapes is defined at the start of forward()
+        if visualization_dump is not None and not use_squeezed_shapes:
             visualization_dump["depth"] = rearrange(
                 depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
             )
@@ -389,24 +438,26 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
             )
 
-        gaussians = Gaussians(
-            rearrange(
-                gaussians.means,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
-            ),
-            rearrange(
-                gaussians.covariances,
-                "b v r srf spp i j -> b (v r srf spp) i j",
-            ),
-            rearrange(
-                gaussians.harmonics,
-                "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
-            ),
-            rearrange(
-                gaussians.opacities,
-                "b v r srf spp -> b (v r srf spp)",
-            ),
-        )
+        # Flatten Gaussians for final output
+        # Use squeezed shapes if we're in export mode OR tensors were squeezed
+        if use_squeezed_shapes:
+            # Export mode shapes (after squeezing): [B, V, H*W, ...]
+            # Target shapes: [B, V*H*W, ...]
+            gaussians = Gaussians(
+                rearrange(gaussians.means, "b v r xyz -> b (v r) xyz"),
+                rearrange(gaussians.covariances, "b v r i j -> b (v r) i j"),
+                rearrange(gaussians.harmonics, "b v r c d_sh -> b (v r) c d_sh"),
+                rearrange(gaussians.opacities, "b v r -> b (v r)"),
+            )
+        else:
+            # Normal mode shapes: [B, V, r, srf, spp, ...]
+            # Target shapes: [B, V*r*srf*spp, ...]
+            gaussians = Gaussians(
+                rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+                rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+                rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+                rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+            )
 
         # Print encoder component timing summary
         print(f"    [Encoder] Component timing summary:")
@@ -420,9 +471,18 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         if self.cfg.return_depth:
             # return depth prediction for supervision
-            depths = rearrange(
-                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            ).squeeze(-1).squeeze(-1)
+            # Check if depths were squeezed (happens with high-dimensional tensors)
+            if use_squeezed_shapes:
+                # First squeeze singleton dims from [B, V, H*W, 1, 1] to [B, V, H*W]
+                while depths.ndim > 3:
+                    depths = depths.squeeze(-1)
+                # Then rearrange: [B, V, H*W] -> [B, V, H, W]
+                depths = rearrange(depths, "b v (h w) -> b v h w", h=h, w=w)
+            else:
+                # [B, V, H*W, srf, s] -> [B, V, H, W, srf, s] -> [B, V, H, W]
+                depths = rearrange(
+                    depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
+                ).squeeze(-1).squeeze(-1)
             # print(depths.shape)  # [B, V, H, W]
 
             return {

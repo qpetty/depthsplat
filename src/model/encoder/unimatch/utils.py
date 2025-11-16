@@ -47,11 +47,17 @@ def split_feature(
         h_new = h // num_splits
         w_new = w // num_splits
 
-        feature = (
-            feature.view(b, num_splits, h // num_splits, num_splits, w // num_splits, c)
-            .permute(0, 1, 3, 2, 4, 5)
-            .reshape(b_new, h_new, w_new, c)
-        )  # [B*K*K, H/K, W/K, C]
+        # Avoid 6D: merge batch with first split dimension incrementally
+        # Step 1: [B, H, W, C] -> [B, K, H/K, W, C] (5D)
+        feature = feature.view(b, num_splits, h_new, w, c)
+        # Step 2: Merge B*K into batch -> [B*K, H/K, W, C] (4D)
+        feature = feature.reshape(b * num_splits, h_new, w, c)
+        # Step 3: Split width -> [B*K, H/K, K, W/K, C] (5D)
+        feature = feature.view(b * num_splits, h_new, num_splits, w_new, c)
+        # Step 4: Permute to group splits -> [B*K, K, H/K, W/K, C] (5D)
+        feature = feature.permute(0, 2, 1, 3, 4)
+        # Step 5: Merge into final batch -> [B*K*K, H/K, W/K, C]
+        feature = feature.reshape(b_new, h_new, w_new, c)
     else:  # [B, C, H, W]
         b, c, h, w = feature.size()
         assert h % num_splits == 0 and w % num_splits == 0
@@ -60,11 +66,19 @@ def split_feature(
         h_new = h // num_splits
         w_new = w // num_splits
 
-        feature = (
-            feature.view(b, c, num_splits, h // num_splits, num_splits, w // num_splits)
-            .permute(0, 2, 4, 1, 3, 5)
-            .reshape(b_new, c, h_new, w_new)
-        )  # [B*K*K, C, H/K, W/K]
+        # Avoid 6D: merge batch with first split dimension incrementally
+        # Step 1: [B, C, H, W] -> [B, C, K, H/K, W] (5D)
+        feature = feature.view(b, c, num_splits, h_new, w)
+        # Step 2: Permute C and K -> [B, K, C, H/K, W] (5D)
+        feature = feature.permute(0, 2, 1, 3, 4)
+        # Step 3: Merge B*K into batch -> [B*K, C, H/K, W] (4D)
+        feature = feature.reshape(b * num_splits, c, h_new, w)
+        # Step 4: Split width -> [B*K, C, H/K, K, W/K] (5D)
+        feature = feature.view(b * num_splits, c, h_new, num_splits, w_new)
+        # Step 5: Permute to group splits -> [B*K, K, C, H/K, W/K] (5D)
+        feature = feature.permute(0, 3, 1, 2, 4)
+        # Step 6: Merge into final batch -> [B*K*K, C, H/K, W/K]
+        feature = feature.reshape(b_new, c, h_new, w_new)
 
     return feature
 
@@ -78,22 +92,38 @@ def merge_splits(
         b, h, w, c = splits.size()
         new_b = b // num_splits // num_splits
 
-        splits = splits.view(new_b, num_splits, num_splits, h, w, c)
-        merge = (
-            splits.permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(new_b, num_splits * h, num_splits * w, c)
-        )  # [B, H, W, C]
+        # Avoid 6D: merge splits incrementally
+        # Step 1: [B*K*K, H/K, W/K, C] -> [B*K, K, H/K, W/K, C] (5D)
+        splits = splits.view(new_b * num_splits, num_splits, h, w, c)
+        # Step 2: Permute to group width windows -> [B*K, H/K, K, W/K, C] (5D)
+        splits = splits.permute(0, 2, 1, 3, 4)
+        # Step 3: Merge width windows -> [B*K, H/K, W, C] (4D)
+        splits = splits.reshape(new_b * num_splits, h, num_splits * w, c)
+        # Step 4: Reshape to separate batch and height window -> [B, K, H/K, W, C] (5D)
+        splits = splits.view(new_b, num_splits, h, num_splits * w, c)
+        # Step 5: Permute to group height windows -> [B, K*H/K, W, C] but do it via permute
+        #         Actually: [B, K, H/K, W, C] -> [B, H/K, K, W, C] ... wait, let me reconsider
+        # Correction: [B, K, H/K, W, C] permute -> [B, H/K, K, W, C]
+        splits = splits.permute(0, 2, 1, 3, 4)
+        # Step 6: Merge height windows -> [B, H, W, C]
+        merge = splits.reshape(new_b, num_splits * h, num_splits * w, c)
     else:  # [B*K*K, C, H/K, W/K]
         b, c, h, w = splits.size()
         new_b = b // num_splits // num_splits
 
-        splits = splits.view(new_b, num_splits, num_splits, c, h, w)
-        merge = (
-            splits.permute(0, 3, 1, 4, 2, 5)
-            .contiguous()
-            .view(new_b, c, num_splits * h, num_splits * w)
-        )  # [B, C, H, W]
+        # Avoid 6D: merge splits incrementally (reverse of split_feature)
+        # Step 1: [B*K*K, C, H/K, W/K] -> [B*K, K, C, H/K, W/K] (5D)
+        splits = splits.view(new_b * num_splits, num_splits, c, h, w)
+        # Step 2: Permute to prepare for width merge -> [B*K, C, H/K, K, W/K] (5D)
+        splits = splits.permute(0, 2, 3, 1, 4)
+        # Step 3: Merge width windows -> [B*K, C, H/K, W] (4D)
+        splits = splits.reshape(new_b * num_splits, c, h, num_splits * w)
+        # Step 4: Reshape to separate batch and height window -> [B, K, C, H/K, W] (5D)
+        splits = splits.view(new_b, num_splits, c, h, num_splits * w)
+        # Step 5: Permute to prepare for height merge -> [B, C, K, H/K, W] (5D)
+        splits = splits.permute(0, 2, 1, 3, 4)
+        # Step 6: Merge height windows -> [B, C, H, W]
+        merge = splits.reshape(new_b, c, num_splits * h, num_splits * w)
 
     return merge
 
