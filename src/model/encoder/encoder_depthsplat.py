@@ -425,18 +425,26 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         print(f"    [Encoder] Gaussian adapter end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_adapter_end_wall))} (elapsed: {gaussian_adapter_elapsed:.3f}s)")
 
         # Dump visualizations if needed.
-        # Skip if using squeezed dimensions (always in export mode)
-        # Note: use_squeezed_shapes is defined at the start of forward()
-        if visualization_dump is not None and not use_squeezed_shapes:
-            visualization_dump["depth"] = rearrange(
-                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            )
-            visualization_dump["scales"] = rearrange(
-                gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
-            )
-            visualization_dump["rotations"] = rearrange(
-                gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
-            )
+        # In export mode we use squeezed tensors (<=5D) so we can still capture
+        # scales/rotations safely.
+        if visualization_dump is not None:
+            if not use_squeezed_shapes:
+                visualization_dump["depth"] = rearrange(
+                    depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
+                )
+                visualization_dump["scales"] = rearrange(
+                    gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
+                )
+                visualization_dump["rotations"] = rearrange(
+                    gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
+                )
+            else:
+                visualization_dump["scales"] = rearrange(
+                    gaussians.scales, "b v r xyz -> b (v r) xyz"
+                )
+                visualization_dump["rotations"] = rearrange(
+                    gaussians.rotations, "b v r xyzw -> b (v r) xyzw"
+                )
 
         # Flatten Gaussians for final output
         # Use squeezed shapes if we're in export mode OR tensors were squeezed

@@ -650,8 +650,8 @@ generate_onnx = False
 run_onnx = False
 generate_coreml = False
 run_coreml = True
-coreml_minimal_outputs = False  # Set True to export only essential outputs (faster)
-coreml_use_fp16_input = False   # Set True to use FP16 input (experimental, may reduce quality)
+coreml_minimal_outputs = True  # True => Gaussians + viz scales/rotations (skip depths)
+coreml_use_fp16_input = True   # Set True to use FP16 input (experimental, may reduce quality)
 ort_session = None
 coreml_model = None
 coreml_output_mapping = None  # Mapping from expected output names to actual CoreML output names
@@ -1531,7 +1531,8 @@ def run_encoder(
                     return None
                 
                 # Extract outputs (order depends on coreml_minimal_outputs setting during export)
-                # The outputs are in order: means, covariances, opacities, harmonics, [depth, scales, rotations, depths]
+                # Minimal order: means, covariances, opacities, harmonics, viz_scales, viz_rotations
+                # Full order: means, covariances, opacities, harmonics, viz_depth, viz_scales, viz_rotations, depths
                 means_key = find_key('gaussians_means')
                 covs_key = find_key('gaussians_covariances')
                 opac_key = find_key('gaussians_opacities')
@@ -1575,29 +1576,26 @@ def run_encoder(
                     opacities=gauss_opac,
                 )
                 
-                # Check if we have full outputs (visualization dump + depths)
-                # This depends on the coreml_minimal_outputs setting used during export
+                # Build optional depth / visualization outputs
                 depths_key = find_key('depths')
                 vd_depth_key = find_key('visualization_dump_depth')
                 vd_scales_key = find_key('visualization_dump_scales')
                 vd_rotations_key = find_key('visualization_dump_rotations')
                 
-                if depths_key and vd_depth_key and vd_scales_key and vd_rotations_key:
-                    # Full outputs available
-                    depths = torch.from_numpy(predictions[depths_key])
-                    vd_depth = torch.from_numpy(predictions[vd_depth_key])
-                    vd_scales = torch.from_numpy(predictions[vd_scales_key])
-                    vd_rotations = torch.from_numpy(predictions[vd_rotations_key])
-                    
-                    visualization_dump_dict = {
-                        "depth": vd_depth,
-                        "scales": vd_scales,
-                        "rotations": vd_rotations,
-                    }
-                    result = {"gaussians": gaussians, "depths": depths, "visualization_dump": visualization_dump_dict}
-                else:
-                    # Minimal outputs - no depths or visualization dump
-                    result = {"gaussians": gaussians, "depths": None, "visualization_dump": None}
+                depths = torch.from_numpy(predictions[depths_key]) if depths_key else None
+                
+                visualization_dump_dict: Optional[Dict[str, torch.Tensor]] = None
+                viz_entries: Dict[str, torch.Tensor] = {}
+                if vd_depth_key:
+                    viz_entries["depth"] = torch.from_numpy(predictions[vd_depth_key])
+                if vd_scales_key:
+                    viz_entries["scales"] = torch.from_numpy(predictions[vd_scales_key])
+                if vd_rotations_key:
+                    viz_entries["rotations"] = torch.from_numpy(predictions[vd_rotations_key])
+                if viz_entries:
+                    visualization_dump_dict = viz_entries
+                
+                result = {"gaussians": gaussians, "depths": depths, "visualization_dump": visualization_dump_dict}
                     
                     
             if generate_coreml:
@@ -1638,12 +1636,22 @@ def run_encoder(
                         # Deterministic tuple of outputs for CoreML; order must be stable.
                         # Visualization dumps are skipped during export, so use get() with defaults
                         if coreml_minimal_outputs:
-                            # Minimal outputs - only the essential Gaussian parameters
+                            # Minimal outputs - Gaussian params plus viz scales/rotations for fast PLY export
+                            vd_scales = flat_output.get("visualization_dump_scales")
+                            if vd_scales is None:
+                                vd_scales = flat_output["gaussians_means"].clone()
+
+                            vd_rotations = flat_output.get("visualization_dump_rotations")
+                            if vd_rotations is None:
+                                vd_rotations = flat_output["gaussians_covariances"].clone()
+
                             return (
                                 flat_output["gaussians_means"],
                                 flat_output["gaussians_covariances"],
                                 flat_output["gaussians_opacities"],
                                 flat_output["gaussians_harmonics"],
+                                vd_scales,
+                                vd_rotations,
                             )
                         else:
                             # Full outputs including visualization and depth
@@ -2006,12 +2014,14 @@ def run_encoder(
                 
                 # Define outputs based on minimal_outputs flag
                 if coreml_minimal_outputs:
-                    print("  Using minimal outputs (4 tensors) for reduced overhead")
+                    print("  Using minimal outputs (Gaussians + viz scales/rotations)")
                     output_spec = [
                         ct.TensorType(name="gaussians_means"),
                         ct.TensorType(name="gaussians_covariances"),
                         ct.TensorType(name="gaussians_opacities"),
                         ct.TensorType(name="gaussians_harmonics"),
+                        ct.TensorType(name="visualization_dump_scales"),
+                        ct.TensorType(name="visualization_dump_rotations"),
                     ]
                 else:
                     print("  Using full outputs (8 tensors) including visualization")
@@ -2403,6 +2413,7 @@ def run_encoder(
         print(f"    Run end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
         print(f"    Run elapsed time: {encoder_elapsed:.3f} seconds")
 
+    visualization_dump = None
     if isinstance(result, dict):
         gaussians = result["gaussians"]
         depths = result.get("depths", None)
@@ -2425,7 +2436,7 @@ def run_encoder(
     print(f"  Harmonics: {gaussians.harmonics.shape}")
     print(f"  Opacities: {gaussians.opacities.shape}")
 
-    if "depth" in visualization_dump:
+    if isinstance(visualization_dump, dict) and "depth" in visualization_dump:
         depth_values = visualization_dump["depth"]  # [B, V, H, W, srf, s]
         print(f"\n  Depth Statistics:")
         print(f"    Depth shape: {depth_values.shape}")
@@ -2444,6 +2455,8 @@ def run_encoder(
                 print(f"      WARNING: Min depth ({view_depth_flat.min().item():.3f}) is much less than near plane ({expected_near:.3f})")
             if view_depth_flat.max().item() > expected_far * 2.0:
                 print(f"      WARNING: Max depth ({view_depth_flat.max().item():.3f}) is much greater than far plane ({expected_far:.3f})")
+    elif visualization_dump is None:
+        print("\n  Depth Statistics: skipped (visualization dump not available; did you export with minimal CoreML outputs?)")
 
     print("\n" + "=" * 70)
     print("Exporting to PLY")
@@ -2458,52 +2471,84 @@ def run_encoder(
     ply_export_elapsed: Optional[float] = None
     ply_export_end_wall_time: Optional[float] = None
 
-    if "scales" in visualization_dump and "rotations" in visualization_dump:
+    available_viz_keys = list(visualization_dump.keys()) if isinstance(visualization_dump, dict) else []
+    scales_tensor = visualization_dump.get("scales") if isinstance(visualization_dump, dict) else None
+    rotations_tensor = visualization_dump.get("rotations") if isinstance(visualization_dump, dict) else None
+
+    def _valid_viz_tensor(tensor: Optional[torch.Tensor], last_dim: int) -> bool:
+        return isinstance(tensor, torch.Tensor) and tensor.ndim >= 2 and tensor.shape[-1] == last_dim
+
+    has_viz_scales = _valid_viz_tensor(scales_tensor, 3) and _valid_viz_tensor(rotations_tensor, 4)
+    if not has_viz_scales:
+        print("✗ Warning: visualization_dump does not contain scales/rotations.")
+        if visualization_dump is None:
+            print("  Visualization data is unavailable (likely because the CoreML model was exported with minimal outputs).")
+        else:
+            print("  This may happen if the encoder config has certain settings.")
+            if isinstance(rotations_tensor, torch.Tensor):
+                print(f"  Rotations tensor shape: {tuple(rotations_tensor.shape)} (expected last dim=4)")
+            if isinstance(scales_tensor, torch.Tensor):
+                print(f"  Scales tensor shape: {tuple(scales_tensor.shape)} (expected last dim=3)")
+        print(f"  Available keys in visualization_dump: {available_viz_keys}")
+        print("  Falling back to deriving scales/rotations from the Gaussian covariances.\n")
+
+    try:
         step_timings: Dict[str, float] = {}
 
-        # ------------------------------------------------------------------
-        # Recover per-Gaussian scales and world-space rotations directly
-        # from the exported covariance matrices.
-        #
-        # For each Gaussian, the covariance has the form:
-        #     cov = R @ diag(s^2) @ R^T
-        # where R is a 3x3 rotation matrix and s is the per-axis scale.
-        # Since cov is symmetric positive definite, eigen-decomposition:
-        #     cov = V diag(λ) V^T
-        # yields eigenvectors V (rotation) and eigenvalues λ (s^2).
-        # ------------------------------------------------------------------
-        extract_start_time = time.perf_counter()
+        scales_world: torch.Tensor
+        rotations_world: torch.Tensor
 
-        cov_world = gaussians.covariances[0].detach().cpu()  # [num_gaussians, 3, 3]
-        eigvals, eigvecs = torch.linalg.eigh(cov_world)      # eigvals: [N,3], eigvecs: [N,3,3]
-        eigvals = torch.clamp(eigvals, min=1e-12)
+        if has_viz_scales and scales_tensor is not None and rotations_tensor is not None:
+            fetch_start = time.perf_counter()
+            scales_world = scales_tensor.detach().reshape(-1, scales_tensor.shape[-1]).cpu()
+            rotations_world = rotations_tensor.detach().reshape(-1, rotations_tensor.shape[-1]).cpu()
+            total_gaussians = rotations_world.shape[0]
+            fetch_end = time.perf_counter()
+            step_timings["fetch_visualization_scales_rotations"] = fetch_end - fetch_start
+        else:
+            # ------------------------------------------------------------------
+            # Recover per-Gaussian scales and world-space rotations directly
+            # from the exported covariance matrices.
+            #
+            # For each Gaussian, the covariance has the form:
+            #     cov = R @ diag(s^2) @ R^T
+            # where R is a 3x3 rotation matrix and s is the per-axis scale.
+            # Since cov is symmetric positive definite, eigen-decomposition:
+            #     cov = V diag(λ) V^T
+            # yields eigenvectors V (rotation) and eigenvalues λ (s^2).
+            # ------------------------------------------------------------------
+            extract_start_time = time.perf_counter()
 
-        # Scales are sqrt of eigenvalues
-        scales = torch.sqrt(eigvals)  # [num_gaussians, 3]
+            cov_world = gaussians.covariances[0].detach().cpu()  # [num_gaussians, 3, 3]
+            eigvals, eigvecs = torch.linalg.eigh(cov_world)      # eigvals: [N,3], eigvecs: [N,3,3]
+            eigvals = torch.clamp(eigvals, min=1e-12)
 
-        # Eigenvectors give an orthonormal rotation matrix per Gaussian.
-        rot_mats = eigvecs  # [num_gaussians, 3, 3]
+            # Scales are sqrt of eigenvalues
+            scales = torch.sqrt(eigvals)  # [num_gaussians, 3]
 
-        # Ensure right-handed coordinate system: if det < 0, flip the last column.
-        det = torch.det(rot_mats)
-        if (det < 0).any():
-            flip_mask = det < 0
-            rot_mats[flip_mask, :, 2] *= -1.0
+            # Eigenvectors give an orthonormal rotation matrix per Gaussian.
+            rot_mats = eigvecs  # [num_gaussians, 3, 3]
 
-        # Convert rotation matrices to xyzw quaternions using SciPy's convention.
-        rot_quats_np = R.from_matrix(rot_mats.numpy()).as_quat().astype(np.float32)
-        world_rotations = torch.from_numpy(rot_quats_np)  # [num_gaussians, 4] (x, y, z, w)
+            # Ensure right-handed coordinate system: if det < 0, flip the last column.
+            det = torch.det(rot_mats)
+            if (det < 0).any():
+                flip_mask = det < 0
+                rot_mats[flip_mask, :, 2] *= -1.0
 
-        total_gaussians = world_rotations.shape[0]
+            # Convert rotation matrices to xyzw quaternions using SciPy's convention.
+            rot_quats_np = R.from_matrix(rot_mats.numpy()).as_quat().astype(np.float32)
+            rotations_world = torch.from_numpy(rot_quats_np)  # [num_gaussians, 4] (x, y, z, w)
+            scales_world = scales.detach().cpu()
+            total_gaussians = rotations_world.shape[0]
+
+            extract_end_time = time.perf_counter()
+            step_timings["extract_scales_rotations"] = extract_end_time - extract_start_time
+
         num_gaussians_per_view = total_gaussians // num_views
-
         if total_gaussians % num_views != 0:
             raise ValueError(
                 f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
             )
-
-        extract_end_time = time.perf_counter()
-        step_timings["extract_scales_rotations"] = extract_end_time - extract_start_time
 
         extrinsics_start_time = time.perf_counter()
         reference_extrinsics = context["extrinsics"][0, 0].detach().cpu()
@@ -2528,8 +2573,6 @@ def run_encoder(
             )
             print("=" * 70)
 
-        scales_world = scales.detach().cpu()
-        rotations_world = world_rotations.detach().cpu()
         harmonics_world = gaussians.harmonics[0].detach().cpu()
         opacities_world = gaussians.opacities[0].detach().cpu()
         extract_props_end_time = time.perf_counter()
@@ -2600,13 +2643,12 @@ def run_encoder(
             print(f"  {display_name:35s}: {elapsed_time:8.3f} seconds ({percentage:5.1f}%)")
         print(f"\n  {'Total (all steps)':35s}: {total_step_time:8.3f} seconds")
         print("=" * 70)
-    else:
-        print("✗ Warning: visualization_dump does not contain scales/rotations.")
-        print("  Cannot export to PLY without this information.")
-        print("  This may happen if the encoder config has certain settings.")
-        print(f"  Available keys in visualization_dump: {list(visualization_dump.keys())}")
-        print("\n  Note: The visualization_dump should be populated by the encoder.")
-        print("  If this is missing, check that the encoder is configured correctly.")
+    except Exception as e:
+        print("✗ Error: Failed to export PLY from Gaussian outputs.")
+        print(f"  Reason: {e}")
+        print("  Tip: Re-run with --debug for a full stack trace or export the CoreML model with full outputs.")
+        ply_path = None
+        ply_export_elapsed = None
 
     print("\n" + "=" * 70)
     print("Timing Summary")
@@ -2623,7 +2665,7 @@ def run_encoder(
         total_elapsed = encoder_elapsed + ply_export_elapsed
         print(f"  Total time: {total_elapsed:.3f} seconds ({total_elapsed/60:.2f} minutes)")
     else:
-        print("  PLY export: Not completed (missing visualization data)")
+        print("  PLY export: Not completed (see warnings above)")
         print(f"  Total time (encoder only): {encoder_elapsed:.3f} seconds ({encoder_elapsed/60:.2f} minutes)")
 
     print("\n" + "=" * 70)
