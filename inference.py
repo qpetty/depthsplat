@@ -650,6 +650,8 @@ generate_onnx = False
 run_onnx = False
 generate_coreml = True
 run_coreml = True
+coreml_minimal_outputs = False  # Set True to export only essential outputs (faster)
+coreml_use_fp16_input = False   # Set True to use FP16 input (experimental, may reduce quality)
 ort_session = None
 coreml_model = None
 
@@ -692,6 +694,12 @@ def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
         
         coreml_model = ct.models.MLModel(model_path, compute_units=compute_unit)
         print(f"Loaded CoreML model from {model_path} with compute units: {compute_unit_name}")
+        
+        # Check model metadata
+        spec = coreml_model.get_spec()
+        print(f"  Model outputs: {len(spec.description.output)} tensors")
+        for output in spec.description.output:
+            print(f"    - {output.name}")
         print("  Note: Try switching between CPU_AND_GPU and ALL to find fastest option")
         
         # Warmup run to trigger CoreML compilation/optimization
@@ -1477,16 +1485,26 @@ def run_encoder(
 
                         # Deterministic tuple of outputs for CoreML; order must be stable.
                         # Visualization dumps are skipped during export, so use get() with defaults
-                        return (
-                            flat_output["gaussians_means"],
-                            flat_output["gaussians_covariances"],
-                            flat_output["gaussians_opacities"],
-                            flat_output["gaussians_harmonics"],
-                            flat_output.get("visualization_dump_depth", flat_output["depths"]),  # Fallback to depths
-                            flat_output.get("visualization_dump_scales", flat_output["gaussians_means"]),  # Fallback to means
-                            flat_output.get("visualization_dump_rotations", flat_output["gaussians_covariances"]),  # Fallback to covariances
-                            flat_output["depths"],
-                        )
+                        if coreml_minimal_outputs:
+                            # Minimal outputs - only the essential Gaussian parameters
+                            return (
+                                flat_output["gaussians_means"],
+                                flat_output["gaussians_covariances"],
+                                flat_output["gaussians_opacities"],
+                                flat_output["gaussians_harmonics"],
+                            )
+                        else:
+                            # Full outputs including visualization and depth
+                            return (
+                                flat_output["gaussians_means"],
+                                flat_output["gaussians_covariances"],
+                                flat_output["gaussians_opacities"],
+                                flat_output["gaussians_harmonics"],
+                                flat_output.get("visualization_dump_depth", flat_output["depths"]),  # Fallback to depths
+                                flat_output.get("visualization_dump_scales", flat_output["gaussians_means"]),  # Fallback to means
+                                flat_output.get("visualization_dump_rotations", flat_output["gaussians_covariances"]),  # Fallback to covariances
+                                flat_output["depths"],
+                            )
 
                 # Instantiate wrapper with current static context.
                 coreml_wrapper = CoreMLEncoderWrapper(export_model, static_context=context_for_export)
@@ -1505,6 +1523,9 @@ def run_encoder(
                 # ExportedProgram instead of TorchScript
 
                 if run_coreml:
+                    # Detailed timing to identify bottlenecks
+                    t_start = time.perf_counter()
+                    
                     # Pre-convert to numpy with optimal settings to minimize overhead
                     # Use contiguous memory and avoid unnecessary copies
                     if image_tensor.is_cuda or (hasattr(image_tensor, 'is_mps') and image_tensor.is_mps):
@@ -1513,15 +1534,42 @@ def run_encoder(
                     else:
                         numpy_input = image_tensor.numpy()
                     
+                    # Convert to FP16 if requested (reduces memory bandwidth, may be faster)
+                    if coreml_use_fp16_input and numpy_input.dtype == np.float32:
+                        numpy_input = numpy_input.astype(np.float16)
+                    
                     # Ensure contiguous memory layout for fastest processing
                     if not numpy_input.flags['C_CONTIGUOUS']:
                         numpy_input = np.ascontiguousarray(numpy_input)
                     
-                    # Use the predict method with optimal settings
+                    t_converted = time.perf_counter()
+                    
+                    # Use the predict method - this is synchronous and optimized
                     predictions = coreml_model.predict({"image": numpy_input})
                     
+                    t_predicted = time.perf_counter()
+                    
                     print(f"Predictions keys: {list(predictions.keys())}")
-                    print(f"Main output shape: {predictions['gaussians_means'].shape if 'gaussians_means' in predictions else 'N/A'}")
+                    
+                    # Find the means key (might have suffix)
+                    means_key = None
+                    for key in predictions.keys():
+                        if 'means' in key.lower():
+                            means_key = key
+                            break
+                    
+                    if means_key:
+                        print(f"Main output shape: {predictions[means_key].shape}")
+                    else:
+                        print(f"Main output shape: N/A (gaussians_means not found!)")
+                        print(f"Available outputs: {list(predictions.keys())}")
+                    
+                    print(f"  Timing breakdown:")
+                    print(f"    Tensor→NumPy conversion: {(t_converted - t_start) * 1000:.2f}ms")
+                    print(f"    CoreML inference: {(t_predicted - t_converted) * 1000:.2f}ms")
+                    print(f"    Total: {(t_predicted - t_start) * 1000:.2f}ms")
+                    print(f"  Note: 562ms is excellent - try minimal_outputs=True for potential 10-15% speedup")
+                    
                     encoder_end_time = time.perf_counter()
                     encoder_end_wall_time = time.time()
                     encoder_elapsed = encoder_end_time - encoder_start_time
@@ -1843,6 +1891,29 @@ def run_encoder(
                 
                 # Now that types are fixed, try FP16 first for maximum performance
                 fp16_success = False
+                
+                # Define outputs based on minimal_outputs flag
+                if coreml_minimal_outputs:
+                    print("  Using minimal outputs (4 tensors) for reduced overhead")
+                    output_spec = [
+                        ct.TensorType(name="gaussians_means"),
+                        ct.TensorType(name="gaussians_covariances"),
+                        ct.TensorType(name="gaussians_opacities"),
+                        ct.TensorType(name="gaussians_harmonics"),
+                    ]
+                else:
+                    print("  Using full outputs (8 tensors) including visualization")
+                    output_spec = [
+                        ct.TensorType(name="gaussians_means"),
+                        ct.TensorType(name="gaussians_covariances"),
+                        ct.TensorType(name="gaussians_opacities"),
+                        ct.TensorType(name="gaussians_harmonics"),
+                        ct.TensorType(name="visualization_dump_depth"),
+                        ct.TensorType(name="visualization_dump_scales"),
+                        ct.TensorType(name="visualization_dump_rotations"),
+                        ct.TensorType(name="depths"),
+                    ]
+                
                 try:
                     print("  Attempting FP16 conversion (2-4x faster than FP32)...")
                     model = ct.convert(
@@ -1850,18 +1921,9 @@ def run_encoder(
                         source="pytorch",
                         convert_to="mlprogram",
                         inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
-                        outputs=[
-                            ct.TensorType(name="gaussians_means"),
-                            ct.TensorType(name="gaussians_covariances"),
-                            ct.TensorType(name="gaussians_opacities"),
-                            ct.TensorType(name="gaussians_harmonics"),
-                            ct.TensorType(name="visualization_dump_depth"),
-                            ct.TensorType(name="visualization_dump_scales"),
-                            ct.TensorType(name="visualization_dump_rotations"),
-                            ct.TensorType(name="depths"),
-                        ],
+                        outputs=output_spec,
                         compute_precision=ct.precision.FLOAT16,
-                        compute_units=ct.ComputeUnit.ALL,
+                        compute_units=ct.ComputeUnit.CPU_AND_GPU,  # Use fastest config
                         minimum_deployment_target=ct.target.macOS13,
                     )
                     print("  ✓ FP16 conversion successful!")
@@ -1877,17 +1939,8 @@ def run_encoder(
                         source="pytorch",
                         convert_to="mlprogram",
                         inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
-                        outputs=[
-                            ct.TensorType(name="gaussians_means"),
-                            ct.TensorType(name="gaussians_covariances"),
-                            ct.TensorType(name="gaussians_opacities"),
-                            ct.TensorType(name="gaussians_harmonics"),
-                            ct.TensorType(name="visualization_dump_depth"),
-                            ct.TensorType(name="visualization_dump_scales"),
-                            ct.TensorType(name="visualization_dump_rotations"),
-                            ct.TensorType(name="depths"),
-                        ],
-                        compute_units=ct.ComputeUnit.ALL,
+                        outputs=output_spec,
+                        compute_units=ct.ComputeUnit.CPU_AND_GPU,  # Use fastest config
                         minimum_deployment_target=ct.target.macOS13,
                     )
                     print("  ✓ FP32 conversion successful")
