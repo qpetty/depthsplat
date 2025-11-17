@@ -648,12 +648,13 @@ def validate_ply_export(
 onnx_model_name = "depthsplat_encoder.onnx"
 generate_onnx = False
 run_onnx = False
-generate_coreml = True
+generate_coreml = False
 run_coreml = True
 coreml_minimal_outputs = False  # Set True to export only essential outputs (faster)
 coreml_use_fp16_input = False   # Set True to use FP16 input (experimental, may reduce quality)
 ort_session = None
 coreml_model = None
+coreml_output_mapping = None  # Mapping from expected output names to actual CoreML output names
 
 
 def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
@@ -694,6 +695,17 @@ def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
         
         coreml_model = ct.models.MLModel(model_path, compute_units=compute_unit)
         print(f"Loaded CoreML model from {model_path} with compute units: {compute_unit_name}")
+        
+        # Load output name mapping if it exists
+        mapping_path = "depthsplat_output_mapping.json"
+        import json
+        import os
+        global coreml_output_mapping
+        coreml_output_mapping = None
+        if os.path.exists(mapping_path):
+            with open(mapping_path, 'r') as f:
+                coreml_output_mapping = json.load(f)
+            print(f"  Loaded output name mapping from {mapping_path}")
         
         # Check model metadata
         spec = coreml_model.get_spec()
@@ -1372,7 +1384,7 @@ def run_encoder(
         encoder_start_wall_time = time.time()
         print(f"    Run start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_start_wall_time))}")
         
-        if generate_onnx or run_onnx or generate_coreml:
+        if generate_onnx or run_onnx or generate_coreml or run_coreml:
             class ExportableEncoder(nn.Module):
                 def __init__(self, encoder: nn.Module, global_step: int = 0):
                     super().__init__()
@@ -1448,6 +1460,146 @@ def run_encoder(
 
             context_for_export = prepare_context_for_export(context)  # Your real context, now export-ready
 
+            if run_coreml:
+                # Extract image tensor from context
+                image_tensor = context_for_export["image"]
+                
+                # Detailed timing to identify bottlenecks
+                t_start = time.perf_counter()
+                
+                # Pre-convert to numpy with optimal settings to minimize overhead
+                # Use contiguous memory and avoid unnecessary copies
+                if image_tensor.is_cuda or (hasattr(image_tensor, 'is_mps') and image_tensor.is_mps):
+                    # For GPU tensors, convert via CPU efficiently
+                    numpy_input = image_tensor.cpu().numpy()
+                else:
+                    numpy_input = image_tensor.numpy()
+                
+                # Convert to FP16 if requested (reduces memory bandwidth, may be faster)
+                if coreml_use_fp16_input and numpy_input.dtype == np.float32:
+                    numpy_input = numpy_input.astype(np.float16)
+                
+                # Ensure contiguous memory layout for fastest processing
+                if not numpy_input.flags['C_CONTIGUOUS']:
+                    numpy_input = np.ascontiguousarray(numpy_input)
+                
+                t_converted = time.perf_counter()
+                
+                # Use the predict method - this is synchronous and optimized
+                predictions = coreml_model.predict({"image": numpy_input})
+                
+                t_predicted = time.perf_counter()
+                
+                print(f"Predictions keys: {list(predictions.keys())}")
+                
+                # Find the means key (might have suffix)
+                means_key = None
+                for key in predictions.keys():
+                    if 'means' in key.lower():
+                        means_key = key
+                        break
+                
+                if means_key:
+                    print(f"Main output shape: {predictions[means_key].shape}")
+                else:
+                    print(f"Main output shape: N/A (gaussians_means not found!)")
+                    print(f"Available outputs: {list(predictions.keys())}")
+                
+                print(f"  Timing breakdown:")
+                print(f"    Tensor→NumPy conversion: {(t_converted - t_start) * 1000:.2f}ms")
+                print(f"    CoreML inference: {(t_predicted - t_converted) * 1000:.2f}ms")
+                print(f"    Total: {(t_predicted - t_start) * 1000:.2f}ms")
+                print(f"  Note: 562ms is excellent - try minimal_outputs=True for potential 10-15% speedup")
+                
+                # Process CoreML outputs into expected result format
+                # Map output keys using the mapping file if available
+                output_keys = list(predictions.keys())
+                
+                # Helper function to find key, using mapping if available
+                global coreml_output_mapping
+                def find_key(expected_name):
+                    # First try using the mapping file
+                    if coreml_output_mapping and 'mapping' in coreml_output_mapping:
+                        mapped_name = coreml_output_mapping['mapping'].get(expected_name)
+                        if mapped_name and mapped_name in output_keys:
+                            return mapped_name
+                    
+                    # Fallback to substring match
+                    for key in output_keys:
+                        if expected_name.lower() in key.lower():
+                            return key
+                    return None
+                
+                # Extract outputs (order depends on coreml_minimal_outputs setting during export)
+                # The outputs are in order: means, covariances, opacities, harmonics, [depth, scales, rotations, depths]
+                means_key = find_key('gaussians_means')
+                covs_key = find_key('gaussians_covariances')
+                opac_key = find_key('gaussians_opacities')
+                harm_key = find_key('gaussians_harmonics')
+                
+                # Build detailed error message if required keys are missing
+                missing_keys = []
+                if not means_key:
+                    missing_keys.append('means')
+                if not covs_key:
+                    missing_keys.append('covariances')
+                if not opac_key:
+                    missing_keys.append('opacities')
+                if not harm_key:
+                    missing_keys.append('harmonics')
+                
+                if missing_keys:
+                    print(f"\n{'='*80}")
+                    print(f"ERROR: CoreML model is missing required outputs: {missing_keys}")
+                    print(f"Available outputs: {output_keys}")
+                    print(f"\nThe CoreML model at 'depthsplat.mlpackage' is incomplete or corrupted.")
+                    print(f"\nTo fix this, regenerate the CoreML model by:")
+                    print(f"  1. Set 'generate_coreml = True' (line ~651)")
+                    print(f"  2. Set 'run_coreml = False' (line ~652)")
+                    print(f"  3. Run the script again to export a new model")
+                    print(f"  4. Once export is complete, set 'generate_coreml = False' and 'run_coreml = True'")
+                    print(f"{'='*80}\n")
+                    raise ValueError(f"CoreML output missing required keys: {missing_keys}. Found: {output_keys}")
+                
+                # Convert numpy arrays to torch tensors
+                gauss_means = torch.from_numpy(predictions[means_key])
+                gauss_covs = torch.from_numpy(predictions[covs_key])
+                gauss_opac = torch.from_numpy(predictions[opac_key])
+                gauss_harm = torch.from_numpy(predictions[harm_key])
+                
+                # Reconstruct Gaussians object
+                gaussians = GaussiansOut(
+                    means=gauss_means,
+                    covariances=gauss_covs,
+                    harmonics=gauss_harm,
+                    opacities=gauss_opac,
+                )
+                
+                # Check if we have full outputs (visualization dump + depths)
+                # This depends on the coreml_minimal_outputs setting used during export
+                depths_key = find_key('depths')
+                vd_depth_key = find_key('visualization_dump_depth')
+                vd_scales_key = find_key('visualization_dump_scales')
+                vd_rotations_key = find_key('visualization_dump_rotations')
+                
+                if depths_key and vd_depth_key and vd_scales_key and vd_rotations_key:
+                    # Full outputs available
+                    depths = torch.from_numpy(predictions[depths_key])
+                    vd_depth = torch.from_numpy(predictions[vd_depth_key])
+                    vd_scales = torch.from_numpy(predictions[vd_scales_key])
+                    vd_rotations = torch.from_numpy(predictions[vd_rotations_key])
+                    
+                    visualization_dump_dict = {
+                        "depth": vd_depth,
+                        "scales": vd_scales,
+                        "rotations": vd_rotations,
+                    }
+                    result = {"gaussians": gaussians, "depths": depths, "visualization_dump": visualization_dump_dict}
+                else:
+                    # Minimal outputs - no depths or visualization dump
+                    result = {"gaussians": gaussians, "depths": None, "visualization_dump": None}
+                    
+                    
             if generate_coreml:
                 # Use the ExportableEncoder wrapper so that we provide a fixed global_step and
                 # a clean tensor-only output dict, then wrap again to expose a simple
@@ -1495,14 +1647,30 @@ def run_encoder(
                             )
                         else:
                             # Full outputs including visualization and depth
+                            # IMPORTANT: Must return unique tensor objects - CoreML doesn't handle duplicates well
+                            # Use .clone() to create new tensors if fallback values are needed
+                            vd_depth = flat_output.get("visualization_dump_depth")
+                            if vd_depth is None:
+                                vd_depth = flat_output["depths"].clone()
+                            
+                            vd_scales = flat_output.get("visualization_dump_scales")
+                            if vd_scales is None:
+                                # Create a unique tensor instead of reusing gaussians_means
+                                vd_scales = flat_output["gaussians_means"].clone()
+                            
+                            vd_rotations = flat_output.get("visualization_dump_rotations")
+                            if vd_rotations is None:
+                                # Create a unique tensor instead of reusing gaussians_covariances
+                                vd_rotations = flat_output["gaussians_covariances"].clone()
+                            
                             return (
                                 flat_output["gaussians_means"],
                                 flat_output["gaussians_covariances"],
                                 flat_output["gaussians_opacities"],
                                 flat_output["gaussians_harmonics"],
-                                flat_output.get("visualization_dump_depth", flat_output["depths"]),  # Fallback to depths
-                                flat_output.get("visualization_dump_scales", flat_output["gaussians_means"]),  # Fallback to means
-                                flat_output.get("visualization_dump_rotations", flat_output["gaussians_covariances"]),  # Fallback to covariances
+                                vd_depth,
+                                vd_scales,
+                                vd_rotations,
                                 flat_output["depths"],
                             )
 
@@ -1521,62 +1689,6 @@ def run_encoder(
                 #         check_trace=False,  # Skip trace-vs-runtime sanity check; model has dynamic/non-deterministic behavior
                 #     )
                 # ExportedProgram instead of TorchScript
-
-                if run_coreml:
-                    # Detailed timing to identify bottlenecks
-                    t_start = time.perf_counter()
-                    
-                    # Pre-convert to numpy with optimal settings to minimize overhead
-                    # Use contiguous memory and avoid unnecessary copies
-                    if image_tensor.is_cuda or (hasattr(image_tensor, 'is_mps') and image_tensor.is_mps):
-                        # For GPU tensors, convert via CPU efficiently
-                        numpy_input = image_tensor.cpu().numpy()
-                    else:
-                        numpy_input = image_tensor.numpy()
-                    
-                    # Convert to FP16 if requested (reduces memory bandwidth, may be faster)
-                    if coreml_use_fp16_input and numpy_input.dtype == np.float32:
-                        numpy_input = numpy_input.astype(np.float16)
-                    
-                    # Ensure contiguous memory layout for fastest processing
-                    if not numpy_input.flags['C_CONTIGUOUS']:
-                        numpy_input = np.ascontiguousarray(numpy_input)
-                    
-                    t_converted = time.perf_counter()
-                    
-                    # Use the predict method - this is synchronous and optimized
-                    predictions = coreml_model.predict({"image": numpy_input})
-                    
-                    t_predicted = time.perf_counter()
-                    
-                    print(f"Predictions keys: {list(predictions.keys())}")
-                    
-                    # Find the means key (might have suffix)
-                    means_key = None
-                    for key in predictions.keys():
-                        if 'means' in key.lower():
-                            means_key = key
-                            break
-                    
-                    if means_key:
-                        print(f"Main output shape: {predictions[means_key].shape}")
-                    else:
-                        print(f"Main output shape: N/A (gaussians_means not found!)")
-                        print(f"Available outputs: {list(predictions.keys())}")
-                    
-                    print(f"  Timing breakdown:")
-                    print(f"    Tensor→NumPy conversion: {(t_converted - t_start) * 1000:.2f}ms")
-                    print(f"    CoreML inference: {(t_predicted - t_converted) * 1000:.2f}ms")
-                    print(f"    Total: {(t_predicted - t_start) * 1000:.2f}ms")
-                    print(f"  Note: 562ms is excellent - try minimal_outputs=True for potential 10-15% speedup")
-                    
-                    encoder_end_time = time.perf_counter()
-                    encoder_end_wall_time = time.time()
-                    encoder_elapsed = encoder_end_time - encoder_start_time
-                    total_encoder_elapsed += encoder_elapsed
-                    print(f"    Run end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
-                    print(f"    Run elapsed time: {encoder_elapsed:.3f} seconds")
-                    return
 
                 import sys
                 from e3nn import o3  # ensure e3nn.o3 is loaded
@@ -1916,6 +2028,18 @@ def run_encoder(
                 
                 try:
                     print("  Attempting FP16 conversion (2-4x faster than FP32)...")
+                    import logging
+                    import sys
+                    
+                    # Capture CoreML conversion warnings/errors
+                    coreml_logger = logging.getLogger('coremltools')
+                    coreml_logger.setLevel(logging.DEBUG)
+                    handler = logging.StreamHandler(sys.stdout)
+                    handler.setLevel(logging.DEBUG)
+                    formatter = logging.Formatter('    [CoreML] %(levelname)s: %(message)s')
+                    handler.setFormatter(formatter)
+                    coreml_logger.addHandler(handler)
+                    
                     model = ct.convert(
                         exported,
                         source="pytorch",
@@ -1930,10 +2054,26 @@ def run_encoder(
                     fp16_success = True
                 except Exception as e:
                     print(f"  ⚠ FP16 conversion still failed: {e}")
+                    import traceback
+                    traceback.print_exc()
                     print("  Falling back to FP32 with post-conversion FP16 optimization...")
                 
                 # Fallback to FP32 if FP16 failed
                 if not fp16_success:
+                    print("  Attempting FP32 conversion...")
+                    import logging
+                    import sys
+                    
+                    # Ensure logging is enabled for FP32 conversion too
+                    coreml_logger = logging.getLogger('coremltools')
+                    coreml_logger.setLevel(logging.DEBUG)
+                    if not coreml_logger.handlers:
+                        handler = logging.StreamHandler(sys.stdout)
+                        handler.setLevel(logging.DEBUG)
+                        formatter = logging.Formatter('    [CoreML] %(levelname)s: %(message)s')
+                        handler.setFormatter(formatter)
+                        coreml_logger.addHandler(handler)
+                    
                     model = ct.convert(
                         exported,
                         source="pytorch",
@@ -1966,6 +2106,117 @@ def run_encoder(
                 
                 if fp16_success:
                     print("  🚀 Final model uses FP16 precision for maximum speed")
+                
+                # FIX: Explicitly rename outputs to match our expected names
+                # CoreML's optimization passes can mix up output names, so we force them here
+                print("\n  Fixing output names after conversion...")
+                spec = model.get_spec()
+                actual_output_names = [output.name for output in spec.description.output]
+                expected_output_names = [o.name for o in output_spec]
+                
+                print(f"    Before fix: {actual_output_names}")
+                print(f"    Expected: {expected_output_names}")
+                
+                # WORKAROUND: CoreML's FP16 conversion messes up output names
+                # Instead of trying to fix the internal program, we'll:
+                # 1. Save a mapping file that maps actual output names to expected names
+                # 2. Use this mapping at runtime to correctly identify outputs
+                
+                # Create output name mapping
+                output_name_mapping = {}
+                for i in range(min(len(actual_output_names), len(expected_output_names))):
+                    actual_name = actual_output_names[i]
+                    expected_name = expected_output_names[i]
+                    if actual_name != expected_name:
+                        output_name_mapping[expected_name] = actual_name
+                        print(f"    Mapping: {expected_name} <- {actual_name}")
+                
+                # Save the mapping to a JSON file alongside the model
+                import json
+                mapping_path = "depthsplat_output_mapping.json"
+                with open(mapping_path, 'w') as f:
+                    json.dump({
+                        'expected_outputs': expected_output_names,
+                        'actual_outputs': actual_output_names,
+                        'mapping': output_name_mapping
+                    }, f, indent=2)
+                print(f"    ✓ Saved output name mapping to {mapping_path}")
+                print(f"    NOTE: Runtime code will use this mapping to correctly identify outputs")
+                
+                # Verify the model outputs before saving
+                print("\n" + "="*80)
+                print("Verifying CoreML model outputs...")
+                spec = model.get_spec()
+                actual_outputs = [output.name for output in spec.description.output]
+                print(f"Expected outputs: {[o.name for o in output_spec]}")
+                print(f"Actual outputs: {actual_outputs}")
+                
+                missing_outputs = [o.name for o in output_spec if o.name not in actual_outputs]
+                if missing_outputs:
+                    print(f"\n⚠ WARNING: The following outputs are MISSING from the converted model:")
+                    for name in missing_outputs:
+                        print(f"  - {name}")
+                    print("\nThis indicates an issue during CoreML conversion.")
+                    print("Possible causes:")
+                    print("  1. The tensor has unsupported operations in its computation path")
+                    print("  2. The tensor shape is incompatible with CoreML")
+                    print("  3. The tensor dtype is problematic")
+                    print("\nInvestigating the exported graph...")
+                    
+                    # Check the torch.export graph to see if those outputs exist there
+                    gm = exported.graph_module
+                    output_nodes = [node for node in gm.graph.nodes if node.op == "output"]
+                    if output_nodes:
+                        output_node = output_nodes[0]
+                        print(f"\nTorch export output node args: {output_node.args}")
+                        if output_node.args and len(output_node.args) > 0:
+                            output_tuple = output_node.args[0]
+                            print(f"Number of outputs in torch.export: {len(output_tuple) if isinstance(output_tuple, (list, tuple)) else 'N/A'}")
+                            if isinstance(output_tuple, (list, tuple)):
+                                # Check for duplicate outputs
+                                output_ids = [id(out) for out in output_tuple]
+                                unique_ids = set(output_ids)
+                                if len(unique_ids) < len(output_tuple):
+                                    print(f"\n⚠ WARNING: Found duplicate outputs in the graph!")
+                                    print(f"  Total outputs: {len(output_tuple)}, Unique outputs: {len(unique_ids)}")
+                                    print(f"  This may cause CoreML conversion issues.")
+                                    print(f"\n  Duplicate analysis:")
+                                    for i, out in enumerate(output_tuple):
+                                        duplicates = [j for j, o in enumerate(output_tuple) if id(o) == id(out) and j != i]
+                                        if duplicates:
+                                            print(f"    Output {i} ({out.name}): also appears at positions {duplicates}")
+                                
+                                print(f"\n  Detailed output information:")
+                                for i, out in enumerate(output_tuple):
+                                    expected_name = output_spec[i].name if i < len(output_spec) else "N/A"
+                                    # Get metadata if available
+                                    meta_str = ""
+                                    if hasattr(out, 'meta') and 'val' in out.meta:
+                                        val = out.meta['val']
+                                        if hasattr(val, 'shape') and hasattr(val, 'dtype'):
+                                            meta_str = f" - shape: {val.shape}, dtype: {val.dtype}"
+                                    print(f"    Output {i}: {out.name}{meta_str}")
+                                    print(f"      -> Expected name: {expected_name}")
+                                    
+                    print(f"\n  Possible issue: CoreML may not handle duplicate tensor outputs correctly.")
+                    print(f"  The model forward() returns some tensors multiple times (see fallback logic lines 1629-1631).")
+                    print(f"  This could cause CoreML to drop outputs during conversion.")
+                    
+                    print("\n" + "="*80)
+                    # Don't raise error - we saved the mapping file
+                    print(f"⚠ WARNING: Output names don't match, but we have {len(actual_outputs)} outputs")
+                    print(f"  The runtime code will use depthsplat_output_mapping.json to map outputs correctly")
+                
+                # Check if we have the right number of outputs
+                if len(actual_outputs) != len(expected_output_names):
+                    print(f"\n⚠ CRITICAL: Output count mismatch!")
+                    print(f"  Expected: {len(expected_output_names)} outputs")
+                    print(f"  Actual: {len(actual_outputs)} outputs")
+                    raise ValueError(f"CoreML conversion produced wrong number of outputs: expected {len(expected_output_names)}, got {len(actual_outputs)}")
+                else:
+                    print(f"✓ Correct number of outputs: {len(actual_outputs)}")
+                print("="*80 + "\n")
+                
                 model.save("depthsplat.mlpackage")
                 print(f"Encoder exported successfully to depthsplat.mlpackage")
                 return
@@ -2135,7 +2386,7 @@ def run_encoder(
                 # Keep result structure consistent with the native encoder path
                 result = {"gaussians": gaussians, "depths": depths, "visualization_dump": visualization_dump_dict}
 
-        if not run_onnx:
+        if not run_onnx and not run_coreml:
             with torch.no_grad():
                 result = encoder(
                     context=context,
