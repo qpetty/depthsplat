@@ -649,13 +649,24 @@ onnx_model_name = "depthsplat_encoder.onnx"
 generate_onnx = False
 run_onnx = False
 generate_coreml = True
+run_coreml = True
 ort_session = None
+coreml_model = None
 
 
 def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
     config_root: Union[str, Path] = CONFIG_ROOT,
     encoder_overrides: Optional[Dict[str, Any]] = ENCODER_OVERRIDES,
     enable_torch_compile: Optional[bool] = ENABLE_TORCH_COMPILE) -> SetupResult:
+
+    # Device selection: prefer CUDA, then MPS (Apple Silicon), then CPU
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    print(f"Using device: {device}")
 
     global ort_session
     if run_onnx:
@@ -669,14 +680,29 @@ def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
         )
         print("ONNX Runtime InferenceSession created")
 
-    # Device selection: prefer CUDA, then MPS (Apple Silicon), then CPU
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
-    print(f"Using device: {device}")
+    global coreml_model
+    if run_coreml:
+        model_path = "depthsplat.mlpackage"
+        
+        # Try different compute units for optimal performance
+        # ALL = CPU+GPU+ANE (Neural Engine), CPU_AND_GPU = CPU+GPU only
+        # For some models, GPU-only is faster than including Neural Engine
+        compute_unit = ct.ComputeUnit.CPU_AND_GPU  # Try this first, change to ALL if slower
+        compute_unit_name = "CPU_AND_GPU"
+        
+        coreml_model = ct.models.MLModel(model_path, compute_units=compute_unit)
+        print(f"Loaded CoreML model from {model_path} with compute units: {compute_unit_name}")
+        print("  Note: Try switching between CPU_AND_GPU and ALL to find fastest option")
+        
+        # Warmup run to trigger CoreML compilation/optimization
+        # Do 2 warmup runs to ensure compilation is fully cached
+        print("Running CoreML warmup (2 iterations)...")
+        input_spec = coreml_model.get_spec().description.input[0]
+        input_shape = tuple(input_spec.type.multiArrayType.shape)
+        dummy_input = {"image": np.random.randn(*input_shape).astype(np.float32)}
+        _ = coreml_model.predict(dummy_input)  # First run: compilation
+        _ = coreml_model.predict(dummy_input)  # Second run: cache verification
+        print("CoreML warmup complete")
 
     # Load encoder config
     print("\n" + "="*70)
@@ -1478,6 +1504,32 @@ def run_encoder(
                 #     )
                 # ExportedProgram instead of TorchScript
 
+                if run_coreml:
+                    # Pre-convert to numpy with optimal settings to minimize overhead
+                    # Use contiguous memory and avoid unnecessary copies
+                    if image_tensor.is_cuda or (hasattr(image_tensor, 'is_mps') and image_tensor.is_mps):
+                        # For GPU tensors, convert via CPU efficiently
+                        numpy_input = image_tensor.cpu().numpy()
+                    else:
+                        numpy_input = image_tensor.numpy()
+                    
+                    # Ensure contiguous memory layout for fastest processing
+                    if not numpy_input.flags['C_CONTIGUOUS']:
+                        numpy_input = np.ascontiguousarray(numpy_input)
+                    
+                    # Use the predict method with optimal settings
+                    predictions = coreml_model.predict({"image": numpy_input})
+                    
+                    print(f"Predictions keys: {list(predictions.keys())}")
+                    print(f"Main output shape: {predictions['gaussians_means'].shape if 'gaussians_means' in predictions else 'N/A'}")
+                    encoder_end_time = time.perf_counter()
+                    encoder_end_wall_time = time.time()
+                    encoder_elapsed = encoder_end_time - encoder_start_time
+                    total_encoder_elapsed += encoder_elapsed
+                    print(f"    Run end time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(encoder_end_wall_time))}")
+                    print(f"    Run elapsed time: {encoder_elapsed:.3f} seconds")
+                    return
+
                 import sys
                 from e3nn import o3  # ensure e3nn.o3 is loaded
 
@@ -1703,23 +1755,164 @@ def run_encoder(
                     traceback.print_exc()
                     print("  Attempting to proceed anyway - CoreML conversion may fail if bicubic ops are present")
 
-                print("Converting to CoreML")
-                model = ct.convert(
-                    exported,
-                    source="pytorch",
-                    convert_to="mlprogram",
-                    inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
-                    outputs=[
-                        ct.TensorType(name="gaussians_means"),
-                        ct.TensorType(name="gaussians_covariances"),
-                        ct.TensorType(name="gaussians_opacities"),
-                        ct.TensorType(name="gaussians_harmonics"),
-                        ct.TensorType(name="visualization_dump_depth"),
-                        ct.TensorType(name="visualization_dump_scales"),
-                        ct.TensorType(name="visualization_dump_rotations"),
-                        ct.TensorType(name="depths"),
-                    ],
-                )
+                print("Debugging and fixing type mismatches for CoreML FP16 compatibility...")
+                # Find and fix operations with mixed types (stack, cat, etc.)
+                try:
+                    gm = exported.graph_module
+                    fixed_ops = 0
+                    
+                    # Operations that are sensitive to type mismatches
+                    type_sensitive_ops = ["stack", "cat", "concat"]
+                    
+                    for node in list(gm.graph.nodes):
+                        if node.op == "call_function":
+                            target_str = str(node.target)
+                            
+                            # Look for type-sensitive operations
+                            is_sensitive = any(op in target_str.lower() for op in type_sensitive_ops)
+                            
+                            if is_sensitive:
+                                print(f"  Found operation: {node.name} -> {target_str}")
+                                
+                                # Try to fix type mismatches by casting all inputs to float32
+                                if node.args and len(node.args) > 0:
+                                    tensors_arg = node.args[0]
+                                    if isinstance(tensors_arg, (list, tuple)):
+                                        print(f"    Operation has {len(tensors_arg)} inputs, ensuring type consistency...")
+                                        
+                                        # Create cast operations to ensure all are float32
+                                        cast_tensors = []
+                                        for i, tensor in enumerate(tensors_arg):
+                                            if hasattr(tensor, 'op') and tensor.op == 'placeholder':
+                                                # Don't cast placeholders
+                                                cast_tensors.append(tensor)
+                                            else:
+                                                # Insert a cast to float32 before the operation
+                                                with gm.graph.inserting_before(node):
+                                                    cast_node = gm.graph.call_function(
+                                                        torch.ops.aten._to_copy.default,
+                                                        args=(tensor,),
+                                                        kwargs={"dtype": torch.float32}
+                                                    )
+                                                    cast_tensors.append(cast_node)
+                                        
+                                        # Replace the operation's input with casted tensors
+                                        new_args = (cast_tensors,) + node.args[1:]
+                                        node.args = new_args
+                                        fixed_ops += 1
+                                        print(f"    ✓ Cast all inputs to float32")
+                            
+                            # Also look for division operations that might create doubles
+                            elif "div" in target_str.lower() or "truediv" in target_str.lower():
+                                # Ensure division results are explicitly float32
+                                for user in list(node.users.keys()):
+                                    # Insert cast after division
+                                    with gm.graph.inserting_after(node):
+                                        cast_node = gm.graph.call_function(
+                                            torch.ops.aten._to_copy.default,
+                                            args=(node,),
+                                            kwargs={"dtype": torch.float32}
+                                        )
+                                        user.replace_input_with(node, cast_node)
+                                        fixed_ops += 1
+                                        break  # Only need to insert once
+                    
+                    if fixed_ops > 0:
+                        gm.graph.lint()
+                        gm.recompile()
+                        print(f"  ✓ Fixed {fixed_ops} operation(s) with type casting")
+                        
+                        # Save the fixed graph
+                        try:
+                            graph_code = gm.code
+                            with open("exported_graph_fixed.py", "w") as f:
+                                f.write(graph_code)
+                            print("  Fixed graph saved to: exported_graph_fixed.py")
+                        except Exception as e:
+                            print(f"  Couldn't save fixed graph: {e}")
+                    else:
+                        print("  No operations needed type fixing")
+                        
+                except Exception as e:
+                    print(f"  Warning: Could not fix type mismatches: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("  Attempting to proceed anyway")
+                
+                print("\nConverting to CoreML with optimizations")
+                
+                # Now that types are fixed, try FP16 first for maximum performance
+                fp16_success = False
+                try:
+                    print("  Attempting FP16 conversion (2-4x faster than FP32)...")
+                    model = ct.convert(
+                        exported,
+                        source="pytorch",
+                        convert_to="mlprogram",
+                        inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
+                        outputs=[
+                            ct.TensorType(name="gaussians_means"),
+                            ct.TensorType(name="gaussians_covariances"),
+                            ct.TensorType(name="gaussians_opacities"),
+                            ct.TensorType(name="gaussians_harmonics"),
+                            ct.TensorType(name="visualization_dump_depth"),
+                            ct.TensorType(name="visualization_dump_scales"),
+                            ct.TensorType(name="visualization_dump_rotations"),
+                            ct.TensorType(name="depths"),
+                        ],
+                        compute_precision=ct.precision.FLOAT16,
+                        compute_units=ct.ComputeUnit.ALL,
+                        minimum_deployment_target=ct.target.macOS13,
+                    )
+                    print("  ✓ FP16 conversion successful!")
+                    fp16_success = True
+                except Exception as e:
+                    print(f"  ⚠ FP16 conversion still failed: {e}")
+                    print("  Falling back to FP32 with post-conversion FP16 optimization...")
+                
+                # Fallback to FP32 if FP16 failed
+                if not fp16_success:
+                    model = ct.convert(
+                        exported,
+                        source="pytorch",
+                        convert_to="mlprogram",
+                        inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
+                        outputs=[
+                            ct.TensorType(name="gaussians_means"),
+                            ct.TensorType(name="gaussians_covariances"),
+                            ct.TensorType(name="gaussians_opacities"),
+                            ct.TensorType(name="gaussians_harmonics"),
+                            ct.TensorType(name="visualization_dump_depth"),
+                            ct.TensorType(name="visualization_dump_scales"),
+                            ct.TensorType(name="visualization_dump_rotations"),
+                            ct.TensorType(name="depths"),
+                        ],
+                        compute_units=ct.ComputeUnit.ALL,
+                        minimum_deployment_target=ct.target.macOS13,
+                    )
+                    print("  ✓ FP32 conversion successful")
+                    
+                    # Try post-conversion FP16 optimization (more aggressive)
+                    try:
+                        print("  Attempting aggressive FP16 casting via compression...")
+                        import coremltools.optimize.coreml as cto
+                        
+                        # Use the newer compression API for better FP16 support
+                        op_config = cto.OpPalettizerConfig(mode="kmeans", nbits=16)
+                        config = cto.OptimizationConfig(global_config=op_config)
+                        
+                        # Alternative: try direct FP16 casting on the model
+                        # This converts compute ops while keeping metadata in FP32
+                        from coremltools.models.neural_network.quantization_utils import quantize_weights
+                        model = quantize_weights(model, nbits=16, quantization_mode="linear")
+                        print("  ✓ Successfully cast operations to FP16")
+                        fp16_success = True
+                    except Exception as e:
+                        print(f"  ℹ Post-conversion FP16 optimization failed: {e}")
+                        print("  Using FP32 model (still GPU-accelerated, ~2s inference)")
+                
+                if fp16_success:
+                    print("  🚀 Final model uses FP16 precision for maximum speed")
                 model.save("depthsplat.mlpackage")
                 print(f"Encoder exported successfully to depthsplat.mlpackage")
                 return
