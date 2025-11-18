@@ -657,11 +657,19 @@ def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
     global ort_session
     if run_onnx:
         # Create an ONNX Runtime session; on macOS this will usually be CPUExecutionProvider
+        # Note: CoreML may convert input names from "context.key" to "context_key" in its cache.
+        # If you encounter errors about missing inputs, try clearing the onnx_cache directory.
+        cache_dir = "onnx_cache"
+        cache_path = Path(cache_dir)
+        if cache_path.exists():
+            print(f"CoreML cache directory exists at {cache_dir}")
+            print("If you encounter input name mismatches, delete this directory to force cache regeneration")
+        
         ort_session = onnxruntime.InferenceSession(
             onnx_model_name,
             providers=[('CoreMLExecutionProvider', {
                         "ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU", 
-                        "RequireStaticInputShapes": "0", "EnableOnSubgraphs": "0", "ModelCacheDirectory": "onnx_cache",
+                        "RequireStaticInputShapes": "0", "EnableOnSubgraphs": "0", "ModelCacheDirectory": cache_dir,
                     })],
         )
         print("ONNX Runtime InferenceSession created")
@@ -1516,21 +1524,47 @@ def run_encoder(
                 global ort_session
                 # Build input_feed dict mapping ONNX input names to numpy arrays.
                 # Inputs were exported as f"context.{key}" for each tensor-valued entry in context_for_export.
+                # CoreML may rename inputs from "context.key" to "context_key" (dots to underscores).
+                print("ONNX session inputs:")
+                for inp in ort_session.get_inputs():
+                    print(f"  {inp.name}: shape={inp.shape}, type={inp.type}")
+                print(f"Context keys available: {list(context_for_export.keys())}")
+                
                 ort_inputs: Dict[str, np.ndarray] = {}
                 for inp in ort_session.get_inputs():
-                    name = inp.name  # e.g., "context.image"
-                    if not name.startswith("context."):
+                    name = inp.name  # e.g., "context.image" or "context_intrinsics"
+                    
+                    # Handle both naming conventions: "context.key" and "context_key"
+                    if name.startswith("context."):
+                        ctx_key = name.split(".", 1)[1]
+                        # CoreML expects underscore format, so convert "context.key" to "context_key"
+                        coreml_name = name.replace(".", "_")
+                    elif name.startswith("context_"):
+                        ctx_key = name.replace("context_", "", 1)  # Remove "context_" prefix
+                        coreml_name = name  # Already in CoreML format
+                    else:
+                        # Skip inputs that don't match our expected pattern
                         continue
-                    ctx_key = name.split(".", 1)[1]
+                    
                     if ctx_key not in context_for_export:
                         raise KeyError(
-                            f"ONNX input '{name}' expects context key '{ctx_key}', which is missing."
+                            f"ONNX input '{name}' expects context key '{ctx_key}', which is missing. "
+                            f"Available keys: {list(context_for_export.keys())}"
                         )
                     tensor = context_for_export[ctx_key]
                     if hasattr(tensor, "detach"):
                         tensor = tensor.detach().cpu()
-                    ort_inputs[name] = tensor.numpy()
+                    
+                    # ONNX Runtime validation requires the original ONNX input names (context.key format)
+                    # CoreML execution provider will handle the internal conversion to underscore format
+                    tensor_np = tensor.numpy()
+                    ort_inputs[name] = tensor_np  # Use original ONNX name for ONNX Runtime validation
+                    print(f"Mapped context key '{ctx_key}' -> ONNX input '{name}'")
 
+                print(f"\nInputs being passed to ONNX Runtime ({len(ort_inputs)} inputs):")
+                for input_name, input_array in ort_inputs.items():
+                    print(f"  {input_name}: shape={input_array.shape}, dtype={input_array.dtype}")
+                
                 onnx_outputs = ort_session.run(None, ort_inputs)
                 print("ONNXRuntime inference completed.")
                 print("ONNXRuntime output count:", len(onnx_outputs))
