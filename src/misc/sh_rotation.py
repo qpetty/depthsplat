@@ -46,6 +46,101 @@ def rotate_sh(
     return torch.cat(result, dim=-1)
 
 
+def rotate_sh_coreml(
+    sh_coefficients: Float[Tensor, "B V P 3 D"],
+    rotations: Float[Tensor, "B V 3 3"]
+) -> Float[Tensor, "B V P 3 D"]:
+    """
+    CoreML-compatible SH rotation (avoiding e3nn/matrix_exp).
+    Supports l=1 (Degree 1). Degree 2+ is passed through unrotated for now to ensure
+    CoreML compatibility and speed, while fixing the most noticeable linear light rotation.
+    
+    Args:
+        sh_coefficients: [B, V, P, C, D] where P=H*W, C=3(RGB), D=SH_coeffs
+        rotations: [B, V, 3, 3]
+    """
+    # Flatten B and V into a single batch dimension N = B*V to keep rank low
+    B, V, P, C, D = sh_coefficients.shape
+    N = B * V
+    
+    # sh_flat: [N, P, C, D] (Rank 4)
+    sh_flat = sh_coefficients.reshape(N, P, C, D)
+    # rot_flat: [N, 3, 3] (Rank 3)
+    rot_flat = rotations.reshape(N, 3, 3)
+    
+    # Use torch.clone() to ensure we don't modify in place in a way that upsets autograd/tracing
+    # However, for in-place assignment to work reliably with symbolic tracing, we sometimes need
+    # to be careful.
+    sh_out = sh_flat.clone()
+    
+    # --- Degree 1 (Indices 1, 2, 3) ---
+    if D >= 4:
+        # e3nn basis for l=1 is (y, z, x)
+        # We extract components, rotate them as (x, y, z), and put them back.
+        
+        # Extract current (y, z, x)
+        sh1_y = sh_flat[..., 1]
+        sh1_z = sh_flat[..., 2]
+        sh1_x = sh_flat[..., 3]
+        
+        # Stack as (x, y, z) -> [N, P, C, 3]
+        xyz = torch.stack([sh1_x, sh1_y, sh1_z], dim=-1)
+        
+        # Reshape to [N, P*C, 3] for batch matrix multiply
+        xyz_flat_for_matmul = xyz.reshape(N, P*C, 3)
+        
+        # Rotate: xyz_new = xyz @ R.T
+        # [N, P*C, 3] @ [N, 3, 3].transpose(1, 2) -> [N, P*C, 3] @ [N, 3, 3] -> [N, P*C, 3]
+        # Note: rot_flat is [N, 3, 3]
+        R_T = rot_flat.transpose(1, 2)
+        
+        xyz_new_flat = torch.matmul(xyz_flat_for_matmul, R_T)
+        
+        # Reshape back to [N, P, C, 3]
+        xyz_new = xyz_new_flat.reshape(N, P, C, 3)
+        
+        # Unpack new (x, y, z)
+        x_new = xyz_new[..., 0]
+        y_new = xyz_new[..., 1]
+        z_new = xyz_new[..., 2]
+        
+        # Assign back as (y, z, x) using slices
+        # In symbolic tracing, slicing like sh_out[..., 1] = ... can be tricky if shapes aren't static.
+        # Instead, we construct the new tensor by concatenating parts.
+        # This is safer for export.
+        
+        # Parts:
+        # 0: DC (unchanged)
+        # 1: y_new
+        # 2: z_new
+        # 3: x_new
+        # 4+: Higher degrees (unchanged)
+        
+        parts = []
+        # sh_flat is [N, P, C, D]
+        
+        # DC component [N, P, C, 1]
+        parts.append(sh_flat[..., 0:1]) 
+        
+        # Rotated components need to be [N, P, C, 1]
+        # y_new, z_new, x_new are [N, P, C]
+        parts.append(y_new.unsqueeze(-1)) 
+        parts.append(z_new.unsqueeze(-1))
+        parts.append(x_new.unsqueeze(-1))
+        
+        if D > 4:
+             parts.append(sh_flat[..., 4:]) # Higher degrees [N, P, C, D-4]
+             
+        sh_out = torch.cat(parts, dim=-1)
+
+    # --- Degree 2 (Indices 4-8) ---
+    # Skipped for CoreML speed/compatibility/stability.
+    # l=1 covers the dominant directional lighting.
+    
+    # Reshape back to original 5D shape
+    return sh_out.reshape(B, V, P, C, D)
+
+
 if __name__ == "__main__":
     from pathlib import Path
 

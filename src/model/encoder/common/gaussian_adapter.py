@@ -7,7 +7,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from ....geometry.projection import get_world_rays, _invert_camera_intrinsics
-from ....misc.sh_rotation import rotate_sh
+from ....misc.sh_rotation import rotate_sh, rotate_sh_coreml
 from .gaussians import build_covariance
 
 # Global flag to skip operations that are incompatible with export/CoreML
@@ -215,9 +215,14 @@ class GaussianAdapter(nn.Module):
 
         rotated_harmonics = sh  # Identity rotation
         if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or _SKIP_EXPORT_INCOMPATIBLE_OPS:
-            # Export: Skip SH rotation (use unrotated harmonics; minimal impact for tracing)
-            # This avoids matrix_exp which decomposes to unsupported diag operations in CoreML
-            print("Export mode: Skipping rotate_sh (uses matrix_exp with unsupported diag operations)")
+            # Export: Use CoreML-compatible SH rotation
+            print("Export mode: Using CoreML-compatible SH rotation (Degree 1 only, Degree 2+ unrotated)")
+            # sh is [B, V, H*W, 3, d_sh]
+            # c2w_rotations is [B, V, 1, 3, 3] (derived from squeezed extrinsics)
+            
+            # Squeeze the singleton spatial dim from rotations to get [B, V, 3, 3]
+            c2w_rot_squeezed = c2w_rotations.squeeze(-3)
+            rotated_harmonics = rotate_sh_coreml(sh, c2w_rot_squeezed)
         else:
             rotated_harmonics = rotate_sh(sh, c2w_rotations[..., None, :, :])
 
