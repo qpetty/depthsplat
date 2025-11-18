@@ -31,7 +31,7 @@ ENCODER_OVERRIDES = {
 
 # Toggle detailed validation and diagnostics during PLY export.
 # Leave disabled for fastest export.
-PLY_EXPORT_VALIDATION = False
+PLY_EXPORT_VALIDATION = True
 
 # Torch compile / encoder benchmarking options
 # Set to True to compile the encoder with torch.compile for faster repeated inference.
@@ -717,9 +717,12 @@ def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
         # Warmup run to trigger CoreML compilation/optimization
         # Do 2 warmup runs to ensure compilation is fully cached
         print("Running CoreML warmup (2 iterations)...")
-        input_spec = coreml_model.get_spec().description.input[0]
-        input_shape = tuple(input_spec.type.multiArrayType.shape)
-        dummy_input = {"image": np.random.randn(*input_shape).astype(np.float32)}
+        dummy_input = {}
+        for input_desc in coreml_model.get_spec().description.input:
+            input_name = input_desc.name
+            input_shape = tuple(input_desc.type.multiArrayType.shape)
+            dummy_input[input_name] = np.zeros(input_shape, dtype=np.float32)
+            
         _ = coreml_model.predict(dummy_input)  # First run: compilation
         _ = coreml_model.predict(dummy_input)  # Second run: cache verification
         print("CoreML warmup complete")
@@ -1469,24 +1472,33 @@ def run_encoder(
                 
                 # Pre-convert to numpy with optimal settings to minimize overhead
                 # Use contiguous memory and avoid unnecessary copies
-                if image_tensor.is_cuda or (hasattr(image_tensor, 'is_mps') and image_tensor.is_mps):
-                    # For GPU tensors, convert via CPU efficiently
-                    numpy_input = image_tensor.cpu().numpy()
-                else:
-                    numpy_input = image_tensor.numpy()
+                input_dict = {}
                 
-                # Convert to FP16 if requested (reduces memory bandwidth, may be faster)
-                if coreml_use_fp16_input and numpy_input.dtype == np.float32:
-                    numpy_input = numpy_input.astype(np.float16)
+                # Helper to convert tensor to numpy
+                def to_numpy(tensor):
+                    if tensor.is_cuda or (hasattr(tensor, 'is_mps') and tensor.is_mps):
+                        numpy_val = tensor.cpu().numpy()
+                    else:
+                        numpy_val = tensor.numpy()
+                    
+                    # Convert to FP16 if requested and it's float32
+                    if coreml_use_fp16_input and numpy_val.dtype == np.float32:
+                        numpy_val = numpy_val.astype(np.float16)
+                        
+                    if not numpy_val.flags['C_CONTIGUOUS']:
+                        numpy_val = np.ascontiguousarray(numpy_val)
+                    return numpy_val
                 
-                # Ensure contiguous memory layout for fastest processing
-                if not numpy_input.flags['C_CONTIGUOUS']:
-                    numpy_input = np.ascontiguousarray(numpy_input)
+                input_dict["image"] = to_numpy(image_tensor)
+                input_dict["extrinsics"] = to_numpy(context_for_export["extrinsics"])
+                input_dict["intrinsics"] = to_numpy(context_for_export["intrinsics"])
+                input_dict["near"] = to_numpy(context_for_export["near"])
+                input_dict["far"] = to_numpy(context_for_export["far"])
                 
                 t_converted = time.perf_counter()
                 
                 # Use the predict method - this is synchronous and optimized
-                predictions = coreml_model.predict({"image": numpy_input})
+                predictions = coreml_model.predict(input_dict)
                 
                 t_predicted = time.perf_counter()
                 
@@ -1614,22 +1626,30 @@ def run_encoder(
                         self.export_model = export_model
 
                         # Register static context entries (e.g., intrinsics, poses) as buffers.
-                        # These will be treated as constants by CoreML; the only runtime input
-                        # will be the image tensor.
+                        # These will be treated as constants by CoreML, unless listed in dynamic_keys.
                         self._buffer_keys: List[str] = []
+                        self.dynamic_keys = ["extrinsics", "intrinsics", "near", "far"]
+
                         for key, value in static_context.items():
+                            if key in self.dynamic_keys:
+                                continue
                             if isinstance(value, torch.Tensor):
                                 # Store as buffer; keys are expected to be simple strings.
                                 self.register_buffer(key, value)
                                 self._buffer_keys.append(key)
 
-                    def forward(self, image: torch.Tensor):
+                    def forward(self, image: torch.Tensor, extrinsics: torch.Tensor, intrinsics: torch.Tensor, near: torch.Tensor, far: torch.Tensor):
                         # Reconstruct context dict from buffers, overriding the image with
                         # the runtime-provided tensor.
                         context: Dict[str, torch.Tensor] = {}
                         for key in self._buffer_keys:
                             context[key] = getattr(self, key)
+                        
                         context["image"] = image
+                        context["extrinsics"] = extrinsics
+                        context["intrinsics"] = intrinsics
+                        context["near"] = near
+                        context["far"] = far
 
                         flat_output = self.export_model(context=context)
 
@@ -1688,6 +1708,10 @@ def run_encoder(
 
                 # Use the main image tensor to define CoreML input shape and trace to TorchScript.
                 image_tensor = context_for_export["image"]
+                extrinsics_tensor = context_for_export["extrinsics"]
+                intrinsics_tensor = context_for_export["intrinsics"]
+                near_tensor = context_for_export["near"]
+                far_tensor = context_for_export["far"]
                 # print(f"Running CoreML trace")
                 # with torch.no_grad():
                 #     traced_wrapper = torch.jit.trace(
@@ -1753,7 +1777,7 @@ def run_encoder(
                 try:
                     # Export via torch.export (ExportedProgram) after patching.
                     print("Starting torch.export...")
-                    exported = export(coreml_wrapper, (image_tensor,))
+                    exported = export(coreml_wrapper, (image_tensor, extrinsics_tensor, intrinsics_tensor, near_tensor, far_tensor))
                     print("torch.export completed successfully")
                     # Lower TRAINING dialect ops to ATEN/EDGE as required by coremltools.
                     exported = exported.run_decompositions({})
@@ -2054,7 +2078,13 @@ def run_encoder(
                         exported,
                         source="pytorch",
                         convert_to="mlprogram",
-                        inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
+                        inputs=[
+                            ct.TensorType(name="image", shape=image_tensor.shape),
+                            ct.TensorType(name="extrinsics", shape=extrinsics_tensor.shape),
+                            ct.TensorType(name="intrinsics", shape=intrinsics_tensor.shape),
+                            ct.TensorType(name="near", shape=near_tensor.shape),
+                            ct.TensorType(name="far", shape=far_tensor.shape),
+                        ],
                         outputs=output_spec,
                         compute_precision=ct.precision.FLOAT16,
                         compute_units=ct.ComputeUnit.CPU_AND_GPU,  # Use fastest config
@@ -2088,7 +2118,13 @@ def run_encoder(
                         exported,
                         source="pytorch",
                         convert_to="mlprogram",
-                        inputs=[ct.TensorType(name="image", shape=image_tensor.shape)],
+                        inputs=[
+                            ct.TensorType(name="image", shape=image_tensor.shape),
+                            ct.TensorType(name="extrinsics", shape=extrinsics_tensor.shape),
+                            ct.TensorType(name="intrinsics", shape=intrinsics_tensor.shape),
+                            ct.TensorType(name="near", shape=near_tensor.shape),
+                            ct.TensorType(name="far", shape=far_tensor.shape),
+                        ],
                         outputs=output_spec,
                         compute_units=ct.ComputeUnit.CPU_AND_GPU,  # Use fastest config
                         minimum_deployment_target=ct.target.macOS13,
