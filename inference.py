@@ -1,8 +1,8 @@
 """
 Run encoder using direct config loading (no Hydra) and export to PLY.
 
-Image resolution: 960x512 (images are automatically resized to this size)
-Camera intrinsics and extrinsics are loaded from metadata files (*_metadata.json)
+Image resolution: 512x960
+Input views: determined by EXTRINSICS_HARDCODED dictionary keys (image filenames)
 """
 
 # ============================================================================
@@ -10,13 +10,15 @@ Camera intrinsics and extrinsics are loaded from metadata files (*_metadata.json
 # ============================================================================
 
 CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
-CONFIG_ROOT = "config"  # Path to config directory
-OUTPUT_DIR = "run-output"
+CONFIG_ROOT = "/content/depthsplat/config"  # Path to config directory
+OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
 
-# Input image base path (directory containing images and metadata files)
-# Images and metadata files (*_metadata.json) should be in this directory
-#IMAGE_BASE_PATH = "/Users/quinton/Desktop/hillman_mov_horizontal"  # Base directory for images
-IMAGE_BASE_PATH = "/Users/quinton/repos/Image_sender/received_images"
+# Input image base path (directory containing images)
+# If EXTRINSICS_HARDCODED is a dictionary, image paths will be constructed as:
+#   IMAGE_BASE_PATH / image_filename (where image_filename is a key in EXTRINSICS_HARDCODED)
+# Set to None to use random images
+IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input"  # Base directory for images
+
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
@@ -644,8 +646,8 @@ def validate_ply_export(
     print("=" * 70)
 
 onnx_model_name = "depthsplat_encoder.onnx"
-generate_onnx = False
-run_onnx = True
+generate_onnx = True
+run_onnx = False
 ort_session = None
 
 
@@ -667,10 +669,7 @@ def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
         
         ort_session = onnxruntime.InferenceSession(
             onnx_model_name,
-            providers=[('CoreMLExecutionProvider', {
-                        "ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU", 
-                        "RequireStaticInputShapes": "0", "EnableOnSubgraphs": "0", "ModelCacheDirectory": cache_dir,
-                    })],
+            providers=["CUDAExecutionProvider"],
         )
         print("ONNX Runtime InferenceSession created")
 
@@ -1417,13 +1416,17 @@ def run_encoder(
                     # if forward() accesses them dynamically (e.g., if key in context), it may fail—simplify if needed
                 return export_context
 
-            context_for_export = prepare_context_for_export(context)  # Your real context, now export-ready
-
             if generate_onnx:
-                encoder.to('cpu')
-                encoder.eval()
+                # Keep encoder on original device for profiling forward pass
+                # (memory_efficient_attention requires CUDA)
+                # Prepare context on CUDA for profiling, then move to CPU for export if needed
+                context_for_profiling = {}
+                for key, value in context.items():
+                    if isinstance(value, torch.Tensor):
+                        context_for_profiling[key] = value.detach().clone().requires_grad_(False)
+                    else:
+                        context_for_profiling[key] = value
                 
-
                 export_model = ExportableEncoder(encoder, global_step=0)
 
                 import sys
@@ -1465,13 +1468,17 @@ def run_encoder(
                 angles = rotation_module.matrix_to_angles(test_R)  # Now uses patched!
                 print("Global patch test success: Angles shapes", [a.shape for a in angles])
 
-                # with torch.no_grad():
-                #     flat_output = export_model(*export_args)
-                #     print("Flattened output keys:", list(flat_output.keys()))
-                #     for k, v in flat_output.items():
-                #         print(f"  {k}: {v.shape}")
-                #     # Expected: gaussians_means: [1,983040,3], etc., + depths: [1,2,512,960]
+                # In run_encoder, after with torch.no_grad(): flat_output = export_model(context=context_for_export)
+                # Trace inv_ex calls (requires torch 2.1+)
+                # Note: Keep model on CUDA for profiling since memory_efficient_attention requires CUDA
+                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True) as prof:
+                    flat_output = export_model(context=context_for_profiling)
+                prof.export_chrome_trace("inv_trace.json")  # View in chrome://tracing
+                print("Inv ops in trace: Check inv_trace.json for 'inv_ex' nodes")
 
+                # Prepare context for export (CPU) - ONNX export typically works better with CPU
+                context_for_export = prepare_context_for_export(context)
+                
                 # Optional: Print shapes to verify (adjust keys to your actual ones)
                 print("Export input shapes:")
                 for key, value in context_for_export.items():
@@ -1491,17 +1498,43 @@ def run_encoder(
                     'visualization_dump_rotations',
                     'depths'
                 ]
+                
+                # Move encoder to CPU for ONNX export (ONNX export can work with CUDA models, but CPU is safer)
+                # Note: This may fail if the model uses CUDA-only operations. If so, keep on CUDA.
+                encoder.eval()
+                try:
+                    encoder.to('cpu')
+                    export_model = ExportableEncoder(encoder, global_step=0)
+                    print("Moved encoder to CPU for ONNX export")
+                except Exception as e:
+                    print(f"Warning: Could not move encoder to CPU: {e}")
+                    print("Keeping encoder on CUDA for ONNX export")
+                    # Keep context on CUDA as well
+                    context_for_export = context_for_profiling
 
-                # In run_encoder, after with torch.no_grad(): flat_output = export_model(context=context_for_export)
-                # Trace inv_ex calls (requires torch 2.1+)
-                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True) as prof:
-                    flat_output = export_model(context=context_for_export)
-                prof.export_chrome_trace("inv_trace.json")  # View in chrome://tracing
-                print("Inv ops in trace: Check inv_trace.json for 'inv_ex' nodes")
+                # Create a wrapper function that unpacks context dict into individual tensor arguments
+                # This matches the input_names structure (context.image, context.extrinsics, etc.)
+                # torch.onnx.export() doesn't support kwargs directly, so we need to unpack the dict
+                class ExportWrapper(nn.Module):
+                    def __init__(self, model, context_keys):
+                        super().__init__()
+                        self.model = model
+                        self.context_keys = context_keys  # Store keys to maintain order
+                    
+                    def forward(self, *context_tensors):
+                        # Reconstruct context dict from individual tensor arguments
+                        context = {key: tensor for key, tensor in zip(self.context_keys, context_tensors)}
+                        return self.model(context=context)
+                
+                # Extract tensor keys and values from context in the same order as input_names
+                # input_names are like "context.image", "context.extrinsics", etc.
+                context_tensor_keys = [key for key in context_for_export.keys() 
+                                       if isinstance(context_for_export[key], torch.Tensor)]
+                context_tensor_values = [context_for_export[key] for key in context_tensor_keys]
+                export_wrapper = ExportWrapper(export_model, context_tensor_keys)
 
-                onnx_program = torch.onnx.export(export_model,
-                                                args=(),
-                                                kwargs={"context": context_for_export},
+                onnx_program = torch.onnx.export(export_wrapper,
+                                                args=tuple(context_tensor_values),
                                                 export_params=True,         # Store trained parameters within the model
                                                 input_names=input_names,
                                                 output_names=output_names,    # Name for the output node (assuming single output)
@@ -1509,8 +1542,6 @@ def run_encoder(
                                                 verbose=True,
                                                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,  # Fallback for custom Functions
                                                 do_constant_folding=True,  # Avoid folding errors in checkpoint remnants
-                                                optimize=True,  # Skip JIT optimizations that trigger 'Subgraph' pass
-                                                report=True,
                                                 )
                 onnx_program.save(onnx_model_name)
                 print(f"Encoder exported successfully to {onnx_model_name}")
@@ -1890,3 +1921,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
