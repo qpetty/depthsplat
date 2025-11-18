@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from typing import Literal, Optional, List
-import time
 
 import torch
 from einops import rearrange
@@ -160,10 +159,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             cameras_dist_index = None
 
         # depth prediction
-        depth_pred_start = time.perf_counter()
-        depth_pred_start_wall = time.time()
-        print(f"    [Encoder] Depth prediction start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(depth_pred_start_wall))}")
-        
         results_dict = self.depth_predictor(
             context["image"],
             attn_splits_list=[2],
@@ -173,11 +168,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             extrinsics=context["extrinsics"],
             nn_matrix=cameras_dist_index,
         )
-        
-        depth_pred_end = time.perf_counter()
-        depth_pred_end_wall = time.time()
-        depth_pred_elapsed = depth_pred_end - depth_pred_start
-        print(f"    [Encoder] Depth prediction end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(depth_pred_end_wall))} (elapsed: {depth_pred_elapsed:.3f}s)")
 
         # list of [B, V, H, W], with all the intermediate depths
         depth_preds = results_dict['depth_preds']
@@ -217,20 +207,11 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             }
 
         # features [BV, C, H, W]
-        feature_upsample_start = time.perf_counter()
-        feature_upsample_start_wall = time.time()
-        print(f"    [Encoder] Feature upsampling start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(feature_upsample_start_wall))}")
-        
         features = self.feature_upsampler(results_dict["features_mono_intermediate"],
                                           cnn_features=results_dict["features_cnn_all_scales"][::-1],
                                           mv_features=results_dict["features_mv"][
                                           0] if self.cfg.num_scales == 1 else results_dict["features_mv"][::-1]
                                           )
-        
-        feature_upsample_end = time.perf_counter()
-        feature_upsample_end_wall = time.time()
-        feature_upsample_elapsed = feature_upsample_end - feature_upsample_start
-        print(f"    [Encoder] Feature upsampling end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(feature_upsample_end_wall))} (elapsed: {feature_upsample_elapsed:.3f}s)")
 
         # match prob from softmax
         # [BV, D, H, W] in feature resolution
@@ -248,16 +229,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             features,
         ), dim=1)
 
-        gaussian_regressor_start = time.perf_counter()
-        gaussian_regressor_start_wall = time.time()
-        print(f"    [Encoder] Gaussian regressor start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_regressor_start_wall))}")
-        
         out = self.gaussian_regressor(concat)
-        
-        gaussian_regressor_end = time.perf_counter()
-        gaussian_regressor_end_wall = time.time()
-        gaussian_regressor_elapsed = gaussian_regressor_end - gaussian_regressor_start
-        print(f"    [Encoder] Gaussian regressor end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_regressor_end_wall))} (elapsed: {gaussian_regressor_elapsed:.3f}s)")
 
         concat = [out,
                     rearrange(context["image"],
@@ -267,16 +239,7 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         out = torch.cat(concat, dim=1)
 
-        gaussian_head_start = time.perf_counter()
-        gaussian_head_start_wall = time.time()
-        print(f"    [Encoder] Gaussian head start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_head_start_wall))}")
-        
         gaussians = self.gaussian_head(out)  # [BV, C, H, W]
-        
-        gaussian_head_end = time.perf_counter()
-        gaussian_head_end_wall = time.time()
-        gaussian_head_elapsed = gaussian_head_end - gaussian_head_start
-        print(f"    [Encoder] Gaussian head end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_head_end_wall))} (elapsed: {gaussian_head_elapsed:.3f}s)")
 
         gaussians = rearrange(gaussians, "(b v) c h w -> b v c h w", b=b, v=v)
 
@@ -330,10 +293,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         sh_input_images = context["image"]
 
-        gaussian_adapter_start = time.perf_counter()
-        gaussian_adapter_start_wall = time.time()
-        print(f"    [Encoder] Gaussian adapter start: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_adapter_start_wall))}")
-        
         if self.cfg.supervise_intermediate_depth and len(depth_preds) > 1:
             context_extrinsics = torch.cat(
                 [context["extrinsics"]] * len(depth_preds), dim=0)
@@ -371,11 +330,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 (h, w),
                 input_images=sh_input_images if self.cfg.init_sh_input_img else None,
             )
-        
-        gaussian_adapter_end = time.perf_counter()
-        gaussian_adapter_end_wall = time.time()
-        gaussian_adapter_elapsed = gaussian_adapter_end - gaussian_adapter_start
-        print(f"    [Encoder] Gaussian adapter end: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(gaussian_adapter_end_wall))} (elapsed: {gaussian_adapter_elapsed:.3f}s)")
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -407,16 +361,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 "b v r srf spp -> b (v r srf spp)",
             ),
         )
-
-        # Print encoder component timing summary
-        print(f"    [Encoder] Component timing summary:")
-        print(f"      Depth prediction: {depth_pred_elapsed:.3f}s")
-        print(f"      Feature upsampling: {feature_upsample_elapsed:.3f}s")
-        print(f"      Gaussian regressor: {gaussian_regressor_elapsed:.3f}s")
-        print(f"      Gaussian head: {gaussian_head_elapsed:.3f}s")
-        print(f"      Gaussian adapter: {gaussian_adapter_elapsed:.3f}s")
-        total_component_time = depth_pred_elapsed + feature_upsample_elapsed + gaussian_regressor_elapsed + gaussian_head_elapsed + gaussian_adapter_elapsed
-        print(f"      Total component time: {total_component_time:.3f}s")
 
         if self.cfg.return_depth:
             # return depth prediction for supervision
