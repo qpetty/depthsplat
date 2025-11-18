@@ -836,25 +836,24 @@ def run_encoder(
     print(f"  Found {len(extrinsics_from_metadata)} metadata file(s)")
     print(f"  Loaded extrinsics for {len(extrinsics_from_metadata)} image(s)")
     
-    # For intrinsics, we need to handle per-image intrinsics
-    # If all images have the same intrinsics, use the first one
-    # Otherwise, we'll need to handle per-image intrinsics later
+    # Store intrinsics and extrinsics dictionaries for per-image use
+    # We'll use per-image intrinsics when setting up the intrinsics tensor
+    intrinsics_loaded_dict = intrinsics_from_metadata
+    extrinsics_loaded = extrinsics_from_metadata
+    
+    # Check if all images have the same intrinsics (for informational purposes)
     intrinsics_values = list(intrinsics_from_metadata.values())
     if len(set(tuple(v) for v in intrinsics_values)) == 1:
         # All images have the same intrinsics
-        intrinsics_loaded = intrinsics_values[0]
-        print(f"  Loaded intrinsics: fx={intrinsics_loaded[0]:.2f}, fy={intrinsics_loaded[1]:.2f}, "
-              f"cx={intrinsics_loaded[2]:.2f}, cy={intrinsics_loaded[3]:.2f}")
+        intrinsics_sample = intrinsics_values[0]
+        print(f"  All images use the same intrinsics: fx={intrinsics_sample[0]:.2f}, fy={intrinsics_sample[1]:.2f}, "
+              f"cx={intrinsics_sample[2]:.2f}, cy={intrinsics_sample[3]:.2f}")
     else:
-        # Different intrinsics per image - use first one and warn
-        intrinsics_loaded = intrinsics_values[0]
-        first_image = list(intrinsics_from_metadata.keys())[0]
-        print(f"  WARNING: Images have different intrinsics. Using intrinsics from {first_image}")
-        print(f"  Loaded intrinsics: fx={intrinsics_loaded[0]:.2f}, fy={intrinsics_loaded[1]:.2f}, "
-              f"cx={intrinsics_loaded[2]:.2f}, cy={intrinsics_loaded[3]:.2f}")
-    
-    # Store extrinsics for later use
-    extrinsics_loaded = extrinsics_from_metadata
+        # Different intrinsics per image
+        print(f"  Images have different intrinsics (will use per-image values):")
+        for img_name, intrinsics_val in intrinsics_from_metadata.items():
+            print(f"    {img_name}: fx={intrinsics_val[0]:.2f}, fy={intrinsics_val[1]:.2f}, "
+                  f"cx={intrinsics_val[2]:.2f}, cy={intrinsics_val[3]:.2f}")
 
 
     # Determine number of views and image paths from loaded extrinsics
@@ -1061,90 +1060,102 @@ def run_encoder(
     # IMPORTANT: Check if image dimensions match COLMAP reconstruction
     print(f"  Current image dimensions: width={width}, height={height}")
     
-    # Use intrinsics from metadata and adjust if images were resized
-    intrinsics_scale_factor_w = 1.0
-    intrinsics_scale_factor_h = 1.0
-    if original_dimensions is not None:
-        orig_height, orig_width = original_dimensions
-        if orig_width != width or orig_height != height:
-            intrinsics_scale_factor_w = width / orig_width
-            intrinsics_scale_factor_h = height / orig_height
-            print(f"  Images were resized from {orig_width} × {orig_height} to {width} × {height}")
-            print(f"  Intrinsics will be scaled by: width_scale={intrinsics_scale_factor_w:.4f}, height_scale={intrinsics_scale_factor_h:.4f}")
+    # Track original dimensions per image for proper intrinsics scaling
+    # Note: We assume all images are resized to the same target size, but they may have different original sizes
+    original_dimensions_per_image = {}
+    if image_paths and len(image_paths) > 0:
+        for img_path, img_filename in zip(image_paths, image_filenames):
+            try:
+                orig_img = load_image(img_path)
+                orig_h, orig_w = orig_img.shape[1], orig_img.shape[2]
+                original_dimensions_per_image[img_filename] = (orig_h, orig_w)
+            except Exception as e:
+                print(f"    Warning: Could not load {img_filename} to get original dimensions: {e}")
+                # Fallback: use the first image's dimensions or target dimensions
+                if original_dimensions is not None:
+                    original_dimensions_per_image[img_filename] = original_dimensions
+                else:
+                    original_dimensions_per_image[img_filename] = (height, width)
     
+    # Initialize intrinsics tensor
     intrinsics = torch.eye(3, dtype=torch.float32).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_views, 1, 1)
     
-    # Use intrinsics from metadata
-    print("  Using intrinsics from metadata files (before normalization)")
-    if len(intrinsics_loaded) != 4:
-        raise ValueError(f"Intrinsics must contain exactly 4 values [fx, fy, cx, cy], got {len(intrinsics_loaded)}")
+    # Use per-image intrinsics from metadata
+    print("  Using per-image intrinsics from metadata files")
     
-    fx, fy, cx, cy = intrinsics_loaded
+    # Verify all image filenames have intrinsics
+    missing_intrinsics = [fname for fname in image_filenames if fname not in intrinsics_loaded_dict]
+    if missing_intrinsics:
+        raise ValueError(f"Intrinsics dictionary is missing entries for: {missing_intrinsics}")
     
-    # Adjust intrinsics if images were resized
-    if original_dimensions is not None and (intrinsics_scale_factor_w != 1.0 or intrinsics_scale_factor_h != 1.0):
-        print(f"  Original intrinsics (pixels): fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
-        fx = fx * intrinsics_scale_factor_w
-        fy = fy * intrinsics_scale_factor_h
-        cx = cx * intrinsics_scale_factor_w
-        cy = cy * intrinsics_scale_factor_h
-        print(f"  Adjusted intrinsics (pixels): fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
-        print(f"    (scaled by {intrinsics_scale_factor_w:.4f} × {intrinsics_scale_factor_h:.4f})")
-    else:
-        print(f"  Intrinsics (pixels): fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+    # Set intrinsics for each view based on the corresponding image filename
+    for view_idx, img_filename in enumerate(image_filenames):
+        intrinsics_raw = intrinsics_loaded_dict[img_filename]
+        
+        if len(intrinsics_raw) != 4:
+            raise ValueError(f"Intrinsics for {img_filename} must contain exactly 4 values [fx, fy, cx, cy], got {len(intrinsics_raw)}")
+        
+        fx, fy, cx, cy = intrinsics_raw
+        
+        # Adjust intrinsics if this image was resized
+        if img_filename in original_dimensions_per_image:
+            orig_h, orig_w = original_dimensions_per_image[img_filename]
+            if orig_w != width or orig_h != height:
+                scale_w = width / orig_w
+                scale_h = height / orig_h
+                fx = fx * scale_w
+                fy = fy * scale_h
+                cx = cx * scale_w
+                cy = cy * scale_h
+        
+        # Set normalized intrinsics for this view
+        intrinsics[0, view_idx, 0, 0] = fx / width   # fx normalized
+        intrinsics[0, view_idx, 1, 1] = fy / height  # fy normalized
+        intrinsics[0, view_idx, 0, 2] = cx / width   # cx normalized
+        intrinsics[0, view_idx, 1, 2] = cy / height  # cy normalized
+        
+        # Print intrinsics for this view
+        print(f"\n  View {view_idx} ({img_filename}):")
+        print(f"    Intrinsics (pixels): fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+        print(f"    Normalized: fx={fx/width:.6f}, fy={fy/height:.6f}, cx={cx/width:.6f}, cy={cy/height:.6f}")
+        
+        # Validate intrinsics values for this view
+        cx_expected = width / 2.0
+        cy_expected = height / 2.0
+        cx_offset = abs(cx - cx_expected) / width if width > 0 else 0
+        cy_offset = abs(cy - cy_expected) / height if height > 0 else 0
+        
+        if cx_offset > 0.1:
+            print(f"      WARNING: cx is {cx_offset*100:.1f}% off from center (expected ~{cx_expected:.1f})")
+        if cy_offset > 0.1:
+            print(f"      WARNING: cy is {cy_offset*100:.1f}% off from center (expected ~{cy_expected:.1f})")
+        
+        # Check focal length ratio
+        if abs(fx - fy) / max(fx, fy) > 0.1:
+            print(f"      WARNING: fx and fy differ by {(abs(fx-fy)/max(fx,fy)*100):.1f}% (may indicate distortion)")
     
-    # Validate intrinsics values
-    cx_expected = width / 2.0
-    cy_expected = height / 2.0
-    cx_offset = abs(cx - cx_expected) / width if width > 0 else 0
-    cy_offset = abs(cy - cy_expected) / height if height > 0 else 0
+    # Compute and validate Field of View for all views
+    print(f"\n  Field of View (FOV) for all views:")
+    for view_idx, img_filename in enumerate(image_filenames):
+        fov = get_fov(intrinsics[0, view_idx:view_idx+1])
+        fov_deg = fov * 180 / math.pi
+        print(f"    View {view_idx} ({img_filename}):")
+        print(f"      Horizontal FOV: {fov_deg[0, 0]:.2f}°")
+        print(f"      Vertical FOV: {fov_deg[0, 1]:.2f}°")
+        
+        # Check if FOV is reasonable (typical range: 30-120 degrees)
+        if fov_deg[0, 0] < 20 or fov_deg[0, 0] > 150:
+            print(f"      WARNING: Horizontal FOV ({fov_deg[0, 0]:.2f}°) is outside typical range (20-150°)")
+        if fov_deg[0, 1] < 20 or fov_deg[0, 1] > 150:
+            print(f"      WARNING: Vertical FOV ({fov_deg[0, 1]:.2f}°) is outside typical range (20-150°)")
     
-    print(f"\n  Intrinsics Validation:")
-    print(f"    Focal length fx: {fx:.2f} pixels (typical range: 100-5000)")
-    print(f"    Focal length fy: {fy:.2f} pixels (typical range: 100-5000)")
-    print(f"    Principal point cx: {cx:.2f} pixels (expected center: {cx_expected:.1f})")
-    print(f"    Principal point cy: {cy:.2f} pixels (expected center: {cy_expected:.1f})")
-    
-    # Additional warnings if still off-center
-    if cx_offset > 0.1:
-        print(f"    WARNING: cx is {cx_offset*100:.1f}% off from center (expected ~{cx_expected:.1f})")
-    if cy_offset > 0.1:
-        print(f"    WARNING: cy is {cy_offset*100:.1f}% off from center (expected ~{cy_expected:.1f})")
-    
-    # Check focal length ratio (should be close to 1 for most cameras)
-    if abs(fx - fy) / max(fx, fy) > 0.1:
-        print(f"    WARNING: fx and fy differ by {(abs(fx-fy)/max(fx,fy)*100):.1f}% (may indicate distortion)")
-    
-    # Normalize intrinsics
-    intrinsics[:, :, 0, 0] = fx / width   # fx normalized
-    intrinsics[:, :, 1, 1] = fy / height  # fy normalized
-    intrinsics[:, :, 0, 2] = cx / width   # cx normalized
-    intrinsics[:, :, 1, 2] = cy / height  # cy normalized
-
-    print(f"\n  Normalized intrinsics matrix:")
-    print(f"    fx: {fx/width:.6f} (multiply by {width} to get {fx:.2f} pixels)")
-    print(f"    fy: {fy/height:.6f} (multiply by {height} to get {fy:.2f} pixels)")
-    print(f"    cx: {cx/width:.6f} (multiply by {width} to get {cx:.2f} pixels)")
-    print(f"    cy: {cy/height:.6f} (multiply by {height} to get {cy:.2f} pixels)")
-    
-    # Compute and validate Field of View
-    fov = get_fov(intrinsics[0, 0:1])  # Get FOV for first view
-    fov_deg = fov * 180 / math.pi
-    print(f"\n  Field of View (FOV):")
-    print(f"    Horizontal FOV: {fov_deg[0, 0]:.2f}°")
-    print(f"    Vertical FOV: {fov_deg[0, 1]:.2f}°")
-    
-    # Check if FOV is reasonable (typical range: 30-120 degrees)
-    if fov_deg[0, 0] < 20 or fov_deg[0, 0] > 150:
-        print(f"    WARNING: Horizontal FOV ({fov_deg[0, 0]:.2f}°) is outside typical range (20-150°)")
-    if fov_deg[0, 1] < 20 or fov_deg[0, 1] > 150:
-        print(f"    WARNING: Vertical FOV ({fov_deg[0, 1]:.2f}°) is outside typical range (20-150°)")
-    
-    # Print full intrinsic matrix for verification
-    print(f"\n  Full intrinsic matrix (3x3):")
-    K = intrinsics[0, 0].numpy()
-    for i in range(3):
-        print(f"    [{K[i,0]:8.6f}, {K[i,1]:8.6f}, {K[i,2]:8.6f}]")
+    # Print full intrinsic matrices for verification
+    print(f"\n  Full intrinsic matrices (3x3) for all views:")
+    for view_idx, img_filename in enumerate(image_filenames):
+        K = intrinsics[0, view_idx].numpy()
+        print(f"    View {view_idx} ({img_filename}):")
+        for i in range(3):
+            print(f"      [{K[i,0]:8.6f}, {K[i,1]:8.6f}, {K[i,2]:8.6f}]")
 
     # Compute near and far planes dynamically based on camera baselines
     # This matches how datasets handle COLMAP coordinate system scale
@@ -1333,12 +1344,15 @@ def run_encoder(
             issues.append("Camera distances are very large - may cause numerical precision issues")
         # Don't warn about scale mismatch since we compute near/far dynamically now
     
-    # Check FOV
-    fov_h = fov_deg[0, 0].item()
-    if fov_h < 30 or fov_h > 120:
-        issues.append(f"FOV ({fov_h:.1f}°) is outside typical range - may indicate incorrect intrinsics")
-    elif fov_h < 20:
-        issues.append(f"FOV ({fov_h:.1f}°) is very narrow - may indicate telephoto lens or incorrect intrinsics")
+    # Check FOV for all views
+    for view_idx, img_filename in enumerate(image_filenames):
+        fov_view = get_fov(intrinsics[0, view_idx:view_idx+1])
+        fov_deg_view = fov_view * 180 / math.pi
+        fov_h = fov_deg_view[0, 0].item()
+        if fov_h < 30 or fov_h > 120:
+            issues.append(f"View {view_idx} ({img_filename}) FOV ({fov_h:.1f}°) is outside typical range - may indicate incorrect intrinsics")
+        elif fov_h < 20:
+            issues.append(f"View {view_idx} ({img_filename}) FOV ({fov_h:.1f}°) is very narrow - may indicate telephoto lens or incorrect intrinsics")
     
     if issues:
         print("  Potential issues found:")
