@@ -31,7 +31,7 @@ ENCODER_OVERRIDES = {
 
 # Toggle detailed validation and diagnostics during PLY export.
 # Leave disabled for fastest export.
-PLY_EXPORT_VALIDATION = True
+PLY_EXPORT_VALIDATION = False
 
 # Torch compile / encoder benchmarking options
 # Set to True to compile the encoder with torch.compile for faster repeated inference.
@@ -1521,7 +1521,8 @@ def run_encoder(
                 print(f"    Tensor→NumPy conversion: {(t_converted - t_start) * 1000:.2f}ms")
                 print(f"    CoreML inference: {(t_predicted - t_converted) * 1000:.2f}ms")
                 print(f"    Total: {(t_predicted - t_start) * 1000:.2f}ms")
-                print(f"  Note: 562ms is excellent - try minimal_outputs=True for potential 10-15% speedup")
+                if not coreml_minimal_outputs:
+                    print(f"  Note: try minimal_outputs=True for potential 10-15% speedup")
                 
                 # Process CoreML outputs into expected result format
                 # Map output keys using the mapping file if available
