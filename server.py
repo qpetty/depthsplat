@@ -169,27 +169,27 @@ class WorkflowCoordinator:
     def notify_processing_complete(self, capture_id: str, file_path: Optional[Union[str, Path]]):
         """
         Called when encoder finishes. 
-        Handles file upload (if enabled) and signals the loop to continue.
+        Signals the loop to continue immediately, then handles file upload in background.
         """
+        # Signal completion immediately so the next request can start
+        self._signal_completion()
+
         # If we have a file and upload is enabled, do it in background
         if self.ply_upload_enabled and file_path:
             threading.Thread(
-                target=self._upload_and_signal,
+                target=self._upload_file,
                 args=(Path(file_path), capture_id),
                 daemon=True,
                 name=f"upload-{capture_id}"
             ).start()
         else:
-            # No upload needed, just signal completion immediately
             if not file_path:
                  app.logger.info(f"No file generated for {capture_id}, skipping upload.")
             elif not self.ply_upload_enabled:
                  app.logger.info(f"Upload disabled, skipping upload for {capture_id}.")
-            
-            self._signal_completion()
 
-    def _upload_and_signal(self, file_path: Path, capture_id: str):
-        """Upload file then signal completion."""
+    def _upload_file(self, file_path: Path, capture_id: str):
+        """Upload file."""
         try:
             if not file_path.exists():
                 app.logger.error(f"File missing: {file_path}")
@@ -221,9 +221,6 @@ class WorkflowCoordinator:
 
         except Exception as e:
             app.logger.exception(f"Failed to upload file for {capture_id}: {e}")
-        finally:
-            # Always signal completion so the loop doesn't hang
-            self._signal_completion()
 
     def _signal_completion(self):
         """Set the event to wake up the request loop."""
@@ -475,7 +472,7 @@ if __name__ == "__main__":
     if args.upload_ply:
         ply_path = Path(args.upload_ply)
         capture_id = args.capture_id or ply_path.stem
-        coordinator._upload_and_signal(ply_path, capture_id) # Reusing this method
+        coordinator._upload_file(ply_path, capture_id) # Reusing this method
         sys.exit(0)
 
     # Server Mode
