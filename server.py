@@ -11,8 +11,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, jsonify, request
 
 from inference import SetupResult, run_encoder, setup_encoder
@@ -32,6 +35,10 @@ _APP_ROOT = Path(__file__).resolve().parent
 _PLY_UPLOAD_URL = os.environ.get("PLY_UPLOAD_URL", "http://192.168.4.24:8080/api/upload")
 _PLY_UPLOAD_ENABLED = os.environ.get("PLY_UPLOAD_ENABLED", "true").lower() == "true"
 
+# Persistent HTTP session for connection reuse and keep-alive
+_UPLOAD_SESSION: Optional[requests.Session] = None
+_SESSION_LOCK = threading.Lock()
+
 
 def _resolve_path(path_value: Union[str, Path]) -> Path:
     """Resolve incoming paths relative to the repo root if not absolute."""
@@ -39,6 +46,66 @@ def _resolve_path(path_value: Union[str, Path]) -> Path:
     if not path.is_absolute():
         path = (_APP_ROOT / path).resolve()
     return path
+
+
+def _get_upload_session() -> requests.Session:
+    """Get or create a persistent HTTP session with connection pooling and keep-alive."""
+    global _UPLOAD_SESSION
+    
+    with _SESSION_LOCK:
+        if _UPLOAD_SESSION is None:
+            session = requests.Session()
+            
+            # Configure retry strategy
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=0.1,
+                status_forcelist=[500, 502, 503, 504],
+            )
+            
+            # Configure HTTP adapter with connection pooling and keep-alive
+            adapter = HTTPAdapter(
+                pool_connections=1,  # Single connection pool for the upload endpoint
+                pool_maxsize=1,  # Max connections in pool
+                max_retries=retry_strategy,
+                pool_block=False,  # Don't block if pool is full
+            )
+            
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            
+            # Set keep-alive headers
+            session.headers.update({
+                "Connection": "keep-alive",
+            })
+            
+            _UPLOAD_SESSION = session
+            
+            logger = _get_logger()
+            logger.info("Initialized persistent HTTP session for PLY uploads with keep-alive")
+        
+        return _UPLOAD_SESSION
+
+
+def _ensure_connection_established() -> None:
+    """Establish connection to upload server if not already connected."""
+    session = _get_upload_session()
+    
+    # Make a small HEAD request to establish the connection
+    # This will be fast and establish the TCP connection + HTTP keep-alive
+    # so that subsequent POST requests can reuse the connection
+    try:
+        # Extract base URL (without path) for connection establishment
+        parsed = urlparse(_PLY_UPLOAD_URL)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Make a small HEAD request to establish the connection
+        # This will be fast and establish the TCP connection + HTTP keep-alive
+        session.head(base_url, timeout=5)
+    except Exception:
+        # If HEAD fails, that's okay - the POST will establish the connection
+        # This is just an optimization, not a requirement
+        pass
 
 
 def _initialize_encoder() -> None:
@@ -118,6 +185,7 @@ def _upload_ply_file(ply_path: Path, capture_id: str) -> None:
     Upload PLY file to external service in the background.
     
     This function runs in a separate thread and won't block the main request.
+    Uses a persistent HTTP session with keep-alive for connection reuse.
     Failures are logged but not retried - another PLY will be sent shortly.
     """
     logger = _get_logger()
@@ -130,48 +198,50 @@ def _upload_ply_file(ply_path: Path, capture_id: str) -> None:
         logger.warning("PLY file does not exist, cannot upload: %s", ply_path)
         return
     
-    # Record start time for upload duration measurement
-    upload_start_time = time.time()
-    
     try:
+        # Get the persistent session (creates it on first call if needed)
+        session = _get_upload_session()
+        
+        # Ensure connection is established before measuring POST time
+        _ensure_connection_established()
+        
         logger.info("Starting PLY upload for capture %s: %s -> %s", capture_id, ply_path, _PLY_UPLOAD_URL)
+        
+        # Prepare file and data before timing
+        file_size_mb = ply_path.stat().st_size / (1024 * 1024)
         
         # Stream the file to avoid loading entire 66MB into memory
         with open(ply_path, "rb") as f:
             files = {"file": (ply_path.name, f, "application/octet-stream")}
             data = {"capture_id": capture_id}
             
-            response = requests.post(
+            # Measure only the POST request time (connection is already established)
+            post_start_time = time.time()
+            response = session.post(
                 _PLY_UPLOAD_URL,
                 files=files,
                 data=data,
                 timeout=300,  # 5 minute timeout for large file
             )
+            post_duration = time.time() - post_start_time
+            
             response.raise_for_status()
         
-        # Calculate and log upload duration
-        upload_duration = time.time() - upload_start_time
-        file_size_mb = ply_path.stat().st_size / (1024 * 1024)
-        
         logger.info(
-            "Successfully uploaded PLY for capture %s: %s (status: %d, size: %.2f MB, duration: %.2f seconds)",
+            "Successfully uploaded PLY for capture %s: %s (status: %d, size: %.2f MB, POST duration: %.2f seconds)",
             capture_id,
             ply_path,
             response.status_code,
             file_size_mb,
-            upload_duration,
+            post_duration,
         )
     except Exception as e:
-        # Calculate duration even on failure
-        upload_duration = time.time() - upload_start_time
-        
         # Log and fail silently - another PLY will be sent shortly
         logger.warning(
-            "PLY upload failed for capture %s: %s. Error: %s (duration: %.2f seconds, will retry with next PLY)",
+            "PLY upload failed for capture %s: %s. Error: %s (will retry with next PLY)",
             capture_id,
             ply_path,
             e,
-            upload_duration,
         )
 
 
