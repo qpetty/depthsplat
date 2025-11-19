@@ -4,6 +4,7 @@ exposes an endpoint to trigger encoding runs.
 """
 from __future__ import annotations
 import argparse
+import json
 import logging
 import os
 import sys
@@ -30,15 +31,6 @@ _SETUP_ERROR: Optional[str] = None
 
 _APP_ROOT = Path(__file__).resolve().parent
 
-# Configuration for PLY upload - hardcoded IP with environment variable override
-# Default to a common local network IP (update with your actual destination IP)
-_PLY_UPLOAD_URL = os.environ.get("PLY_UPLOAD_URL", "http://192.168.4.24:8080/api/upload")
-_PLY_UPLOAD_ENABLED = os.environ.get("PLY_UPLOAD_ENABLED", "true").lower() == "true"
-
-# Persistent HTTP session for connection reuse and keep-alive
-_UPLOAD_SESSION: Optional[requests.Session] = None
-_SESSION_LOCK = threading.Lock()
-
 
 def _resolve_path(path_value: Union[str, Path]) -> Path:
     """Resolve incoming paths relative to the repo root if not absolute."""
@@ -46,86 +38,6 @@ def _resolve_path(path_value: Union[str, Path]) -> Path:
     if not path.is_absolute():
         path = (_APP_ROOT / path).resolve()
     return path
-
-
-def _get_upload_session() -> requests.Session:
-    """Get or create a persistent HTTP session with connection pooling and keep-alive."""
-    global _UPLOAD_SESSION
-    
-    with _SESSION_LOCK:
-        if _UPLOAD_SESSION is None:
-            session = requests.Session()
-            
-            # Configure retry strategy
-            retry_strategy = Retry(
-                total=3,
-                backoff_factor=0.1,
-                status_forcelist=[500, 502, 503, 504],
-            )
-            
-            # Configure HTTP adapter with connection pooling and keep-alive
-            adapter = HTTPAdapter(
-                pool_connections=1,  # Single connection pool for the upload endpoint
-                pool_maxsize=1,  # Max connections in pool
-                max_retries=retry_strategy,
-                pool_block=False,  # Don't block if pool is full
-            )
-            
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            
-            # Set keep-alive headers
-            session.headers.update({
-                "Connection": "keep-alive",
-            })
-            
-            _UPLOAD_SESSION = session
-            
-            logger = _get_logger()
-            logger.info("Initialized persistent HTTP session for PLY uploads with keep-alive")
-        
-        return _UPLOAD_SESSION
-
-
-def _ensure_connection_established() -> None:
-    """Establish connection to upload server if not already connected."""
-    session = _get_upload_session()
-    
-    # Make a small HEAD request to establish the connection
-    # This will be fast and establish the TCP connection + HTTP keep-alive
-    # so that subsequent POST requests can reuse the connection
-    try:
-        # Extract base URL (without path) for connection establishment
-        parsed = urlparse(_PLY_UPLOAD_URL)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-        
-        # Make a small HEAD request to establish the connection
-        # This will be fast and establish the TCP connection + HTTP keep-alive
-        session.head(base_url, timeout=5)
-    except Exception:
-        # If HEAD fails, that's okay - the POST will establish the connection
-        # This is just an optimization, not a requirement
-        pass
-
-
-def _initialize_encoder() -> None:
-    """Initialize the encoder exactly once for the process lifetime."""
-    global _SETUP_RESULT, _SETUP_ERROR
-
-    with _SETUP_LOCK:
-        if _SETUP_RESULT is not None:
-            return
-
-        try:
-            app.logger.info("Initializing encoder via inference.setup_encoder()")
-            _SETUP_RESULT = setup_encoder()
-            _SETUP_ERROR = None
-            app.logger.info("Encoder initialized successfully.")
-        except Exception as exc:  # noqa: BLE001 - we want to surface any failure.
-            _SETUP_RESULT = None
-            _SETUP_ERROR = str(exc)
-            app.logger.exception("Failed to initialize encoder: %s", exc)
-            raise
 
 
 def _extract_payload_image_base(payload: Dict[str, Any]) -> Tuple[str, List[Tuple[Path, Path]]]:
@@ -171,94 +83,236 @@ def _extract_payload_image_base(payload: Dict[str, Any]) -> Tuple[str, List[Tupl
     return capture_id, resolved_entries
 
 
-def _get_logger():
-    """Get a logger that works in both Flask and standalone contexts."""
-    try:
-        return app.logger
-    except RuntimeError:
-        # Flask app context not available, use standard logger
-        return logging.getLogger(__name__)
-
-
-def _upload_ply_file(ply_path: Path, capture_id: str) -> None:
+class WorkflowCoordinator:
     """
-    Upload PLY file to external service in the background.
-    
-    This function runs in a separate thread and won't block the main request.
-    Uses a persistent HTTP session with keep-alive for connection reuse.
-    Failures are logged but not retried - another PLY will be sent shortly.
+    Manages the workflow of:
+    1. Requesting frames from capture server.
+    2. Waiting for encoder processing (triggered via /process).
+    3. Uploading the resulting PLY file.
+    4. Looping back to step 1.
     """
-    logger = _get_logger()
-    
-    if not _PLY_UPLOAD_ENABLED:
-        logger.debug("PLY upload disabled, skipping upload for capture %s", capture_id)
-        return
-    
-    if not ply_path or not ply_path.exists():
-        logger.warning("PLY file does not exist, cannot upload: %s", ply_path)
-        return
-    
-    try:
-        # Get the persistent session (creates it on first call if needed)
-        session = _get_upload_session()
-        
-        # Ensure connection is established before measuring POST time
-        _ensure_connection_established()
-        
-        logger.info("Starting PLY upload for capture %s: %s -> %s", capture_id, ply_path, _PLY_UPLOAD_URL)
-        
-        # Prepare file and data before timing
-        file_size_mb = ply_path.stat().st_size / (1024 * 1024)
-        
-        # Stream the file to avoid loading entire 66MB into memory
-        with open(ply_path, "rb") as f:
-            files = {"file": (ply_path.name, f, "application/octet-stream")}
-            data = {"capture_id": capture_id}
-            
-            # Measure only the POST request time (connection is already established)
-            post_start_time = time.time()
-            response = session.post(
-                _PLY_UPLOAD_URL,
-                files=files,
-                data=data,
-                timeout=300,  # 5 minute timeout for large file
-            )
-            post_duration = time.time() - post_start_time
-            
-            response.raise_for_status()
-        
-        logger.info(
-            "Successfully uploaded PLY for capture %s: %s (status: %d, size: %.2f MB, POST duration: %.2f seconds)",
-            capture_id,
-            ply_path,
-            response.status_code,
-            file_size_mb,
-            post_duration,
-        )
-    except Exception as e:
-        # Log and fail silently - another PLY will be sent shortly
-        logger.warning(
-            "PLY upload failed for capture %s: %s. Error: %s (will retry with next PLY)",
-            capture_id,
-            ply_path,
-            e,
-        )
+    def __init__(self):
+        # Configuration
+        self.ply_upload_url = os.environ.get("PLY_UPLOAD_URL", "http://192.168.4.24:8080/api/upload")
+        self.ply_upload_enabled = os.environ.get("PLY_UPLOAD_ENABLED", "true").lower() == "true"
+        self.capture_server_url = os.environ.get("CAPTURE_SERVER_URL", "http://localhost:8080/trigger_capture")
+        self.frame_request_enabled = os.environ.get("FRAME_REQUEST_ENABLED", "true").lower() == "true"
+        self.retry_delay = 5  # Seconds
 
+        # State
+        self._session: Optional[requests.Session] = None
+        self._session_lock = threading.Lock()
+        self._completion_event = threading.Event()
+        self._active = False
+        self._thread: Optional[threading.Thread] = None
+        self.local_port = 8081
 
-def _queue_ply_upload(ply_path: Optional[Path], capture_id: str) -> None:
-    """Queue a PLY upload task to be processed in the background."""
-    if ply_path and ply_path.exists():
-        # Start upload in a daemon thread so it doesn't block server shutdown
-        upload_thread = threading.Thread(
-            target=_upload_ply_file,
-            args=(ply_path, capture_id),
+    def _get_session(self) -> requests.Session:
+        """Get or create a persistent HTTP session with connection pooling and keep-alive."""
+        with self._session_lock:
+            if self._session is None:
+                session = requests.Session()
+                retry_strategy = Retry(
+                    total=3,
+                    backoff_factor=0.1,
+                    status_forcelist=[500, 502, 503, 504],
+                )
+                adapter = HTTPAdapter(
+                    pool_connections=1,
+                    pool_maxsize=1,
+                    max_retries=retry_strategy,
+                    pool_block=False,
+                )
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                session.headers.update({"Connection": "keep-alive"})
+                self._session = session
+                app.logger.info("Initialized persistent HTTP session for PLY uploads")
+            return self._session
+
+    def _ensure_connection(self):
+        """Establish connection to upload server if not already connected."""
+        session = self._get_session()
+        try:
+            parsed = urlparse(self.ply_upload_url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            session.head(base_url, timeout=5)
+        except Exception:
+            pass
+
+    def start_continuous_requests(self, capture_server_url: Optional[str] = None, local_port: int = 8081):
+        """Start the background loop to request frames."""
+        if not self.frame_request_enabled:
+            app.logger.info("Frame requests disabled.")
+            return
+
+        if self._active:
+            app.logger.info("Continuous requests already active.")
+            return
+        
+        if capture_server_url:
+            self.capture_server_url = capture_server_url
+        
+        self.local_port = local_port
+
+        self._active = True
+        self._thread = threading.Thread(
+            target=self._loop,
             daemon=True,
-            name=f"ply-upload-{capture_id}",
+            name="workflow-coordinator"
         )
-        upload_thread.start()
-        app.logger.debug("Queued PLY upload thread for capture %s", capture_id)
-    else:
-        app.logger.debug("No PLY file to upload for capture %s", capture_id)
+        self._thread.start()
+        app.logger.info(f"Started continuous frame request loop targeting: {self.capture_server_url}")
+
+    def notify_processing_complete(self, capture_id: str, ply_path: Optional[Union[str, Path]]):
+        """
+        Called when encoder finishes. 
+        Handles PLY upload (if enabled) and signals the loop to continue.
+        """
+        # If we have a PLY and upload is enabled, do it in background
+        if self.ply_upload_enabled and ply_path:
+            threading.Thread(
+                target=self._upload_and_signal,
+                args=(Path(ply_path), capture_id),
+                daemon=True,
+                name=f"upload-{capture_id}"
+            ).start()
+        else:
+            # No upload needed, just signal completion immediately
+            if not ply_path:
+                 app.logger.info(f"No PLY generated for {capture_id}, skipping upload.")
+            elif not self.ply_upload_enabled:
+                 app.logger.info(f"PLY upload disabled, skipping upload for {capture_id}.")
+            
+            self._signal_completion()
+
+    def _upload_and_signal(self, ply_path: Path, capture_id: str):
+        """Upload PLY file then signal completion."""
+        try:
+            if not ply_path.exists():
+                app.logger.error(f"PLY file missing: {ply_path}")
+                return
+
+            session = self._get_session()
+            self._ensure_connection()
+
+            app.logger.info(f"Uploading PLY for {capture_id}: {ply_path}")
+            file_size_mb = ply_path.stat().st_size / (1024 * 1024)
+            
+            with open(ply_path, "rb") as f:
+                files = {"file": (ply_path.name, f, "application/octet-stream")}
+                data = {"capture_id": capture_id}
+                
+                start_time = time.time()
+                response = session.post(
+                    self.ply_upload_url,
+                    files=files,
+                    data=data,
+                    timeout=300
+                )
+                duration = time.time() - start_time
+                response.raise_for_status()
+
+            app.logger.info(
+                f"Uploaded PLY for {capture_id} (Size: {file_size_mb:.2f}MB, Time: {duration:.2f}s)"
+            )
+
+        except Exception as e:
+            app.logger.exception(f"Failed to upload PLY for {capture_id}: {e}")
+        finally:
+            # Always signal completion so the loop doesn't hang
+            self._signal_completion()
+
+    def _signal_completion(self):
+        """Set the event to wake up the request loop."""
+        app.logger.info("Processing cycle complete. Signaling next request.")
+        self._completion_event.set()
+
+    def _request_frames(self) -> bool:
+        """
+        Send trigger request to capture server. 
+        Returns True if capture was triggered successfully.
+        """
+        # Clear event before requesting to ensure we catch the *new* completion
+        self._completion_event.clear()
+        
+        try:
+            app.logger.info(f"Requesting frames from {self.capture_server_url}")
+            response = requests.post(self.capture_server_url, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            status = data.get("status")
+            if status == "success":
+                app.logger.info(f"Capture triggered: {data.get('capture_id')} (Clients: {data.get('connected_clients')})")
+                return True
+            elif status == "error":
+                msg = data.get("message", "Unknown error")
+                clients = data.get("connected_clients", 0)
+                app.logger.warning(f"Capture trigger refused: {msg} (Clients: {clients})")
+                return False
+            else:
+                app.logger.warning(f"Unexpected status: {status}")
+                return False
+
+        except Exception as e:
+            app.logger.warning(f"Failed to request frames: {e}")
+            return False
+
+    def _wait_for_server_ready(self):
+        """Poll /healthz to ensure local Flask server is up before triggering remote."""
+        url = f"http://localhost:{self.local_port}/healthz"
+        app.logger.info(f"Coordinator waiting for local server at {url}...")
+        
+        while self._active:
+            try:
+                response = requests.get(url, timeout=1)
+                if response.status_code == 200:
+                    app.logger.info("Local server is ready. Starting workflow.")
+                    return
+            except requests.RequestException:
+                pass
+            
+            time.sleep(1)
+
+    def _loop(self):
+        """Main loop: Request -> Wait for Processing -> Repeat."""
+        # 1. Wait for local server to be ready
+        self._wait_for_server_ready()
+        
+        while self._active:
+            # 2. Trigger Capture
+            if self._request_frames():
+                # 3. Wait for completion
+                if not self._completion_event.wait(timeout=600):
+                    app.logger.error("Timeout waiting for processing completion. Resetting loop.")
+            else:
+                # Request failed, wait and retry
+                time.sleep(self.retry_delay)
+
+
+# Initialize coordinator
+coordinator = WorkflowCoordinator()
+
+
+def _initialize_encoder() -> None:
+    """Initialize the encoder exactly once for the process lifetime."""
+    global _SETUP_RESULT, _SETUP_ERROR
+
+    with _SETUP_LOCK:
+        if _SETUP_RESULT is not None:
+            return
+
+        try:
+            app.logger.info("Initializing encoder via inference.setup_encoder()")
+            _SETUP_RESULT = setup_encoder()
+            _SETUP_ERROR = None
+            app.logger.info("Encoder initialized successfully.")
+        except Exception as exc:  # noqa: BLE001 - we want to surface any failure.
+            _SETUP_RESULT = None
+            _SETUP_ERROR = str(exc)
+            app.logger.exception("Failed to initialize encoder: %s", exc)
+            raise
 
 
 @app.route("/healthz", methods=["GET"])
@@ -279,10 +333,6 @@ def healthcheck():
 def process_route():
     """
     Trigger an encoder run.
-
-    Optional JSON body fields:
-        - num_runs: override number of encoder runs
-        - output_dir: override output directory path
     """
     payload: Dict[str, Any] = request.get_json(force=False, silent=True) or {}
     num_runs = payload.get("num_runs")
@@ -293,7 +343,6 @@ def process_route():
     except (ValueError, FileNotFoundError) as payload_error:
         app.logger.warning("Invalid /process payload: %s", payload_error)
         return jsonify({"status": "error", "message": str(payload_error)}), 400
-
 
     try:
         _initialize_encoder()
@@ -315,10 +364,8 @@ def process_route():
 
         ply_path = inference_result.get("ply_path")
         
-        # Queue the upload in a background thread (non-blocking)
-        if ply_path:
-            resolved_ply_path = Path(ply_path) if isinstance(ply_path, str) else ply_path
-            _queue_ply_upload(resolved_ply_path, capture_id)
+        # Notify coordinator to handle upload and next request
+        coordinator.notify_processing_complete(capture_id, ply_path)
 
         response_body = {
             "status": "success",
@@ -348,7 +395,7 @@ def create_app() -> Flask:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="DepthSplat encoder server with optional PLY upload capability"
+        description="DepthSplat encoder server"
     )
     parser.add_argument(
         "--upload-ply",
@@ -360,49 +407,51 @@ if __name__ == "__main__":
         "--capture-id",
         type=str,
         metavar="ID",
-        help="Capture ID to use when uploading PLY file (defaults to filename stem if not provided)",
+        help="Capture ID to use when uploading PLY file",
     )
     parser.add_argument(
         "--host",
         type=str,
         default=os.environ.get("FLASK_RUN_HOST", "0.0.0.0"),
-        help="Host to bind the server to (default: 0.0.0.0)",
+        help="Host to bind the server to",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=int(os.environ.get("FLASK_RUN_PORT", "8081")),
-        help="Port to bind the server to (default: 8081)",
+        help="Port to bind the server to",
+    )
+    parser.add_argument(
+        "--request-frames",
+        action="store_true",
+        help="Start loop to continuously request frames from capture server",
+    )
+    parser.add_argument(
+        "--capture-server-url",
+        type=str,
+        default=None,
+        help="URL of the capture server endpoint",
     )
 
     args = parser.parse_args()
 
-    # If --upload-ply is provided, upload the file and exit
+    # Always configure logging so output is visible
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    # CLI Mode: Upload PLY
     if args.upload_ply:
         ply_path = Path(args.upload_ply)
-        if not ply_path.exists():
-            print(f"Error: PLY file not found: {ply_path}", file=sys.stderr)
-            sys.exit(1)
-
         capture_id = args.capture_id or ply_path.stem
-        print(f"Uploading PLY file: {ply_path}")
-        print(f"Capture ID: {capture_id}")
-        print(f"Destination: {_PLY_UPLOAD_URL}")
-
-        # Configure logging for standalone upload
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        )
-
-        # Upload the file (this will run synchronously since we're exiting anyway)
-        _upload_ply_file(ply_path, capture_id)
+        coordinator._upload_and_signal(ply_path, capture_id) # Reusing this method
         sys.exit(0)
 
-    # Otherwise, run the Flask server
-    host = args.host
-    port = args.port
-
+    # Server Mode
     _initialize_encoder()
-    app.run(host=host, port=port)
+    
+    if args.request_frames:
+        coordinator.start_continuous_requests(args.capture_server_url, local_port=args.port)
 
+    app.run(host=args.host, port=args.port)
