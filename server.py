@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -129,6 +130,9 @@ def _upload_ply_file(ply_path: Path, capture_id: str) -> None:
         logger.warning("PLY file does not exist, cannot upload: %s", ply_path)
         return
     
+    # Record start time for upload duration measurement
+    upload_start_time = time.time()
+    
     try:
         logger.info("Starting PLY upload for capture %s: %s -> %s", capture_id, ply_path, _PLY_UPLOAD_URL)
         
@@ -144,20 +148,30 @@ def _upload_ply_file(ply_path: Path, capture_id: str) -> None:
                 timeout=300,  # 5 minute timeout for large file
             )
             response.raise_for_status()
-            
+        
+        # Calculate and log upload duration
+        upload_duration = time.time() - upload_start_time
+        file_size_mb = ply_path.stat().st_size / (1024 * 1024)
+        
         logger.info(
-            "Successfully uploaded PLY for capture %s: %s (status: %d)",
+            "Successfully uploaded PLY for capture %s: %s (status: %d, size: %.2f MB, duration: %.2f seconds)",
             capture_id,
             ply_path,
             response.status_code,
+            file_size_mb,
+            upload_duration,
         )
     except Exception as e:
+        # Calculate duration even on failure
+        upload_duration = time.time() - upload_start_time
+        
         # Log and fail silently - another PLY will be sent shortly
         logger.warning(
-            "PLY upload failed for capture %s: %s. Error: %s (will retry with next PLY)",
+            "PLY upload failed for capture %s: %s. Error: %s (duration: %.2f seconds, will retry with next PLY)",
             capture_id,
             ply_path,
             e,
+            upload_duration,
         )
 
 
