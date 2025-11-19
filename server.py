@@ -3,11 +3,15 @@ Simple Flask server that initializes the DepthSplat encoder on startup and
 exposes an endpoint to trigger encoding runs.
 """
 from __future__ import annotations
+import argparse
+import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import requests
 from flask import Flask, jsonify, request
 
 from inference import SetupResult, run_encoder, setup_encoder
@@ -21,6 +25,11 @@ _SETUP_RESULT: Optional[SetupResult] = None
 _SETUP_ERROR: Optional[str] = None
 
 _APP_ROOT = Path(__file__).resolve().parent
+
+# Configuration for PLY upload - hardcoded IP with environment variable override
+# Default to a common local network IP (update with your actual destination IP)
+_PLY_UPLOAD_URL = os.environ.get("PLY_UPLOAD_URL", "http://192.168.4.24:8080/api/upload")
+_PLY_UPLOAD_ENABLED = os.environ.get("PLY_UPLOAD_ENABLED", "true").lower() == "true"
 
 
 def _resolve_path(path_value: Union[str, Path]) -> Path:
@@ -94,6 +103,80 @@ def _extract_payload_image_base(payload: Dict[str, Any]) -> Tuple[str, List[Tupl
     return capture_id, resolved_entries
 
 
+def _get_logger():
+    """Get a logger that works in both Flask and standalone contexts."""
+    try:
+        return app.logger
+    except RuntimeError:
+        # Flask app context not available, use standard logger
+        return logging.getLogger(__name__)
+
+
+def _upload_ply_file(ply_path: Path, capture_id: str) -> None:
+    """
+    Upload PLY file to external service in the background.
+    
+    This function runs in a separate thread and won't block the main request.
+    Failures are logged but not retried - another PLY will be sent shortly.
+    """
+    logger = _get_logger()
+    
+    if not _PLY_UPLOAD_ENABLED:
+        logger.debug("PLY upload disabled, skipping upload for capture %s", capture_id)
+        return
+    
+    if not ply_path or not ply_path.exists():
+        logger.warning("PLY file does not exist, cannot upload: %s", ply_path)
+        return
+    
+    try:
+        logger.info("Starting PLY upload for capture %s: %s -> %s", capture_id, ply_path, _PLY_UPLOAD_URL)
+        
+        # Stream the file to avoid loading entire 66MB into memory
+        with open(ply_path, "rb") as f:
+            files = {"file": (ply_path.name, f, "application/octet-stream")}
+            data = {"capture_id": capture_id}
+            
+            response = requests.post(
+                _PLY_UPLOAD_URL,
+                files=files,
+                data=data,
+                timeout=300,  # 5 minute timeout for large file
+            )
+            response.raise_for_status()
+            
+        logger.info(
+            "Successfully uploaded PLY for capture %s: %s (status: %d)",
+            capture_id,
+            ply_path,
+            response.status_code,
+        )
+    except Exception as e:
+        # Log and fail silently - another PLY will be sent shortly
+        logger.warning(
+            "PLY upload failed for capture %s: %s. Error: %s (will retry with next PLY)",
+            capture_id,
+            ply_path,
+            e,
+        )
+
+
+def _queue_ply_upload(ply_path: Optional[Path], capture_id: str) -> None:
+    """Queue a PLY upload task to be processed in the background."""
+    if ply_path and ply_path.exists():
+        # Start upload in a daemon thread so it doesn't block server shutdown
+        upload_thread = threading.Thread(
+            target=_upload_ply_file,
+            args=(ply_path, capture_id),
+            daemon=True,
+            name=f"ply-upload-{capture_id}",
+        )
+        upload_thread.start()
+        app.logger.debug("Queued PLY upload thread for capture %s", capture_id)
+    else:
+        app.logger.debug("No PLY file to upload for capture %s", capture_id)
+
+
 @app.route("/healthz", methods=["GET"])
 def healthcheck():
     """Basic health endpoint indicating encoder readiness."""
@@ -146,6 +229,13 @@ def process_route():
         )
         inference_result = run_encoder(_SETUP_RESULT, **run_kwargs)
 
+        ply_path = inference_result.get("ply_path")
+        
+        # Queue the upload in a background thread (non-blocking)
+        if ply_path:
+            resolved_ply_path = Path(ply_path) if isinstance(ply_path, str) else ply_path
+            _queue_ply_upload(resolved_ply_path, capture_id)
+
         response_body = {
             "status": "success",
             "capture_id": capture_id,
@@ -154,7 +244,7 @@ def process_route():
             "ply_export_time": inference_result.get("ply_export_time"),
             "device": inference_result.get("device"),
             "num_runs": inference_result.get("num_runs"),
-            "ply_path": str(inference_result["ply_path"]) if inference_result.get("ply_path") else None,
+            "ply_path": str(ply_path) if ply_path else None,
         }
 
         return jsonify(response_body)
@@ -173,10 +263,61 @@ def create_app() -> Flask:
 
 
 if __name__ == "__main__":
-    # Allow overriding host/port via environment for flexibility.
-    host = os.environ.get("FLASK_RUN_HOST", "0.0.0.0")
-    port = int(os.environ.get("FLASK_RUN_PORT", "8081"))
+    parser = argparse.ArgumentParser(
+        description="DepthSplat encoder server with optional PLY upload capability"
+    )
+    parser.add_argument(
+        "--upload-ply",
+        type=str,
+        metavar="PATH",
+        help="Upload a PLY file to the configured destination and exit",
+    )
+    parser.add_argument(
+        "--capture-id",
+        type=str,
+        metavar="ID",
+        help="Capture ID to use when uploading PLY file (defaults to filename stem if not provided)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=os.environ.get("FLASK_RUN_HOST", "0.0.0.0"),
+        help="Host to bind the server to (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("FLASK_RUN_PORT", "8081")),
+        help="Port to bind the server to (default: 8081)",
+    )
 
+    args = parser.parse_args()
+
+    # If --upload-ply is provided, upload the file and exit
+    if args.upload_ply:
+        ply_path = Path(args.upload_ply)
+        if not ply_path.exists():
+            print(f"Error: PLY file not found: {ply_path}", file=sys.stderr)
+            sys.exit(1)
+
+        capture_id = args.capture_id or ply_path.stem
+        print(f"Uploading PLY file: {ply_path}")
+        print(f"Capture ID: {capture_id}")
+        print(f"Destination: {_PLY_UPLOAD_URL}")
+
+        # Configure logging for standalone upload
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        )
+
+        # Upload the file (this will run synchronously since we're exiting anyway)
+        _upload_ply_file(ply_path, capture_id)
+        sys.exit(0)
+
+    # Otherwise, run the Flask server
+    host = args.host
+    port = args.port
 
     _initialize_encoder()
     app.run(host=host, port=port)
