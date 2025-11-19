@@ -18,6 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, jsonify, request
+import spz
 
 from inference import SetupResult, run_encoder, setup_encoder
 
@@ -140,7 +141,7 @@ class WorkflowCoordinator:
         except Exception:
             pass
 
-    def start_continuous_requests(self, capture_server_url: Optional[str] = None, local_port: int = 8081):
+    def start_continuous_requests(self, capture_server_url: Optional[str] = None, local_port: int = 8081, run_once: bool = False):
         """Start the background loop to request frames."""
         if not self.frame_request_enabled:
             app.logger.info("Frame requests disabled.")
@@ -154,6 +155,7 @@ class WorkflowCoordinator:
             self.capture_server_url = capture_server_url
         
         self.local_port = local_port
+        self._run_once = run_once
 
         self._active = True
         self._thread = threading.Thread(
@@ -162,45 +164,45 @@ class WorkflowCoordinator:
             name="workflow-coordinator"
         )
         self._thread.start()
-        app.logger.info(f"Started continuous frame request loop targeting: {self.capture_server_url}")
+        app.logger.info(f"Started continuous frame request loop targeting: {self.capture_server_url} (Run Once: {run_once})")
 
-    def notify_processing_complete(self, capture_id: str, ply_path: Optional[Union[str, Path]]):
+    def notify_processing_complete(self, capture_id: str, file_path: Optional[Union[str, Path]]):
         """
         Called when encoder finishes. 
-        Handles PLY upload (if enabled) and signals the loop to continue.
+        Handles file upload (if enabled) and signals the loop to continue.
         """
-        # If we have a PLY and upload is enabled, do it in background
-        if self.ply_upload_enabled and ply_path:
+        # If we have a file and upload is enabled, do it in background
+        if self.ply_upload_enabled and file_path:
             threading.Thread(
                 target=self._upload_and_signal,
-                args=(Path(ply_path), capture_id),
+                args=(Path(file_path), capture_id),
                 daemon=True,
                 name=f"upload-{capture_id}"
             ).start()
         else:
             # No upload needed, just signal completion immediately
-            if not ply_path:
-                 app.logger.info(f"No PLY generated for {capture_id}, skipping upload.")
+            if not file_path:
+                 app.logger.info(f"No file generated for {capture_id}, skipping upload.")
             elif not self.ply_upload_enabled:
-                 app.logger.info(f"PLY upload disabled, skipping upload for {capture_id}.")
+                 app.logger.info(f"Upload disabled, skipping upload for {capture_id}.")
             
             self._signal_completion()
 
-    def _upload_and_signal(self, ply_path: Path, capture_id: str):
-        """Upload PLY file then signal completion."""
+    def _upload_and_signal(self, file_path: Path, capture_id: str):
+        """Upload file then signal completion."""
         try:
-            if not ply_path.exists():
-                app.logger.error(f"PLY file missing: {ply_path}")
+            if not file_path.exists():
+                app.logger.error(f"File missing: {file_path}")
                 return
 
             session = self._get_session()
             self._ensure_connection()
 
-            app.logger.info(f"Uploading PLY for {capture_id}: {ply_path}")
-            file_size_mb = ply_path.stat().st_size / (1024 * 1024)
+            app.logger.info(f"Uploading file for {capture_id}: {file_path}")
+            file_size_mb = file_path.stat().st_size / (1024 * 1024)
             
-            with open(ply_path, "rb") as f:
-                files = {"file": (ply_path.name, f, "application/octet-stream")}
+            with open(file_path, "rb") as f:
+                files = {"file": (file_path.name, f, "application/octet-stream")}
                 data = {"capture_id": capture_id}
                 
                 start_time = time.time()
@@ -214,11 +216,11 @@ class WorkflowCoordinator:
                 response.raise_for_status()
 
             app.logger.info(
-                f"Uploaded PLY for {capture_id} (Size: {file_size_mb:.2f}MB, Time: {duration:.2f}s)"
+                f"Uploaded file for {capture_id} (Size: {file_size_mb:.2f}MB, Time: {duration:.2f}s)"
             )
 
         except Exception as e:
-            app.logger.exception(f"Failed to upload PLY for {capture_id}: {e}")
+            app.logger.exception(f"Failed to upload file for {capture_id}: {e}")
         finally:
             # Always signal completion so the loop doesn't hang
             self._signal_completion()
@@ -286,6 +288,9 @@ class WorkflowCoordinator:
                 # 3. Wait for completion
                 if not self._completion_event.wait(timeout=600):
                     app.logger.error("Timeout waiting for processing completion. Resetting loop.")
+                elif getattr(self, "_run_once", False):
+                     app.logger.info("Run once enabled and processing complete. Exiting.")
+                     os._exit(0)
             else:
                 # Request failed, wait and retry
                 time.sleep(self.retry_delay)
@@ -364,6 +369,26 @@ def process_route():
 
         ply_path = inference_result.get("ply_path")
         
+        # Compress PLY to SPZ before sending
+        if ply_path and Path(ply_path).exists():
+            try:
+                app.logger.info(f"Compressing PLY to SPZ: {ply_path}")
+                spz_path = Path(ply_path).with_suffix(".spz")
+                
+                unpack_options = spz.UnpackOptions()
+                cloud = spz.load_splat_from_ply(str(ply_path), unpack_options)
+                
+                pack_options = spz.PackOptions()
+                spz.save_spz(cloud, pack_options, str(spz_path))
+                
+                app.logger.info(f"Compression complete: {spz_path}")
+                ply_path = spz_path
+            except Exception as e:
+                app.logger.error(f"Failed to compress PLY to SPZ: {e}")
+                # Proceed with original PLY if compression fails? 
+                # For now, let's assume we want to fail or continue with PLY.
+                # Given the requirement "compress... before sending", maybe we should just log error and send PLY.
+        
         # Notify coordinator to handle upload and next request
         coordinator.notify_processing_complete(capture_id, ply_path)
 
@@ -432,6 +457,11 @@ if __name__ == "__main__":
         default=None,
         help="URL of the capture server endpoint",
     )
+    parser.add_argument(
+        "--run-once",
+        action="store_true",
+        help="Exit after successfully processing one capture",
+    )
 
     args = parser.parse_args()
 
@@ -452,6 +482,6 @@ if __name__ == "__main__":
     _initialize_encoder()
     
     if args.request_frames:
-        coordinator.start_continuous_requests(args.capture_server_url, local_port=args.port)
+        coordinator.start_continuous_requests(args.capture_server_url, local_port=args.port, run_once=args.run_once)
 
     app.run(host=args.host, port=args.port)
