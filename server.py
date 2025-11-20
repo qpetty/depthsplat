@@ -104,6 +104,7 @@ class WorkflowCoordinator:
         self._session: Optional[requests.Session] = None
         self._session_lock = threading.Lock()
         self._completion_event = threading.Event()
+        self._upload_complete_event = threading.Event()
         self._active = False
         self._thread: Optional[threading.Thread] = None
         self.local_port = 8081
@@ -176,6 +177,7 @@ class WorkflowCoordinator:
 
         # If we have a file and upload is enabled, do it in background
         if self.ply_upload_enabled and file_path:
+            self._upload_complete_event.clear()
             threading.Thread(
                 target=self._upload_file,
                 args=(Path(file_path), capture_id),
@@ -187,6 +189,8 @@ class WorkflowCoordinator:
                  app.logger.info(f"No file generated for {capture_id}, skipping upload.")
             elif not self.ply_upload_enabled:
                  app.logger.info(f"Upload disabled, skipping upload for {capture_id}.")
+            # Mark upload as complete (since we're not uploading)
+            self._upload_complete_event.set()
 
     def _upload_file(self, file_path: Path, capture_id: str):
         """Upload file."""
@@ -221,6 +225,9 @@ class WorkflowCoordinator:
 
         except Exception as e:
             app.logger.exception(f"Failed to upload file for {capture_id}: {e}")
+        finally:
+            # Always signal upload complete, even on failure
+            self._upload_complete_event.set()
 
     def _signal_completion(self):
         """Set the event to wake up the request loop."""
@@ -286,7 +293,12 @@ class WorkflowCoordinator:
                 if not self._completion_event.wait(timeout=600):
                     app.logger.error("Timeout waiting for processing completion. Resetting loop.")
                 elif getattr(self, "_run_once", False):
-                     app.logger.info("Run once enabled and processing complete. Exiting.")
+                     # Wait for upload to complete before exiting
+                     app.logger.info("Run once enabled and processing complete. Waiting for upload...")
+                     if not self._upload_complete_event.wait(timeout=300):
+                         app.logger.error("Timeout waiting for upload completion.")
+                     else:
+                         app.logger.info("Upload complete. Exiting.")
                      os._exit(0)
             else:
                 # Request failed, wait and retry
