@@ -9,9 +9,11 @@ Camera intrinsics and extrinsics are loaded from metadata files (*_metadata.json
 # Configuration - Modify these paths as needed
 # ============================================================================
 
+USE_BASE_MODEL = True
+
 CHECKPOINT_PATH_BASE = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
 CHECKPOINT_PATH_SMALL = "pretrained/depthsplat-gs-small-re10kdl3dv-448x768-randview4-10-c08188db.pth"
-CHECKPOINT_PATH = CHECKPOINT_PATH_SMALL
+CHECKPOINT_PATH = CHECKPOINT_PATH_BASE if USE_BASE_MODEL else CHECKPOINT_PATH_SMALL
 CONFIG_ROOT = "config"  # Path to config directory
 OUTPUT_DIR = "run-output"
 
@@ -40,7 +42,11 @@ ENCODER_OVERRIDES_SMALL = {
     }
 }
 
-ENCODER_OVERRIDES = ENCODER_OVERRIDES_SMALL
+ENCODER_OVERRIDES = ENCODER_OVERRIDES_BASE if USE_BASE_MODEL else ENCODER_OVERRIDES_SMALL
+
+COREML_MODEL_OUPUT_PATH_BASE = "depthsplat-base.mlpackage"
+COREML_MODEL_OUPUT_PATH_SMALL = "depthsplat-small.mlpackage"
+COREML_MODEL_OUTPUT_PATH = COREML_MODEL_OUPUT_PATH_BASE if USE_BASE_MODEL else COREML_MODEL_OUPUT_PATH_SMALL
 
 # Toggle detailed validation and diagnostics during PLY export.
 # Leave disabled for fastest export.
@@ -698,7 +704,7 @@ def setup_encoder(checkpoint_path: Optional[Union[str, Path]] = CHECKPOINT_PATH,
 
     global coreml_model
     if run_coreml:
-        model_path = "depthsplat.mlpackage"
+        model_path = COREML_MODEL_OUTPUT_PATH
         
         # Try different compute units for optimal performance
         # ALL = CPU+GPU+ANE (Neural Engine), CPU_AND_GPU = CPU+GPU only
@@ -1593,7 +1599,7 @@ def run_encoder(
                     print(f"\n{'='*80}")
                     print(f"ERROR: CoreML model is missing required outputs: {missing_keys}")
                     print(f"Available outputs: {output_keys}")
-                    print(f"\nThe CoreML model at 'depthsplat.mlpackage' is incomplete or corrupted.")
+                    print(f"\nThe CoreML model at '{COREML_MODEL_OUTPUT_PATH}' is incomplete or corrupted.")
                     print(f"\nTo fix this, regenerate the CoreML model by:")
                     print(f"  1. Set 'generate_coreml = True' (line ~651)")
                     print(f"  2. Set 'run_coreml = False' (line ~652)")
@@ -2291,8 +2297,8 @@ def run_encoder(
                     print(f"✓ Correct number of outputs: {len(actual_outputs)}")
                 print("="*80 + "\n")
                 
-                model.save("depthsplat.mlpackage")
-                print(f"Encoder exported successfully to depthsplat.mlpackage")
+                model.save(COREML_MODEL_OUTPUT_PATH)
+                print(f"Encoder exported successfully to {COREML_MODEL_OUTPUT_PATH}")
                 return
 
             if generate_onnx:
