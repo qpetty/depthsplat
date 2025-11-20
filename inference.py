@@ -9,7 +9,9 @@ Camera intrinsics and extrinsics are loaded from metadata files (*_metadata.json
 # Configuration - Modify these paths as needed
 # ============================================================================
 
-CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
+CHECKPOINT_PATH_BASE = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
+CHECKPOINT_PATH_SMALL = "pretrained/depthsplat-gs-small-re10kdl3dv-448x768-randview4-10-c08188db.pth"
+CHECKPOINT_PATH = CHECKPOINT_PATH_SMALL
 CONFIG_ROOT = "config"  # Path to config directory
 OUTPUT_DIR = "run-output"
 
@@ -19,15 +21,26 @@ OUTPUT_DIR = "run-output"
 IMAGE_BASE_PATH = "/Users/quinton/repos/Image_sender/received_images"
 
 # Encoder config overrides (set to None to use YAML defaults)
-ENCODER_OVERRIDES = {
+ENCODER_OVERRIDES_BASE = {
     "num_scales": 2,
-    "upsample_factor": 4,
+    "upsample_factor": 4,  # 8 for 448x768 resolution (else branch in DPTHead)
     "lowest_feature_resolution": 8,
     "monodepth_vit_type": "vitb",
     "gaussian_adapter": {
         "gaussian_scale_max": 0.1
     }
 }
+ENCODER_OVERRIDES_SMALL = {
+    "num_scales": 1,
+    "upsample_factor": 8,  # 8 for 448x768 resolution (else branch in DPTHead)
+    "lowest_feature_resolution": 8,
+    "monodepth_vit_type": "vits",
+    "gaussian_adapter": {
+        "gaussian_scale_max": 0.1
+    }
+}
+
+ENCODER_OVERRIDES = ENCODER_OVERRIDES_SMALL
 
 # Toggle detailed validation and diagnostics during PLY export.
 # Leave disabled for fastest export.
