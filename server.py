@@ -130,6 +130,8 @@ class WorkflowCoordinator:
                 session.headers.update({"Connection": "keep-alive"})
                 self._session = session
                 app.logger.info("Initialized persistent HTTP session for PLY uploads")
+            else:
+                app.logger.info("Reusing existing HTTP session for PLY uploads")
             return self._session
 
     def _ensure_connection(self):
