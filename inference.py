@@ -33,6 +33,16 @@ ENCODER_OVERRIDES = {
 
 import numpy as np
 
+# TensorRT Configuration
+# NOTE: TensorRT compilation may fail with xformers and complex models
+# If compilation fails, the script will automatically fall back to PyTorch
+USE_TENSORRT = True  # Enable TensorRT optimization
+TENSORRT_MODEL_PATH = "depthsplat_encoder_trt.ts"  # Path to save/load TensorRT model
+TENSORRT_FP16 = True  # Use FP16 precision (faster, slightly less accurate)
+TENSORRT_USE_TORCH_COMPILE = False  # Use torch.compile instead (PyTorch 2.0+)
+BENCHMARK_RUNS = 10  # Number of runs for benchmarking
+WARMUP_RUNS = 5  # Number of warmup runs before benchmarking
+
 # Near/Far plane computation
 # These disparity values control how near/far planes are computed from camera baselines
 # Smaller disparity = farther depth (larger far plane)
@@ -57,6 +67,21 @@ from src.geometry.projection import get_fov
 from src.dataset.shims.bounds_shim import compute_depth_for_disparity
 from scipy.spatial.transform import Rotation as R
 import json
+import time
+from typing import Optional
+
+# Try to import torch_tensorrt if TensorRT is enabled
+if USE_TENSORRT:
+    try:
+        import torch_tensorrt
+        TENSORRT_AVAILABLE = True
+        print(f"torch_tensorrt version: {torch_tensorrt.__version__}")
+    except ImportError:
+        TENSORRT_AVAILABLE = False
+        print("Warning: torch_tensorrt not found. Install with: pip install torch-tensorrt")
+        print("Falling back to standard PyTorch inference.")
+else:
+    TENSORRT_AVAILABLE = False
 
 
 def load_metadata_from_json(image_path: Path) -> dict:
@@ -273,6 +298,337 @@ def load_encoder_config(config_root: str, overrides: dict = None) -> EncoderDept
     print(f"  gaussian_scale_max: {encoder_cfg.gaussian_adapter.gaussian_scale_max}")
 
     return encoder_cfg
+
+
+class TensorRTEncoderWrapper(torch.nn.Module):
+    """
+    Wrapper for TensorRT compiled encoder that maintains the original interface.
+    This allows the TensorRT model to be used as a drop-in replacement.
+    """
+    def __init__(self, trt_model):
+        super().__init__()
+        self.trt_model = trt_model
+    
+    def forward(self, context, global_step=0, deterministic=False, visualization_dump=None, scene_names=None):
+        """
+        Forward pass that matches the original encoder interface.
+        
+        The TensorRT model returns (means, covariances, harmonics, opacities),
+        which we need to package back into the expected format.
+        """
+        # Extract inputs from context
+        image = context["image"]
+        extrinsics = context["extrinsics"]
+        intrinsics = context["intrinsics"]
+        near = context["near"]
+        far = context["far"]
+        
+        # Run TensorRT model
+        means, covariances, harmonics, opacities = self.trt_model(
+            image, extrinsics, intrinsics, near, far
+        )
+        
+        # Create a mock Gaussians object
+        from src.model.types import Gaussians
+        gaussians = Gaussians(
+            means=means,
+            covariances=covariances,
+            harmonics=harmonics,
+            opacities=opacities,
+        )
+        
+        # Return in the same format as the original encoder
+        return {"gaussians": gaussians}
+
+
+def compile_with_torch_compile(
+    model: torch.nn.Module,
+    backend: str = "inductor",
+) -> torch.nn.Module:
+    """
+    Compile a PyTorch model using torch.compile (PyTorch 2.0+).
+    This is more robust than TensorRT for complex models with xformers.
+    
+    Args:
+        model: PyTorch model to compile
+        backend: Compilation backend ("inductor", "cudagraphs", etc.)
+        
+    Returns:
+        Compiled model
+    """
+    print("\n" + "="*70)
+    print("Compiling Model with torch.compile")
+    print("="*70)
+    print(f"  Backend: {backend}")
+    
+    try:
+        # Check PyTorch version
+        torch_version = torch.__version__.split('+')[0]
+        major, minor = map(int, torch_version.split('.')[:2])
+        
+        if major < 2:
+            print(f"  ✗ torch.compile requires PyTorch 2.0+, found {torch.__version__}")
+            print("  Falling back to standard PyTorch")
+            return None
+        
+        print("  Compiling model (first run will be slower)...")
+        
+        # Compile the model
+        compiled_model = torch.compile(
+            model,
+            backend=backend,
+            mode="max-autotune",  # Optimize for performance
+        )
+        
+        print("  ✓ Model compiled successfully!")
+        print("  Note: First inference will trigger actual compilation")
+        
+        return compiled_model
+        
+    except Exception as e:
+        print(f"  ✗ torch.compile failed: {e}")
+        print("  Falling back to standard PyTorch")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def compile_to_tensorrt(
+    model: torch.nn.Module,
+    example_inputs: dict,
+    save_path: Path,
+    fp16: bool = True,
+) -> Optional[torch.nn.Module]:
+    """
+    Compile a PyTorch model to TensorRT.
+    
+    NOTE: This may fail with complex models that use xformers or dynamic shapes.
+    If compilation fails, consider using torch.compile instead (TENSORRT_USE_TORCH_COMPILE=True).
+    
+    Args:
+        model: PyTorch model to compile
+        example_inputs: Dictionary of example inputs for tracing
+        save_path: Path to save the compiled model
+        fp16: Whether to use FP16 precision
+        
+    Returns:
+        TensorRT wrapped model or None if compilation failed
+    """
+    if not TENSORRT_AVAILABLE:
+        print("TensorRT compilation skipped: torch_tensorrt not available")
+        return None
+    
+    print("\n" + "="*70)
+    print("Compiling Model to TensorRT")
+    print("="*70)
+    print(f"  Target precision: {'FP16' if fp16 else 'FP32'}")
+    print(f"  Save path: {save_path}")
+    print(f"  NOTE: This model uses xformers which may not be compatible with JIT tracing")
+    
+    try:
+        # Put model in eval mode
+        model.eval()
+        
+        # Create a wrapper that accepts separate tensor inputs
+        class EncoderWrapper(torch.nn.Module):
+            def __init__(self, encoder):
+                super().__init__()
+                self.encoder = encoder
+            
+            def forward(self, image, extrinsics, intrinsics, near, far):
+                context = {
+                    "image": image,
+                    "extrinsics": extrinsics,
+                    "intrinsics": intrinsics,
+                    "near": near,
+                    "far": far,
+                }
+                # Create a minimal visualization_dump
+                visualization_dump = {}
+                result = self.encoder(
+                    context=context,
+                    global_step=0,
+                    deterministic=False,
+                    visualization_dump=visualization_dump,
+                    scene_names=None,
+                )
+                
+                # Return only the core gaussian data
+                if isinstance(result, dict):
+                    gaussians = result["gaussians"]
+                else:
+                    gaussians = result
+                
+                # Return the essential gaussian properties as separate tensors
+                return gaussians.means, gaussians.covariances, gaussians.harmonics, gaussians.opacities
+        
+        wrapped_model = EncoderWrapper(model).cuda().eval()
+        
+        # Trace the model with example inputs
+        print("  Tracing model with example inputs...")
+        with torch.no_grad():
+            traced_model = torch.jit.trace(
+                wrapped_model,
+                (
+                    example_inputs["image"],
+                    example_inputs["extrinsics"],
+                    example_inputs["intrinsics"],
+                    example_inputs["near"],
+                    example_inputs["far"],
+                )
+            )
+        
+        print("  Model traced successfully!")
+        print("  Compiling with TensorRT (this may take several minutes)...")
+        
+        # Configure TensorRT compilation
+        enabled_precisions = {torch.float}
+        if fp16:
+            enabled_precisions.add(torch.half)
+        
+        # Compile to TensorRT
+        # Note: We use explicit shapes since the model expects specific input sizes
+        batch_size, num_views, channels, height, width = example_inputs["image"].shape
+        
+        trt_inputs = [
+            torch_tensorrt.Input(
+                shape=[batch_size, num_views, channels, height, width],
+                dtype=torch.float32,
+            ),  # image
+            torch_tensorrt.Input(
+                shape=[batch_size, num_views, 4, 4],
+                dtype=torch.float32,
+            ),  # extrinsics
+            torch_tensorrt.Input(
+                shape=[batch_size, num_views, 3, 3],
+                dtype=torch.float32,
+            ),  # intrinsics
+            torch_tensorrt.Input(
+                shape=[batch_size, num_views],
+                dtype=torch.float32,
+            ),  # near
+            torch_tensorrt.Input(
+                shape=[batch_size, num_views],
+                dtype=torch.float32,
+            ),  # far
+        ]
+        
+        trt_model = torch_tensorrt.compile(
+            traced_model,
+            inputs=trt_inputs,
+            enabled_precisions=enabled_precisions,
+            truncate_long_and_double=True,
+            workspace_size=1 << 30,  # 1GB workspace
+        )
+        
+        print("  Compilation successful!")
+        
+        # Save the compiled model
+        print(f"  Saving TensorRT model to {save_path}...")
+        torch.jit.save(trt_model, str(save_path))
+        
+        print(f"  ✓ TensorRT model saved successfully!")
+        print(f"  File size: {save_path.stat().st_size / (1024*1024):.2f} MB")
+        
+        # Wrap the TensorRT model to match the original encoder interface
+        wrapped_trt = TensorRTEncoderWrapper(trt_model)
+        
+        return wrapped_trt
+        
+    except Exception as e:
+        print(f"  ✗ TensorRT compilation failed: {e}")
+        
+        # Check for common issues and provide helpful guidance
+        error_str = str(e)
+        if "SymInt" in error_str or "unsupported argument type" in error_str:
+            print("\n  This error is typically caused by:")
+            print("    - xformers operations that use symbolic integers")
+            print("    - Dynamic shapes in the model")
+            print("    - Incompatibility between JIT tracing and certain operations")
+            print("\n  Recommended solutions:")
+            print("    1. Use torch.compile instead: Set TENSORRT_USE_TORCH_COMPILE = True")
+            print("    2. Or disable optimization: Set USE_TENSORRT = False")
+            print("    3. See TENSORRT_USAGE.md for more details")
+        
+        print(f"\n  Falling back to standard PyTorch inference")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def benchmark_inference(
+    model: torch.nn.Module,
+    context: dict,
+    num_warmup: int = 10,
+    num_runs: int = 100,
+    model_name: str = "Model",
+) -> dict:
+    """
+    Benchmark model inference time.
+    
+    Args:
+        model: Model to benchmark
+        context: Input context dictionary
+        num_warmup: Number of warmup runs
+        num_runs: Number of benchmark runs
+        model_name: Name of the model for display
+        
+    Returns:
+        Dictionary with timing statistics
+    """
+    print("\n" + "="*70)
+    print(f"Benchmarking {model_name} Inference")
+    print("="*70)
+    
+    # Warmup runs
+    print(f"  Running {num_warmup} warmup iterations...")
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model(context=context, global_step=0, deterministic=False, visualization_dump={}, scene_names=None)
+    
+    # Synchronize CUDA before timing
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
+    # Benchmark runs
+    print(f"  Running {num_runs} benchmark iterations...")
+    times = []
+    
+    with torch.no_grad():
+        for _ in range(num_runs):
+            start_time = time.perf_counter()
+            
+            _ = model(context=context, global_step=0, deterministic=False, visualization_dump={}, scene_names=None)
+            
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            end_time = time.perf_counter()
+            times.append(end_time - start_time)
+    
+    # Compute statistics
+    times = np.array(times)
+    stats = {
+        "mean": float(np.mean(times)),
+        "std": float(np.std(times)),
+        "min": float(np.min(times)),
+        "max": float(np.max(times)),
+        "median": float(np.median(times)),
+        "p95": float(np.percentile(times, 95)),
+        "p99": float(np.percentile(times, 99)),
+    }
+    
+    print(f"\n  Timing Statistics ({num_runs} runs):")
+    print(f"    Mean:   {stats['mean']*1000:.2f} ms")
+    print(f"    Median: {stats['median']*1000:.2f} ms")
+    print(f"    Std:    {stats['std']*1000:.2f} ms")
+    print(f"    Min:    {stats['min']*1000:.2f} ms")
+    print(f"    Max:    {stats['max']*1000:.2f} ms")
+    print(f"    P95:    {stats['p95']*1000:.2f} ms")
+    print(f"    P99:    {stats['p99']*1000:.2f} ms")
+    print(f"    FPS:    {1.0/stats['mean']:.2f}")
+    
+    return stats
 
 
 def main():
@@ -786,18 +1142,152 @@ def main():
     # Prepare visualization dump to capture scales and rotations for PLY export
     visualization_dump = {}
 
+    # Model Optimization Setup
+    use_optimization = USE_TENSORRT and (TENSORRT_AVAILABLE or TENSORRT_USE_TORCH_COMPILE)
+    trt_model_path = Path(TENSORRT_MODEL_PATH)
+    encoder_to_use = encoder
+    optimization_name = "PyTorch (Standard)"
+    
+    if use_optimization:
+        # Use torch.compile if requested (more robust for complex models)
+        if TENSORRT_USE_TORCH_COMPILE:
+            print("\n" + "="*70)
+            print("Optimization Setup (torch.compile)")
+            print("="*70)
+            
+            compiled_encoder = compile_with_torch_compile(encoder, backend="inductor")
+            
+            if compiled_encoder is not None:
+                encoder_to_use = compiled_encoder
+                optimization_name = "torch.compile (Inductor)"
+            else:
+                use_optimization = False
+                
+        # Use TensorRT compilation (requires compatible model)
+        elif TENSORRT_AVAILABLE:
+            print("\n" + "="*70)
+            print("Optimization Setup (TensorRT)")
+            print("="*70)
+            
+            if trt_model_path.exists():
+                print(f"  Found existing TensorRT model: {trt_model_path}")
+                print(f"  File size: {trt_model_path.stat().st_size / (1024*1024):.2f} MB")
+                
+                try:
+                    print("  Loading TensorRT model...")
+                    trt_model_raw = torch.jit.load(str(trt_model_path)).cuda().eval()
+                    # Wrap the loaded model to match the encoder interface
+                    trt_encoder = TensorRTEncoderWrapper(trt_model_raw)
+                    print("  ✓ TensorRT model loaded successfully!")
+                    encoder_to_use = trt_encoder
+                    optimization_name = "TensorRT"
+                except Exception as e:
+                    print(f"  ✗ Failed to load TensorRT model: {e}")
+                    print("  Falling back to standard PyTorch inference")
+                    use_optimization = False
+            else:
+                print(f"  TensorRT model not found: {trt_model_path}")
+                print("  Compiling model to TensorRT...")
+                
+                # Prepare example inputs for compilation
+                example_inputs = {
+                    "image": context["image"],
+                    "extrinsics": context["extrinsics"],
+                    "intrinsics": context["intrinsics"],
+                    "near": context["near"],
+                    "far": context["far"],
+                }
+                
+                # Compile to TensorRT
+                trt_encoder = compile_to_tensorrt(
+                    encoder,
+                    example_inputs,
+                    trt_model_path,
+                    fp16=TENSORRT_FP16,
+                )
+                
+                if trt_encoder is not None:
+                    encoder_to_use = trt_encoder
+                    optimization_name = "TensorRT"
+                else:
+                    print("\n  TensorRT compilation failed. Consider using torch.compile instead:")
+                    print("    Set TENSORRT_USE_TORCH_COMPILE = True at the top of inference.py")
+                    use_optimization = False
+    
+    # Benchmark inference if requested
+    if BENCHMARK_RUNS > 0:
+        # Benchmark original model
+        pytorch_stats = benchmark_inference(
+            encoder,
+            context,
+            num_warmup=WARMUP_RUNS,
+            num_runs=BENCHMARK_RUNS,
+            model_name="PyTorch (Standard)",
+        )
+        
+        # Benchmark optimized model if available
+        if use_optimization and encoder_to_use != encoder:
+            optimized_stats = benchmark_inference(
+                encoder_to_use,
+                context,
+                num_warmup=WARMUP_RUNS,
+                num_runs=BENCHMARK_RUNS,
+                model_name=optimization_name,
+            )
+            
+            # Print speedup comparison
+            speedup = pytorch_stats["mean"] / optimized_stats["mean"]
+            print("\n" + "="*70)
+            print("Performance Comparison")
+            print("="*70)
+            print(f"  PyTorch:   {pytorch_stats['mean']*1000:.2f} ms")
+            print(f"  {optimization_name}: {optimized_stats['mean']*1000:.2f} ms")
+            print(f"  Speedup:   {speedup:.2f}x faster")
+            print("="*70)
+
     # Run encoder
     print("\n" + "="*70)
     print("Running Encoder Inference")
     print("="*70)
+    using_optimized = use_optimization and encoder_to_use != encoder
+    print(f"  Using: {optimization_name}")
+    
+    # Note: For PLY export, we need visualization_dump
+    # TensorRT wrapper doesn't populate it, so we need to run PyTorch encoder once
+    # torch.compile should populate it correctly
+    needs_viz_pass = using_optimized and optimization_name == "TensorRT"
+    if needs_viz_pass:
+        print("  Note: TensorRT model will be used for main inference")
+        print("  Standard PyTorch will run once more to capture visualization data for PLY export")
+    
+    inference_start = time.perf_counter()
     with torch.no_grad():
-        result = encoder(
+        result = encoder_to_use(
             context=context,
             global_step=0,
             deterministic=False,
-            visualization_dump=visualization_dump,
+            visualization_dump=visualization_dump if not needs_viz_pass else {},
             scene_names=None,
         )
+    
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    inference_end = time.perf_counter()
+    inference_time = inference_end - inference_start
+    
+    print(f"  Inference completed in {inference_time*1000:.2f} ms")
+    
+    # If using TensorRT wrapper, run the original encoder to populate visualization_dump for PLY export
+    if needs_viz_pass:
+        print("\n  Running PyTorch encoder to capture visualization data for PLY export...")
+        with torch.no_grad():
+            _ = encoder(
+                context=context,
+                global_step=0,
+                deterministic=False,
+                visualization_dump=visualization_dump,
+                scene_names=None,
+            )
 
     # Handle both dict and direct gaussians return
     if isinstance(result, dict):
