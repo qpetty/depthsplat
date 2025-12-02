@@ -519,11 +519,15 @@ def batch_features(features, nn_matrix=None):
         # [B, N-1, C, H, W] or [B, N-1, H*W, C]
         if nn_matrix is not None:
             # select views based on the provided nn matrix
+            # Use explicit size() calls for better TensorRT/JIT compatibility
             if features_tensor.dim() == 5:
-                c, h, w = features_tensor.shape[-3:]
+                c = features_tensor.size(-3)
+                h = features_tensor.size(-2)
+                w = features_tensor.size(-1)
                 index = repeat(nn_matrix[:, i, 1:], "b v -> b v c h w", c=c, h=h, w=w)
             elif features_tensor.dim() == 4:
-                hw, c = features_tensor.shape[-2:]
+                hw = features_tensor.size(-2)
+                c = features_tensor.size(-1)
                 index = repeat(nn_matrix[:, i, 1:], "b v -> b v hw c", hw=hw, c=c)
 
             kv_x = torch.gather(features_tensor, dim=1, index=index)
@@ -594,7 +598,11 @@ class MultiViewFeatureTransformer(nn.Module):
         nn_matrix = kwargs.pop("nn_matrix", None)
 
         # multi_view_features: list of [B, C, H, W]
-        b, c, h, w = multi_view_features[0].shape
+        # Use explicit size() calls for better TensorRT/JIT compatibility
+        b = multi_view_features[0].size(0)
+        c = multi_view_features[0].size(1)
+        h = multi_view_features[0].size(2)
+        w = multi_view_features[0].size(3)
         assert self.d_model == c
 
         num_views = len(multi_view_features)
@@ -621,7 +629,8 @@ class MultiViewFeatureTransformer(nn.Module):
         concat0 = concat0.reshape(num_views * b, c, -1).permute(
             0, 2, 1
         )  # [N*B, H*W, C]
-        c1_v = num_views - 1 if nn_matrix is None else nn_matrix.shape[-1] - 1
+        # Use explicit size() for TensorRT/JIT compatibility
+        c1_v = num_views - 1 if nn_matrix is None else nn_matrix.size(-1) - 1
         concat1 = concat1.reshape(num_views * b, c1_v, c, -1).permute(
             0, 1, 3, 2
         )  # [N*B, N-1, H*W, C]
@@ -700,11 +709,15 @@ def batch_features_camera_parameters(
         # [B, V-1, C, H, W]
         if nn_matrix is not None:
             # select views based on the provided nn matrix
+            # Use explicit size() calls for better TensorRT/JIT compatibility
             if features_tensor.dim() == 5:
-                c, h, w = features_tensor.shape[-3:]
+                c = features_tensor.size(-3)
+                h = features_tensor.size(-2)
+                w = features_tensor.size(-1)
                 index = repeat(nn_matrix[:, i, 1:], "b v -> b v c h w", c=c, h=h, w=w)
             elif features_tensor.dim() == 4:
-                hw, c = features_tensor.shape[-2:]
+                hw = features_tensor.size(-2)
+                c = features_tensor.size(-1)
                 index = repeat(nn_matrix[:, i, 1:], "b v -> b v hw c", hw=hw, c=c)
 
             kv_x = torch.gather(features_tensor, dim=1, index=index)
@@ -729,7 +742,10 @@ def batch_features_camera_parameters(
         # list of [B, C, H, W]
         return q, q_intrinsics, q_extrinsics, kv, kv_intrinsics, kv_extrinsics
 
-    c, h, w = q[0].shape[1:]
+    # Use explicit size() calls for better TensorRT/JIT compatibility
+    c = q[0].size(1)
+    h = q[0].size(2)
+    w = q[0].size(3)
 
     q = torch.stack(q, dim=1).view(-1, c, h, w)  # [BV, C, H, W]
     q_intrinsics = torch.stack(q_intrinsics, dim=1).view(-1, 3, 3)  # [BV, 3, 3]

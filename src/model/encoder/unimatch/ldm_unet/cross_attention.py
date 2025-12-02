@@ -49,8 +49,10 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, y):
         c = self.dim
-        b, n1, c1 = x.shape
-        n2, c2 = y.shape[1:]
+        # Use explicit size() for TensorRT/JIT compatibility
+        b = x.size(0)
+        n1 = x.size(1)
+        n2 = y.size(1)
 
         q = self.q(x).reshape(b, n1, self.num_heads, c // self.num_heads)
         kv = self.kv(y).reshape(b, n2, 2, self.num_heads, c // self.num_heads)
@@ -147,8 +149,11 @@ class UNetCrossAttentionBlock(nn.Module):
 
         if self.no_cross_attn:
             assert x.dim() == 4 and y.dim() == 4
-            if y.shape[2:] != x.shape[2:]:
-                y = F.interpolate(y, x.shape[2:], mode='bilinear', align_corners=True)
+            # Use explicit size() for TensorRT/JIT compatibility
+            x_h, x_w = x.size(2), x.size(3)
+            y_h, y_w = y.size(2), y.size(3)
+            if y_h != x_h or y_w != x_w:
+                y = F.interpolate(y, (x_h, x_w), mode='bilinear', align_corners=True)
             return self.proj(torch.cat((x, y), dim=1))
 
         identity = x

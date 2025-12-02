@@ -554,12 +554,13 @@ class DPTHead(nn.Module):
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
 
-        path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])  # 1/8
+        # Use explicit size() for TensorRT/JIT compatibility
+        path_4 = self.scratch.refinenet4(layer_4_rn, size=(layer_3_rn.size(2), layer_3_rn.size(3)))  # 1/8
         path_3 = self.scratch.refinenet3(
-            path_4, layer_3_rn, size=layer_2_rn.shape[2:]
+            path_4, layer_3_rn, size=(layer_2_rn.size(2), layer_2_rn.size(3))
         )  # 1/4
         path_2 = self.scratch.refinenet2(
-            path_3, layer_2_rn, size=layer_1_rn.shape[2:]
+            path_3, layer_2_rn, size=(layer_1_rn.size(2), layer_1_rn.size(3))
         )  # 1/2
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)  # 1
 

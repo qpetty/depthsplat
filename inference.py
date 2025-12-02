@@ -515,10 +515,16 @@ def compile_to_tensorrt(
         print("  ✓ Encoder re-created with PyTorch native attention")
         
         # Create a wrapper that accepts separate tensor inputs
+        # We pass shapes explicitly to avoid TensorRT shape analysis issues
         class EncoderWrapper(torch.nn.Module):
-            def __init__(self, encoder):
+            def __init__(self, encoder, batch_size: int, num_views: int, height: int, width: int):
                 super().__init__()
                 self.encoder = encoder
+                # Register shapes as buffers so they're constants in the traced graph
+                self.register_buffer('_batch_size', torch.tensor(batch_size, dtype=torch.int64))
+                self.register_buffer('_num_views', torch.tensor(num_views, dtype=torch.int64))
+                self.register_buffer('_height', torch.tensor(height, dtype=torch.int64))
+                self.register_buffer('_width', torch.tensor(width, dtype=torch.int64))
             
             def forward(self, image, extrinsics, intrinsics, near, far):
                 context = {
@@ -547,7 +553,8 @@ def compile_to_tensorrt(
                 # Return the essential gaussian properties as separate tensors
                 return gaussians.means, gaussians.covariances, gaussians.harmonics, gaussians.opacities
         
-        wrapped_model = EncoderWrapper(pytorch_encoder).cuda().eval()
+        batch_size, num_views, channels, height, width = example_inputs["image"].shape
+        wrapped_model = EncoderWrapper(pytorch_encoder, batch_size, num_views, height, width).cuda().eval()
         
         # Trace the model with example inputs
         print("  Tracing model with example inputs...")
@@ -560,10 +567,15 @@ def compile_to_tensorrt(
                     example_inputs["intrinsics"],
                     example_inputs["near"],
                     example_inputs["far"],
-                )
+                ),
+                strict=False,  # Allow non-tensor inputs and more flexible tracing
             )
+            
+            # Freeze the model to convert shape-dependent values to constants
+            # This helps TensorRT understand static shapes during graph partitioning
+            traced_model = torch.jit.freeze(traced_model)
         
-        print("  Model traced successfully!")
+        print("  Model traced and frozen successfully!")
         print("  Compiling with TensorRT (this may take several minutes)...")
         
         # Configure TensorRT compilation
@@ -573,7 +585,7 @@ def compile_to_tensorrt(
         
         # Compile to TensorRT
         # Note: We use explicit shapes since the model expects specific input sizes
-        batch_size, num_views, channels, height, width = example_inputs["image"].shape
+        # (batch_size, num_views, height, width were extracted earlier during wrapper creation)
         
         trt_inputs = [
             torch_tensorrt.Input(
@@ -600,10 +612,13 @@ def compile_to_tensorrt(
         
         trt_model = torch_tensorrt.compile(
             traced_model,
+            ir="torchscript",  # Explicitly use TorchScript IR since we traced the model
             inputs=trt_inputs,
             enabled_precisions=enabled_precisions,
             truncate_long_and_double=True,
             workspace_size=1 << 30,  # 1GB workspace
+            require_full_compilation=False,  # Allow fallback for unsupported ops
+            min_block_size=1,  # Minimize subgraph fragmentation
         )
         
         print("  Compilation successful!")

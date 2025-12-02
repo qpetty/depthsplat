@@ -53,7 +53,9 @@ class AttentionPool2d(nn.Module):
         self.attention = QKVAttention(self.num_heads)
 
     def forward(self, x):
-        b, c, *_spatial = x.shape
+        # Use explicit size() for TensorRT/JIT compatibility
+        b = x.size(0)
+        c = x.size(1)
         x = x.reshape(b, c, -1)  # NC(HW)
         x = th.cat([x.mean(dim=-1, keepdim=True), x], dim=-1)  # NC(HW+1)
         x = x + self.positional_embedding[None, :, :].to(x.dtype)  # NC(HW+1)
@@ -366,7 +368,11 @@ class AttentionBlock(nn.Module):
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):
-        b, c, *spatial = x.shape
+        # Use explicit size() for TensorRT/JIT compatibility
+        b = x.size(0)
+        c = x.size(1)
+        # Get spatial dimensions (everything after b, c) for reshape back
+        spatial = x.shape[2:]
         x = x.reshape(b, c, -1)
 
         if self.postnorm:
@@ -518,7 +524,10 @@ def count_flops_attn(model, _x, y):
             custom_ops={QKVAttention: QKVAttention.count_flops},
         )
     """
-    b, c, *spatial = y[0].shape
+    # Use explicit size() for TensorRT/JIT compatibility
+    b = y[0].size(0)
+    c = y[0].size(1)
+    spatial = y[0].shape[2:]  # Get remaining spatial dims
     num_spatial = int(np.prod(spatial))
     # We perform two matmuls with the same number of ops.
     # The first computes the weight matrix, the second computes
@@ -551,7 +560,10 @@ class QKVAttentionLegacy(nn.Module):
             n_views = self.n_frames if num_views is None else num_views
             qkv = rearrange(qkv, "(b v) n t -> b n (v t)", v=n_views)
 
-        bs, width, length = qkv.shape
+        # Use explicit size() for TensorRT/JIT compatibility
+        bs = qkv.size(0)
+        width = qkv.size(1)
+        length = qkv.size(2)
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
@@ -588,7 +600,10 @@ class QKVAttention(nn.Module):
         :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
         :return: an [N x (H * C) x T] tensor after attention.
         """
-        bs, width, length = qkv.shape
+        # Use explicit size() for TensorRT/JIT compatibility
+        bs = qkv.size(0)
+        width = qkv.size(1)
+        length = qkv.size(2)
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.chunk(3, dim=1)
