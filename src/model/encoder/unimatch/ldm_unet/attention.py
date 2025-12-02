@@ -25,7 +25,8 @@ def max_neg_value(t):
 
 
 def init_(tensor):
-    dim = tensor.shape[-1]
+    # Use explicit size() for TensorRT/JIT compatibility
+    dim = tensor.size(-1)
     std = 1 / math.sqrt(dim)
     tensor.uniform_(-std, std)
     return tensor

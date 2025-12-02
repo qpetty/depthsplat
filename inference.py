@@ -610,25 +610,65 @@ def compile_to_tensorrt(
             ),  # far
         ]
         
-        trt_model = torch_tensorrt.compile(
-            traced_model,
-            ir="torchscript",  # Explicitly use TorchScript IR since we traced the model
-            inputs=trt_inputs,
-            enabled_precisions=enabled_precisions,
-            truncate_long_and_double=True,
-            workspace_size=1 << 30,  # 1GB workspace
-            require_full_compilation=False,  # Allow fallback for unsupported ops
-            min_block_size=1,  # Minimize subgraph fragmentation
-        )
+        # Try TorchScript-based compilation first
+        use_dynamo_fallback = False
+        try:
+            trt_model = torch_tensorrt.compile(
+                traced_model,
+                ir="torchscript",  # Explicitly use TorchScript IR since we traced the model
+                inputs=trt_inputs,
+                enabled_precisions=enabled_precisions,
+                truncate_long_and_double=True,
+                workspace_size=1 << 30,  # 1GB workspace
+                require_full_compilation=False,  # Allow fallback for unsupported ops
+                min_block_size=1,  # Minimize subgraph fragmentation
+            )
+        except Exception as ts_error:
+            print(f"  TorchScript compilation failed: {ts_error}")
+            print("  Trying torch.compile with torch_tensorrt backend...")
+            
+            # Fall back to torch.compile with torch_tensorrt backend (Dynamo-based)
+            # This handles dynamic shapes better
+            try:
+                trt_model = torch.compile(
+                    wrapped_model,
+                    backend="torch_tensorrt",
+                    options={
+                        "enabled_precisions": enabled_precisions,
+                        "truncate_long_and_double": True,
+                        "debug": True,
+                        "min_block_size": 1,
+                    }
+                )
+                
+                # Run a warmup pass to trigger compilation
+                print("  Running warmup pass to trigger compilation...")
+                with torch.no_grad():
+                    _ = trt_model(
+                        example_inputs["image"],
+                        example_inputs["extrinsics"],
+                        example_inputs["intrinsics"],
+                        example_inputs["near"],
+                        example_inputs["far"],
+                    )
+                use_dynamo_fallback = True
+                print("  ✓ Dynamo + TensorRT compilation successful!")
+            except Exception as dynamo_error:
+                print(f"  Dynamo compilation also failed: {dynamo_error}")
+                raise ts_error  # Re-raise original error
         
-        print("  Compilation successful!")
-        
-        # Save the compiled model
-        print(f"  Saving TensorRT model to {save_path}...")
-        torch.jit.save(trt_model, str(save_path))
-        
-        print(f"  ✓ TensorRT model saved successfully!")
-        print(f"  File size: {save_path.stat().st_size / (1024*1024):.2f} MB")
+        if not use_dynamo_fallback:
+            print("  Compilation successful!")
+            
+            # Save the compiled model (only for TorchScript-based)
+            print(f"  Saving TensorRT model to {save_path}...")
+            torch.jit.save(trt_model, str(save_path))
+            
+            print(f"  ✓ TensorRT model saved successfully!")
+            print(f"  File size: {save_path.stat().st_size / (1024*1024):.2f} MB")
+        else:
+            print("  Note: Dynamo-compiled models cannot be saved to disk")
+            print("  The model will be recompiled on each run")
         
         # Wrap the TensorRT model to match the original encoder interface
         wrapped_trt = TensorRTEncoderWrapper(trt_model)

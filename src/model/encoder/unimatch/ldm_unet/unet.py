@@ -117,10 +117,11 @@ class Upsample(nn.Module):
         self.downsample_3ddim = downsample_3ddim
 
     def forward(self, x, y=None):
-        assert x.shape[1] == self.channels
+        # Use explicit size() for TensorRT/JIT compatibility
+        assert x.size(1) == self.channels
         if self.dims == 3 and not self.downsample_3ddim:
             x = F.interpolate(
-                x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
+                x, (x.size(2), x.size(3) * 2, x.size(4) * 2), mode="nearest"
             )
         else:
             x = F.interpolate(x, scale_factor=2, mode="nearest")
@@ -173,7 +174,8 @@ class Downsample(nn.Module):
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
 
     def forward(self, x, y=None):
-        assert x.shape[1] == self.channels
+        # Use explicit size() for TensorRT/JIT compatibility
+        assert x.size(1) == self.channels
         return self.op(x)
 
 
@@ -371,21 +373,26 @@ class AttentionBlock(nn.Module):
         # Use explicit size() for TensorRT/JIT compatibility
         b = x.size(0)
         c = x.size(1)
-        # Get spatial dimensions (everything after b, c) for reshape back
-        spatial = x.shape[2:]
-        x = x.reshape(b, c, -1)
+        # Get spatial dimensions explicitly for reshape back
+        h_dim = x.size(2)
+        w_dim = x.size(3) if x.dim() > 3 else 1
+        x_flat = x.reshape(b, c, -1)
 
         if self.postnorm:
-            qkv = self.qkv(x)
-            h = self.attention(qkv)
-            h = self.proj_out(h)
-            h = self.norm(h)
+            qkv = self.qkv(x_flat)
+            attn_out = self.attention(qkv)
+            attn_out = self.proj_out(attn_out)
+            attn_out = self.norm(attn_out)
         else:
-            qkv = self.qkv(self.norm(x))
-            h = self.attention(qkv)
-            h = self.proj_out(h)
+            qkv = self.qkv(self.norm(x_flat))
+            attn_out = self.attention(qkv)
+            attn_out = self.proj_out(attn_out)
 
-        return (x + h).reshape(b, c, *spatial)
+        # Reshape back to original spatial dimensions
+        if x.dim() == 4:
+            return (x_flat + attn_out).reshape(b, c, h_dim, w_dim)
+        else:
+            return (x_flat + attn_out).reshape(b, c, h_dim)
 
 
 class CrossAttentionBlock(nn.Module):
@@ -1120,7 +1127,8 @@ class UNetModel(nn.Module):
         emb = None
 
         if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
+            # Use explicit size() for TensorRT/JIT compatibility
+            assert y.size(0) == x.size(0) and y.dim() == 1
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)

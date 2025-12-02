@@ -330,9 +330,10 @@ class MultiViewUniMatch(nn.Module):
         )
 
         for i in range(len(mono_intermediate_features)):
+            # Use explicit size() for TensorRT/JIT compatibility
             curr_features = (
                 mono_intermediate_features[i]
-                .reshape(concat.shape[0], resize_h // 14, resize_w // 14, -1)
+                .reshape(concat.size(0), resize_h // 14, resize_w // 14, -1)
                 .permute(0, 3, 1, 2)
                 .contiguous()
             )
