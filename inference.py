@@ -84,6 +84,74 @@ else:
     TENSORRT_AVAILABLE = False
 
 
+def patch_dinov2_attention(model):
+    """
+    Monkey-patch DINOv2's attention instances to use PyTorch native attention instead of xformers.
+    This is needed for TensorRT compatibility since xformers uses SymInt which JIT can't trace.
+    
+    Args:
+        model: The encoder model containing DINOv2 (must have depth_predictor.pretrained)
+    
+    Must be called AFTER the encoder is created (so DINOv2 modules are loaded).
+    """
+    import torch.nn.functional as F
+    import types
+    
+    def pytorch_attention_forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        # Use PyTorch native scaled dot product attention
+        x = F.scaled_dot_product_attention(q, k, v)
+        
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+    # Find and patch all Attention instances in the DINOv2 model
+    patched_count = 0
+    
+    try:
+        # Get the DINOv2 model (pretrained attribute of depth_predictor)
+        dinov2_model = model.depth_predictor.pretrained
+        
+        # Iterate through all modules and patch Attention instances
+        for name, module in dinov2_model.named_modules():
+            # Check if this is a DINOv2 Attention module by checking for the attributes we need
+            if (hasattr(module, 'qkv') and 
+                hasattr(module, 'num_heads') and 
+                hasattr(module, 'proj') and 
+                hasattr(module, 'proj_drop') and
+                'attn' in name.lower()):
+                # Bind our new forward method to this specific instance
+                module.forward = types.MethodType(pytorch_attention_forward, module)
+                patched_count += 1
+        
+        if patched_count > 0:
+            print(f"  ✓ Patched {patched_count} DINOv2 attention instances to use PyTorch native attention")
+        else:
+            print("  Warning: No DINOv2 attention instances found to patch")
+            
+    except AttributeError as e:
+        print(f"  Warning: Could not access DINOv2 model: {e}")
+        print("  Trying alternative patching method...")
+        
+        # Fallback: try to patch via class
+        try:
+            import sys
+            if 'dinov2.layers.attention' in sys.modules:
+                dinov2_attention = sys.modules['dinov2.layers.attention']
+                dinov2_attention.Attention.forward = pytorch_attention_forward
+                print("  ✓ Patched DINOv2 Attention class (fallback method)")
+                return True
+        except Exception as e2:
+            print(f"  Warning: Fallback patching also failed: {e2}")
+    
+    return patched_count > 0
+
+
 def load_metadata_from_json(image_path: Path) -> dict:
     """
     Load camera intrinsics and extrinsics from JSON metadata file.
@@ -437,6 +505,10 @@ def compile_to_tensorrt(
         encoder_cfg = load_encoder_config(CONFIG_ROOT, ENCODER_OVERRIDES)
         pytorch_encoder, _ = get_encoder(encoder_cfg)
         pytorch_encoder = pytorch_encoder.to("cuda").eval()
+        
+        # Patch DINOv2's attention instances after the model is loaded (it uses xformers internally)
+        # We must patch the actual instances, not just the class, since the model is already instantiated
+        patch_dinov2_attention(pytorch_encoder)
         
         # Copy weights from original model
         pytorch_encoder.load_state_dict(model.state_dict())
