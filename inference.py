@@ -87,6 +87,71 @@ else:
     TENSORRT_AVAILABLE = False
 
 
+def patch_dinov2_pos_embed(model):
+    """
+    Patch DINOv2's positional embedding interpolation to avoid complex numbers.
+    The original uses antialias=True which can trigger complex number operations via FFT.
+    
+    Must be called AFTER the encoder is created.
+    """
+    import types
+    import torch.nn.functional as F
+    
+    def simple_interpolate_pos_encoding(self, x, w, h):
+        """
+        Simplified positional embedding interpolation without complex operations.
+        Uses bilinear interpolation instead of bicubic with antialias.
+        """
+        previous_dtype = x.dtype
+        npatch = x.shape[1] - 1
+        N = self.pos_embed.shape[1] - 1
+        
+        if npatch == N and w == h:
+            return self.pos_embed
+        
+        pos_embed = self.pos_embed.float()
+        class_pos_embed = pos_embed[:, 0]
+        patch_pos_embed = pos_embed[:, 1:]
+        
+        dim = x.shape[-1]
+        w0 = w // self.patch_size
+        h0 = h // self.patch_size
+        
+        # Use sqrt(N) to get original grid size
+        M = int(N ** 0.5)
+        
+        # Reshape and interpolate using bilinear (avoids complex numbers)
+        patch_pos_embed = patch_pos_embed.reshape(1, M, M, dim)
+        patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
+        
+        patch_pos_embed = F.interpolate(
+            patch_pos_embed,
+            size=(h0, w0),
+            mode="bilinear",  # Use bilinear instead of bicubic to avoid complex ops
+            align_corners=False,
+        )
+        
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).reshape(1, -1, dim)
+        
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+    
+    patched = False
+    try:
+        dinov2_model = model.depth_predictor.pretrained
+        
+        # Patch the interpolate_pos_encoding method
+        if hasattr(dinov2_model, 'interpolate_pos_encoding'):
+            dinov2_model.interpolate_pos_encoding = types.MethodType(
+                simple_interpolate_pos_encoding, dinov2_model
+            )
+            patched = True
+            print("  ✓ Patched DINOv2 positional embedding interpolation (avoiding complex ops)")
+    except Exception as e:
+        print(f"  Warning: Could not patch DINOv2 pos embed: {e}")
+    
+    return patched
+
+
 def patch_dinov2_attention(model):
     """
     Monkey-patch DINOv2's attention instances to use PyTorch native attention instead of xformers.
@@ -569,8 +634,9 @@ def compile_to_tensorrt_via_onnx(
         pytorch_encoder, _ = get_encoder(encoder_cfg)
         pytorch_encoder = pytorch_encoder.to("cuda").eval()
         
-        # Patch DINOv2's attention
+        # Patch DINOv2's attention and positional embedding interpolation
         patch_dinov2_attention(pytorch_encoder)
+        patch_dinov2_pos_embed(pytorch_encoder)  # Avoid complex numbers in pos embed interpolation
         
         # Copy weights from original model
         pytorch_encoder.load_state_dict(model.state_dict())
@@ -622,24 +688,68 @@ def compile_to_tensorrt_via_onnx(
             "opacities": {0: "batch"},
         }
         
-        with torch.no_grad():
-            torch.onnx.export(
+        onnx_export_success = False
+        
+        # Try multiple ONNX export methods
+        # Method 1: Try torch.onnx.dynamo_export (PyTorch 2.x, handles more ops)
+        print("    Trying dynamo-based ONNX export...")
+        try:
+            export_options = torch.onnx.ExportOptions(dynamic_shapes=True)
+            onnx_program = torch.onnx.dynamo_export(
                 wrapped_model,
-                (
-                    example_inputs["image"],
-                    example_inputs["extrinsics"],
-                    example_inputs["intrinsics"],
-                    example_inputs["near"],
-                    example_inputs["far"],
-                ),
-                str(onnx_path),
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=17,
-                do_constant_folding=True,
-                export_params=True,
+                example_inputs["image"],
+                example_inputs["extrinsics"],
+                example_inputs["intrinsics"],
+                example_inputs["near"],
+                example_inputs["far"],
+                export_options=export_options,
             )
+            onnx_program.save(str(onnx_path))
+            onnx_export_success = True
+            print("    ✓ Dynamo ONNX export successful")
+        except Exception as e:
+            print(f"    Dynamo export failed: {e}")
+            print("    Trying legacy ONNX export...")
+        
+        # Method 2: Try legacy torch.onnx.export with verbose mode
+        if not onnx_export_success:
+            try:
+                with torch.no_grad():
+                    torch.onnx.export(
+                        wrapped_model,
+                        (
+                            example_inputs["image"],
+                            example_inputs["extrinsics"],
+                            example_inputs["intrinsics"],
+                            example_inputs["near"],
+                            example_inputs["far"],
+                        ),
+                        str(onnx_path),
+                        input_names=input_names,
+                        output_names=output_names,
+                        dynamic_axes=dynamic_axes,
+                        opset_version=17,
+                        do_constant_folding=True,
+                        export_params=True,
+                        verbose=False,
+                    )
+                onnx_export_success = True
+                print("    ✓ Legacy ONNX export successful")
+            except RuntimeError as e:
+                if "complex" in str(e).lower():
+                    print(f"    ✗ ONNX export failed due to complex numbers: {e}")
+                    print("\n    The model contains operations with complex numbers (likely in DINOv2).")
+                    print("    This is a known limitation of ONNX export.")
+                    print("\n    Workaround options:")
+                    print("    1. Use torch.compile with inductor backend (set TENSORRT_USE_TORCH_COMPILE = True)")
+                    print("    2. Use a different depth predictor backbone")
+                    print("    3. Patch DINOv2 to avoid complex operations")
+                else:
+                    print(f"    ✗ ONNX export failed: {e}")
+                raise
+        
+        if not onnx_export_success:
+            raise RuntimeError("All ONNX export methods failed")
         
         print(f"  ✓ ONNX model exported to {onnx_path}")
         print(f"    File size: {onnx_path.stat().st_size / (1024*1024):.2f} MB")
@@ -842,6 +952,7 @@ def compile_to_tensorrt(
         # Patch DINOv2's attention instances after the model is loaded (it uses xformers internally)
         # We must patch the actual instances, not just the class, since the model is already instantiated
         patch_dinov2_attention(pytorch_encoder)
+        patch_dinov2_pos_embed(pytorch_encoder)  # Avoid complex numbers in pos embed interpolation
         
         # Copy weights from original model
         pytorch_encoder.load_state_dict(model.state_dict())
