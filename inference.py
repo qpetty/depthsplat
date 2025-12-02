@@ -13,11 +13,12 @@ CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-
 CONFIG_ROOT = "/content/depthsplat/config"  # Path to config directory
 OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
 
-# Input image base path (directory containing images)
-# If EXTRINSICS_HARDCODED is a dictionary, image paths will be constructed as:
-#   IMAGE_BASE_PATH / image_filename (where image_filename is a key in EXTRINSICS_HARDCODED)
-# Set to None to use random images
-IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/hillman_images"  # Base directory for images
+# Base directory containing the images and metadata files
+# All .png and .jpg images in this directory will be processed
+# For each image, a corresponding *_metadata.json file must exist in the same directory
+# (e.g., for "dude_1.png", there must be "dude_1_metadata.json")
+# Camera intrinsics and extrinsics will be loaded from these metadata files.
+IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input"
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
@@ -32,56 +33,7 @@ ENCODER_OVERRIDES = {
 
 import numpy as np
 
-# Camera intrinsics (before normalization)
-# Set to None to use computed values, or provide [fx, fy, cx, cy] in pixels
-# If provided, will be normalized by image dimensions automatically
-INTRINSICS_HARDCODED = None
-# Example (uncomment to use):
-INTRINSICS_HARDCODED = [1719.87357, 1719.87357, 256.0, 480.0]  # [fx, fy, cx, cy] in pixels
-
-# Camera extrinsics (4x4 camera-to-world matrices)
-# Set to None to use computed poses, or provide a dictionary mapping image filenames to numpy arrays
-# Each matrix should be 4x4 in shape
-# Keys are image filenames (e.g., 'frame_0002.png'), values are 4x4 C2W matrices
-# If provided, images will be loaded from IMAGE_BASE_PATH using the dictionary keys as filenames
-EXTRINSICS_HARDCODED = None
-# Example (uncomment to use - note: numpy is already imported as np):
-EXTRINSICS_HARDCODED = {
-    "frame_0017.png": np.array([
-        [0.2097, -0.0580, -0.9760, 4.0834],
-        [-0.0471, 0.9965, -0.0693, 0.0745],
-        [0.9766, 0.0605, 0.2062, 2.4196],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
-    "frame_0025.png": np.array([
-        [0.3673, -0.0574, -0.9283, 3.8409],
-        [-0.0363, 0.9964, -0.0760, 0.1100],
-        [0.9294, 0.0616, 0.3639, 1.6217],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
-    "frame_0034.png": np.array([
-        [0.5372, -0.0551, -0.8417, 3.4024],
-        [-0.0238, 0.9965, -0.0804, 0.1335],
-        [0.8431, 0.0632, 0.5340, 0.7633],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
-    "frame_0043.png": np.array([
-        [0.6923, -0.0511, -0.7198, 2.7938],
-        [-0.0104, 0.9967, -0.0808, 0.1430],
-        [0.7216, 0.0634, 0.6894, -0.0107],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
-    "frame_0051.png": np.array([
-        [0.8075, -0.0494, -0.5878, 2.1365],
-        [0.0020, 0.9967, -0.0810, 0.1406],
-        [0.5899, 0.0642, 0.8049, -0.5854],
-        [0.0000, 0.0000, 0.0000, 1.0000],
-    ], dtype=np.float32),
-}
-
-
-
-# Near/Far plane computation (only used if EXTRINSICS_HARDCODED is provided)
+# Near/Far plane computation
 # These disparity values control how near/far planes are computed from camera baselines
 # Smaller disparity = farther depth (larger far plane)
 # Larger disparity = closer depth (smaller near plane)
@@ -104,6 +56,77 @@ import torchvision.transforms as tf
 from src.geometry.projection import get_fov
 from src.dataset.shims.bounds_shim import compute_depth_for_disparity
 from scipy.spatial.transform import Rotation as R
+import json
+
+
+def load_metadata_from_json(image_path: Path) -> dict:
+    """
+    Load camera intrinsics and extrinsics from JSON metadata file.
+    
+    Metadata file should be named: {image_stem}_metadata.json
+    For example, for "dude_1.png", the metadata file should be "dude_1_metadata.json"
+    
+    Expected JSON structure:
+    {
+        "intrinsics": [fx, 0, cx, 0, fy, cy, 0, 0, 1],  # 3x3 matrix in row-major order
+        "extrinsics": [r11, r12, r13, tx, r21, r22, r23, ty, r31, r32, r33, tz, 0, 0, 0, 1],  # 4x4 matrix in row-major order
+        "image_width": int,
+        "image_height": int
+    }
+    
+    Args:
+        image_path: Path to the image file
+        
+    Returns:
+        Dictionary containing:
+            - intrinsics: 3x3 numpy array
+            - extrinsics: 4x4 numpy array (camera-to-world matrix)
+            - image_width: int
+            - image_height: int
+    """
+    # Construct metadata filename
+    metadata_path = image_path.parent / f"{image_path.stem}_metadata.json"
+    
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Metadata file not found: {metadata_path}\n"
+            f"Expected metadata file for image: {image_path}"
+        )
+    
+    # Load JSON
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    
+    # Parse intrinsics (3x3 matrix in row-major order)
+    if "intrinsics" not in metadata:
+        raise ValueError(f"Metadata file {metadata_path} missing 'intrinsics' field")
+    
+    intrinsics_flat = metadata["intrinsics"]
+    if len(intrinsics_flat) != 9:
+        raise ValueError(f"Intrinsics must have 9 elements (3x3 matrix), got {len(intrinsics_flat)}")
+    
+    intrinsics = np.array(intrinsics_flat, dtype=np.float32).reshape(3, 3)
+    
+    # Parse extrinsics (4x4 matrix in row-major order)
+    if "extrinsics" not in metadata:
+        raise ValueError(f"Metadata file {metadata_path} missing 'extrinsics' field")
+    
+    extrinsics_flat = metadata["extrinsics"]
+    if len(extrinsics_flat) != 16:
+        raise ValueError(f"Extrinsics must have 16 elements (4x4 matrix), got {len(extrinsics_flat)}")
+    
+    extrinsics = np.array(extrinsics_flat, dtype=np.float32).reshape(4, 4)
+    
+    # Get image dimensions from metadata
+    image_width = metadata.get("image_width")
+    image_height = metadata.get("image_height")
+    
+    return {
+        "intrinsics": intrinsics,
+        "extrinsics": extrinsics,
+        "image_width": image_width,
+        "image_height": image_height,
+    }
 
 
 def create_rotation_matrix_y(angle_degrees: float) -> torch.Tensor:
@@ -292,172 +315,165 @@ def main():
     else:
         print("\nNo checkpoint path provided. Using randomly initialized weights.")
 
-    # Create input with resolution matching COLMAP reconstruction
-    # NOTE: Dimensions must match what COLMAP used during reconstruction
-    # Based on principal point analysis: COLMAP used width=512, height=960
-    batch_size = 1
-    height, width = 512, 960  # FIXED: Match COLMAP dimensions (was 512, 960)
-
-    # Determine number of views and image paths from EXTRINSICS_HARDCODED
-    image_paths = []
-    image_filenames = []
-    if EXTRINSICS_HARDCODED is not None:
-        if isinstance(EXTRINSICS_HARDCODED, dict):
-            # Extract image filenames from dictionary keys
-            image_filenames = list(EXTRINSICS_HARDCODED.keys())
-            num_views = len(image_filenames)
-            if IMAGE_BASE_PATH is not None:
-                image_base = Path(IMAGE_BASE_PATH)
-                image_paths = [str(image_base / filename) for filename in image_filenames]
-            else:
-                print("  WARNING: EXTRINSICS_HARDCODED is a dictionary but IMAGE_BASE_PATH is None.")
-                print("  Cannot load images. Falling back to random images.")
-                image_paths = []
-        elif isinstance(EXTRINSICS_HARDCODED, (list, tuple)):
-            # Backward compatibility: list format
-            num_views = len(EXTRINSICS_HARDCODED)
-            image_filenames = []  # No filenames available for list format
-            image_paths = []  # Cannot construct paths without filenames
-        else:
-            raise TypeError(f"EXTRINSICS_HARDCODED must be a dict, list, or None, got {type(EXTRINSICS_HARDCODED)}")
-    else:
-        # Default to 3 views if not using hardcoded extrinsics
-        num_views = 3
-        image_paths = []
-        image_filenames = []
-
-    # Load images from paths or generate random ones
+    # Load images and metadata
     print("\n" + "="*70)
-    print("Loading Images")
+    print("Loading Images and Metadata")
     print("="*70)
-    if image_paths and len(image_paths) > 0:
+    
+    # Set up paths
+    image_base = Path(IMAGE_BASE_PATH)
+    
+    if not image_base.exists():
+        raise FileNotFoundError(f"IMAGE_BASE_PATH does not exist: {image_base}")
+    
+    if not image_base.is_dir():
+        raise ValueError(f"IMAGE_BASE_PATH must be a directory: {image_base}")
+    
+    # Discover all .png and .jpg images in the directory
+    image_files = []
+    for ext in ['*.png', '*.jpg', '*.PNG', '*.JPG', '*.jpeg', '*.JPEG']:
+        image_files.extend(sorted(image_base.glob(ext)))
+    
+    if not image_files:
+        raise ValueError(f"No image files (.png, .jpg) found in: {image_base}")
+    
+    print(f"  Found {len(image_files)} image(s) in {image_base}")
+    
+    # Load all images and metadata
+    batch_size = 1
+    num_views = len(image_files)
+    loaded_images = []
+    metadata_list = []
+    image_filenames = []
+    
+    # Target resolution for inference (will resize images to this)
+    # Can be adjusted based on your needs
+    target_height, target_width = 512, 960
+    
+    for image_path in image_files:
+        image_filename = image_path.name
+        
+        # Load metadata
+        print(f"\n  Loading: {image_filename}")
         try:
-            loaded_images = []
-            for img_path, img_filename in zip(image_paths, image_filenames):
-                loaded_img = load_and_resize_image(img_path, (height, width))
-                loaded_images.append(loaded_img)
-                print(f"  Loaded: {img_filename} from {img_path}")
-
-            # Stack images: [num_views, 3, height, width] -> [1, num_views, 3, height, width]
-            images = torch.stack(loaded_images, dim=0).unsqueeze(0)
-            print(f"  Image shape: {images.shape}")
-            print(f"  Number of views: {num_views}")
+            metadata = load_metadata_from_json(image_path)
+            metadata_list.append(metadata)
         except FileNotFoundError as e:
-            print(f"  Warning: {e}")
-            print("  Falling back to random images.")
-            images = torch.rand(batch_size, num_views, 3, height, width)
-    else:
-        print("  Using random images (image paths not set or incomplete).")
-        images = torch.rand(batch_size, num_views, 3, height, width)
+            print(f"    ✗ Skipping {image_filename}: {e}")
+            continue
+        except Exception as e:
+            print(f"    ✗ Error loading metadata for {image_filename}: {e}")
+            continue
+        
+        # Load and resize image
+        try:
+            loaded_img = load_and_resize_image(str(image_path), (target_height, target_width))
+            loaded_images.append(loaded_img)
+            image_filenames.append(image_filename)
+            
+            print(f"    ✓ Image loaded: {image_path}")
+            print(f"    ✓ Metadata loaded from: {image_path.parent / f'{image_path.stem}_metadata.json'}")
+            print(f"    Original size: {metadata['image_width']}x{metadata['image_height']}")
+            print(f"    Resized to: {target_width}x{target_height}")
+        except Exception as e:
+            print(f"    ✗ Error loading image {image_filename}: {e}")
+            # Remove the metadata we just added since the image failed
+            metadata_list.pop()
+            continue
+    
+    if not loaded_images:
+        raise ValueError(f"No valid image/metadata pairs found in: {image_base}")
+    
+    # Update num_views based on successfully loaded images
+    num_views = len(loaded_images)
+    
+    # Stack images: [num_views, 3, height, width] -> [1, num_views, 3, height, width]
+    images = torch.stack(loaded_images, dim=0).unsqueeze(0)
+    height, width = target_height, target_width
+    
+    print(f"\n  Successfully loaded {num_views} image(s) with metadata")
+    print(f"  Final image tensor shape: {images.shape}")
 
-    # Create camera poses
+    # Create camera poses from metadata
     print("\n" + "="*70)
-    print("Setting Up Camera Poses")
+    print("Setting Up Camera Poses from Metadata")
     print("="*70)
 
     # Initialize variables for validation
     camera_centers = []
     camera_distances = []
     viewing_directions = []
-
-    if EXTRINSICS_HARDCODED is not None:
-        # Use hardcoded extrinsics
-        print("  Using hardcoded extrinsics")
+    
+    extrinsics_list = []
+    
+    for i, metadata in enumerate(metadata_list):
+        img_name = image_filenames[i]
         
-        # Handle dictionary format
-        if isinstance(EXTRINSICS_HARDCODED, dict):
-            # Verify all image filenames are in the dictionary
-            # (num_views should already match since we set it from the dict length)
-            missing_files = [fname for fname in image_filenames if fname not in EXTRINSICS_HARDCODED]
-            if missing_files:
-                raise ValueError(f"EXTRINSICS_HARDCODED dictionary is missing entries for: {missing_files}")
-            
-            # Extract extrinsics in the order of image_filenames
-            extrinsics_values = [EXTRINSICS_HARDCODED[fname] for fname in image_filenames]
-        else:
-            # Handle list format (backward compatibility)
-            # num_views was set from the list length, so they should match
-            extrinsics_values = EXTRINSICS_HARDCODED
+        # Get extrinsics from metadata (already a 4x4 numpy array)
+        ext = metadata["extrinsics"]
+        ext_tensor = torch.from_numpy(ext).float()
         
-        extrinsics_list = []
-        camera_centers = []
-        camera_distances = []
-        viewing_directions = []
+        # Normalize the rotation matrix (3x3 upper-left block) to ensure it's valid
+        rotation = ext_tensor[:3, :3]
+        rotation_normalized = normalize_rotation_matrix(rotation)
+        ext_tensor[:3, :3] = rotation_normalized
         
-        for i, ext in enumerate(extrinsics_values):
-            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
-            
-            if isinstance(ext, np.ndarray):
-                ext_tensor = torch.from_numpy(ext).float()
-            elif isinstance(ext, torch.Tensor):
-                ext_tensor = ext.float()
-            else:
-                raise TypeError(f"Extrinsic {i} ({img_name}) must be numpy array or torch tensor, got {type(ext)}")
-            
-            if ext_tensor.shape != (4, 4):
-                raise ValueError(f"Extrinsic {i} ({img_name}) must be 4x4 matrix, got shape {ext_tensor.shape}")
-            
-            # Normalize the rotation matrix (3x3 upper-left block) to ensure it's valid
-            rotation = ext_tensor[:3, :3]
-            rotation_normalized = normalize_rotation_matrix(rotation)
-            ext_tensor[:3, :3] = rotation_normalized
-            
-            # Check determinant for validation
-            det = torch.det(rotation_normalized)
-            if not torch.allclose(det, torch.tensor(1.0), atol=1e-5):
-                print(f"  WARNING: View {i} ({img_name}) rotation matrix determinant after normalization: {det.item():.6f} (should be 1.0)")
-            
-            # Extract camera center (translation part of C2W matrix)
-            camera_center = ext_tensor[:3, 3]
-            camera_centers.append(camera_center)
-            camera_distances.append(torch.norm(camera_center).item())
-            
-            # Extract viewing direction (camera looks down +Z in camera space)
-            # In C2W matrix, the third column of rotation is the camera's +Z axis in world space
-            view_dir = rotation_normalized[:, 2]  # Camera's forward direction in world coordinates
-            viewing_directions.append(view_dir)
-            
-            extrinsics_list.append(ext_tensor)
+        # Check determinant for validation
+        det = torch.det(rotation_normalized)
+        if not torch.allclose(det, torch.tensor(1.0), atol=1e-5):
+            print(f"  WARNING: View {i} ({img_name}) rotation matrix determinant after normalization: {det.item():.6f} (should be 1.0)")
         
-        extrinsics = torch.stack(extrinsics_list, dim=0).unsqueeze(0)  # [1, num_views, 4, 4]
+        # Extract camera center (translation part of C2W matrix)
+        camera_center = ext_tensor[:3, 3]
+        camera_centers.append(camera_center)
+        camera_distances.append(torch.norm(camera_center).item())
         
-        # Print detailed extrinsics information
-        print(f"\n  Extrinsics Validation:")
-        print(f"    Camera positions (world coordinates):")
-        for i, center in enumerate(camera_centers):
-            dist = camera_distances[i]
-            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
-            print(f"      View {i} ({img_name}): [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}] (distance from origin: {dist:.3f})")
+        # Extract viewing direction (camera looks down +Z in camera space)
+        # In C2W matrix, the third column of rotation is the camera's +Z axis in world space
+        view_dir = rotation_normalized[:, 2]  # Camera's forward direction in world coordinates
+        viewing_directions.append(view_dir)
         
-        print(f"\n    Viewing directions (camera forward in world coordinates):")
-        for i, view_dir in enumerate(viewing_directions):
-            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
-            print(f"      View {i} ({img_name}): [{view_dir[0]:.3f}, {view_dir[1]:.3f}, {view_dir[2]:.3f}]")
-        
-        # Check camera distances consistency
-        if len(set([round(d, 1) for d in camera_distances])) > 1:
-            print(f"\n    WARNING: Camera distances vary significantly:")
-            for i, dist in enumerate(camera_distances):
-                img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
-                print(f"      View {i} ({img_name}): {dist:.3f}")
-            print(f"    This may indicate cameras are at different distances from the scene.")
-        
-        # Check if cameras are too close or too far
-        avg_distance = sum(camera_distances) / len(camera_distances)
-        if avg_distance < 0.01:
-            print(f"\n    WARNING: Cameras are very close to origin (avg distance: {avg_distance:.3f})")
-            print(f"    This may cause numerical issues. Consider scaling the scene.")
-        elif avg_distance > 1000:
-            print(f"\n    WARNING: Cameras are very far from origin (avg distance: {avg_distance:.3f})")
-            print(f"    This may cause precision issues. Consider scaling the scene.")
-        
-        # Check baseline (distance between cameras)
+        extrinsics_list.append(ext_tensor)
+    
+    extrinsics = torch.stack(extrinsics_list, dim=0).unsqueeze(0)  # [1, num_views, 4, 4]
+    
+    # Print detailed extrinsics information
+    print(f"\n  Extrinsics Validation:")
+    print(f"    Camera positions (world coordinates):")
+    for i, center in enumerate(camera_centers):
+        dist = camera_distances[i]
+        img_name = image_filenames[i]
+        print(f"      View {i} ({img_name}): [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}] (distance from origin: {dist:.3f})")
+    
+    print(f"\n    Viewing directions (camera forward in world coordinates):")
+    for i, view_dir in enumerate(viewing_directions):
+        img_name = image_filenames[i]
+        print(f"      View {i} ({img_name}): [{view_dir[0]:.3f}, {view_dir[1]:.3f}, {view_dir[2]:.3f}]")
+    
+    # Check camera distances consistency
+    if len(set([round(d, 1) for d in camera_distances])) > 1:
+        print(f"\n    NOTE: Camera distances vary:")
+        for i, dist in enumerate(camera_distances):
+            img_name = image_filenames[i]
+            print(f"      View {i} ({img_name}): {dist:.3f}")
+    
+    # Check if cameras are too close or too far
+    avg_distance = sum(camera_distances) / len(camera_distances)
+    if avg_distance < 0.01:
+        print(f"\n    WARNING: Cameras are very close to origin (avg distance: {avg_distance:.3f})")
+        print(f"    This may cause numerical issues. Consider scaling the scene.")
+    elif avg_distance > 1000:
+        print(f"\n    WARNING: Cameras are very far from origin (avg distance: {avg_distance:.3f})")
+        print(f"    This may cause precision issues. Consider scaling the scene.")
+    
+    # Check baseline (distance between cameras) if we have multiple views
+    if num_views > 1:
         print(f"\n    Camera baselines (distances between camera centers):")
         for i in range(len(camera_centers)):
             for j in range(i + 1, len(camera_centers)):
                 baseline = torch.norm(camera_centers[i] - camera_centers[j]).item()
-                img_name_i = image_filenames[i] if i < len(image_filenames) else f"View {i}"
-                img_name_j = image_filenames[j] if j < len(image_filenames) else f"View {j}"
+                img_name_i = image_filenames[i]
+                img_name_j = image_filenames[j]
                 print(f"      View {i} ({img_name_i}) <-> View {j} ({img_name_j}): {baseline:.3f}")
         
         # Check viewing angles between cameras
@@ -466,159 +482,102 @@ def main():
             for j in range(i + 1, len(viewing_directions)):
                 angle_rad = torch.acos(torch.clamp(torch.dot(viewing_directions[i], viewing_directions[j]), -1.0, 1.0))
                 angle_deg = angle_rad * 180 / math.pi
-                img_name_i = image_filenames[i] if i < len(image_filenames) else f"View {i}"
-                img_name_j = image_filenames[j] if j < len(image_filenames) else f"View {j}"
+                img_name_i = image_filenames[i]
+                img_name_j = image_filenames[j]
                 print(f"      View {i} ({img_name_i}) <-> View {j} ({img_name_j}): {angle_deg:.1f}°")
-        
-        # Print full extrinsic matrices
-        print(f"\n    Full extrinsic matrices (C2W):")
-        for i, ext in enumerate(extrinsics_list):
-            img_name = image_filenames[i] if i < len(image_filenames) else f"View {i}"
-            print(f"      View {i} ({img_name}):")
-            ext_np = ext.numpy()
-            for row in ext_np:
-                print(f"        [{row[0]:8.4f}, {row[1]:8.4f}, {row[2]:8.4f}, {row[3]:8.4f}]")
-    else:
-        # Compute camera poses (default behavior)
-        # View 0: 90 degrees to the left
-        # View 1: Head-on (center)
-        # View 2: 90 degrees to the right
-        print("  Computing camera poses from rotations and translations")
-        camera_distance = 0.1  # Distance from origin (0 = at origin)
+    
+    # Print full extrinsic matrices
+    print(f"\n    Full extrinsic matrices (C2W):")
+    for i, ext in enumerate(extrinsics_list):
+        img_name = image_filenames[i]
+        print(f"      View {i} ({img_name}):")
+        ext_np = ext.numpy()
+        for row in ext_np:
+            print(f"        [{row[0]:8.4f}, {row[1]:8.4f}, {row[2]:8.4f}, {row[3]:8.4f}]")
 
-        # View 0: Left 90° (camera looks down -X axis)
-        rotation_left = create_rotation_matrix_y(90.0)
-        translation_left = torch.tensor([camera_distance, 0.0, 0.0], dtype=torch.float32)
-        pose_left = create_camera_pose(rotation_left, translation_left)
-
-        # View 1: Head-on (camera looks down +Z axis) - identity rotation
-        rotation_center = torch.eye(3, dtype=torch.float32)
-        translation_center = torch.tensor([0.0, 0.0, camera_distance], dtype=torch.float32)
-        pose_center = create_camera_pose(rotation_center, translation_center)
-
-        # View 2: Right 90° (camera looks down +X axis)
-        rotation_right = create_rotation_matrix_y(-90.0)
-        translation_right = torch.tensor([-camera_distance, 0.0, 0.0], dtype=torch.float32)
-        pose_right = create_camera_pose(rotation_right, translation_right)
-
-        # Stack all poses
-        extrinsics = torch.stack([pose_left, pose_center, pose_right], dim=0).unsqueeze(0)  # [1, 3, 4, 4]
-
-        # Extract camera centers and viewing directions for validation
-        for i in range(num_views):
-            pose = extrinsics[0, i]
-            camera_center = pose[:3, 3]
-            camera_centers.append(camera_center)
-            camera_distances.append(torch.norm(camera_center).item())
-            view_dir = pose[:3, 2]  # Camera's forward direction
-            viewing_directions.append(view_dir)
-
-        print(f"  View 0 (Left 90°):\n{extrinsics[0, 0]}")
-        print(f"  View 1 (Head-on):\n{extrinsics[0, 1]}")
-        print(f"  View 2 (Right 90°):\n{extrinsics[0, 2]}")
-        
-        # Print camera positions for default case
-        print(f"\n  Camera positions (world coordinates):")
-        for i, center in enumerate(camera_centers):
-            dist = camera_distances[i]
-            print(f"    View {i}: [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}] (distance from origin: {dist:.3f})")
-
-    # Set up intrinsics
+    # Set up intrinsics from metadata
     print("\n" + "="*70)
-    print("Setting Up Camera Intrinsics")
+    print("Setting Up Camera Intrinsics from Metadata")
     print("="*70)
     
-    # IMPORTANT: Check if image dimensions match COLMAP reconstruction
-    print(f"  Current image dimensions: width={width}, height={height}")
+    print(f"  Target inference dimensions: width={width}, height={height}")
     
-    intrinsics = torch.eye(3, dtype=torch.float32).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_views, 1, 1)
+    # Process intrinsics for each view
+    intrinsics_list = []
     
-    if INTRINSICS_HARDCODED is not None:
-        # Use hardcoded intrinsics
-        print("  Using hardcoded intrinsics (before normalization)")
-        if len(INTRINSICS_HARDCODED) != 4:
-            raise ValueError(f"INTRINSICS_HARDCODED must contain exactly 4 values [fx, fy, cx, cy], got {len(INTRINSICS_HARDCODED)}")
+    for i, metadata in enumerate(metadata_list):
+        img_name = image_filenames[i]
         
-        fx, fy, cx, cy = INTRINSICS_HARDCODED
+        # Get intrinsics from metadata (3x3 numpy array)
+        K = metadata["intrinsics"]
         
-        # Auto-detect if dimensions might be wrong based on principal point
+        # Extract focal lengths and principal point from metadata
+        # Intrinsics are for the original image size in metadata
+        original_width = metadata["image_width"]
+        original_height = metadata["image_height"]
+        
+        fx_orig = float(K[0, 0])
+        fy_orig = float(K[1, 1])
+        cx_orig = float(K[0, 2])
+        cy_orig = float(K[1, 2])
+        
+        print(f"\n  View {i} ({img_name}):")
+        print(f"    Original image size: {original_width}x{original_height}")
+        print(f"    Original intrinsics: fx={fx_orig:.2f}, fy={fy_orig:.2f}, cx={cx_orig:.2f}, cy={cy_orig:.2f}")
+        
+        # Scale intrinsics to match resized image dimensions
+        # Focal lengths scale proportionally with image dimensions
+        # Principal point also scales proportionally
+        scale_x = width / original_width
+        scale_y = height / original_height
+        
+        fx = fx_orig * scale_x
+        fy = fy_orig * scale_y
+        cx = cx_orig * scale_x
+        cy = cy_orig * scale_y
+        
+        print(f"    Scaled to {width}x{height}: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+        
+        # Validate scaled intrinsics
         cx_expected = width / 2.0
         cy_expected = height / 2.0
         cx_offset = abs(cx - cx_expected) / width if width > 0 else 0
         cy_offset = abs(cy - cy_expected) / height if height > 0 else 0
         
-        # If principal point is far from center, suggest correct dimensions
         if cx_offset > 0.15 or cy_offset > 0.15:
-            print(f"  ⚠️  WARNING: Principal point suggests dimension mismatch!")
-            print(f"      Principal point: cx={cx:.1f}, cy={cy:.1f}")
-            print(f"      Expected center: cx={cx_expected:.1f}, cy={cy_expected:.1f}")
-            
-            # Infer correct dimensions
-            inferred_width = int(cx * 2) if cx > 0 else width
-            inferred_height = int(cy * 2) if cy > 0 else height
-            
-            if abs(cx - inferred_width/2) < abs(cx - cx_expected) or abs(cy - inferred_height/2) < abs(cy - cy_expected):
-                print(f"      Suggested dimensions: width={inferred_width}, height={inferred_height}")
-                print(f"      Update inference.py: height, width = {inferred_height}, {inferred_width}")
-        else:
-            print(f"  ✓ Principal point is near center - dimensions appear correct")
+            print(f"    ⚠️  WARNING: Principal point far from center!")
+            print(f"        Principal point: cx={cx:.1f}, cy={cy:.1f}")
+            print(f"        Expected center: cx={cx_expected:.1f}, cy={cy_expected:.1f}")
         
-        print(f"\n  Raw intrinsics (pixels): fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+        # Create normalized intrinsics matrix for this view
+        K_normalized = torch.eye(3, dtype=torch.float32)
+        K_normalized[0, 0] = fx / width   # fx normalized
+        K_normalized[1, 1] = fy / height  # fy normalized
+        K_normalized[0, 2] = cx / width   # cx normalized
+        K_normalized[1, 2] = cy / height  # cy normalized
         
-        # Validate intrinsics values
-        print(f"\n  Intrinsics Validation:")
-        print(f"    Focal length fx: {fx:.2f} pixels (typical range: 100-5000)")
-        print(f"    Focal length fy: {fy:.2f} pixels (typical range: 100-5000)")
-        print(f"    Principal point cx: {cx:.2f} pixels (expected center: {cx_expected:.1f})")
-        print(f"    Principal point cy: {cy:.2f} pixels (expected center: {cy_expected:.1f})")
+        intrinsics_list.append(K_normalized)
         
-        # Additional warnings if still off-center (redundant but useful for clarity)
-        if cx_offset > 0.1:
-            print(f"    WARNING: cx is {cx_offset*100:.1f}% off from center (expected ~{cx_expected:.1f})")
-        if cy_offset > 0.1:
-            print(f"    WARNING: cy is {cy_offset*100:.1f}% off from center (expected ~{cy_expected:.1f})")
+        print(f"    Normalized: fx={fx/width:.6f}, fy={fy/height:.6f}, cx={cx/width:.6f}, cy={cy/height:.6f}")
+    
+    # Stack all intrinsics: [num_views, 3, 3] -> [1, num_views, 3, 3]
+    intrinsics = torch.stack(intrinsics_list, dim=0).unsqueeze(0)
+    
+    # Compute and validate Field of View for each view
+    print(f"\n  Field of View (FOV) for each view:")
+    for i in range(num_views):
+        img_name = image_filenames[i]
+        fov = get_fov(intrinsics[0, i:i+1])  # Get FOV for this view
+        fov_deg = fov * 180 / math.pi
+        print(f"    View {i} ({img_name}):")
+        print(f"      Horizontal FOV: {fov_deg[0, 0]:.2f}°")
+        print(f"      Vertical FOV: {fov_deg[0, 1]:.2f}°")
         
-        # Check focal length ratio (should be close to 1 for most cameras)
-        if abs(fx - fy) / max(fx, fy) > 0.1:
-            print(f"    WARNING: fx and fy differ by {(abs(fx-fy)/max(fx,fy)*100):.1f}% (may indicate distortion)")
-    else:
-        # Use computed intrinsics (default behavior)
-        print("  Computing intrinsics from default values")
-        # from colmap: 1152 focal length
-        fx, fy = 1152.0, 1152.0  # Focal length in pixels
-        cx, cy = width / 2.0, height / 2.0  # Principal point at center (480, 256)
-        print(f"  Raw intrinsics (pixels): fx={fx}, fy={fy}, cx={cx}, cy={cy}")
-    
-    # Normalize intrinsics
-    intrinsics[:, :, 0, 0] = fx / width   # fx normalized
-    intrinsics[:, :, 1, 1] = fy / height  # fy normalized
-    intrinsics[:, :, 0, 2] = cx / width   # cx normalized
-    intrinsics[:, :, 1, 2] = cy / height  # cy normalized
-
-    print(f"\n  Normalized intrinsics matrix:")
-    print(f"    fx: {fx/width:.6f} (multiply by {width} to get {fx:.2f} pixels)")
-    print(f"    fy: {fy/height:.6f} (multiply by {height} to get {fy:.2f} pixels)")
-    print(f"    cx: {cx/width:.6f} (multiply by {width} to get {cx:.2f} pixels)")
-    print(f"    cy: {cy/height:.6f} (multiply by {height} to get {cy:.2f} pixels)")
-    
-    # Compute and validate Field of View
-    fov = get_fov(intrinsics[0, 0:1])  # Get FOV for first view
-    fov_deg = fov * 180 / math.pi
-    print(f"\n  Field of View (FOV):")
-    print(f"    Horizontal FOV: {fov_deg[0, 0]:.2f}°")
-    print(f"    Vertical FOV: {fov_deg[0, 1]:.2f}°")
-    
-    # Check if FOV is reasonable (typical range: 30-120 degrees)
-    if fov_deg[0, 0] < 20 or fov_deg[0, 0] > 150:
-        print(f"    WARNING: Horizontal FOV ({fov_deg[0, 0]:.2f}°) is outside typical range (20-150°)")
-    if fov_deg[0, 1] < 20 or fov_deg[0, 1] > 150:
-        print(f"    WARNING: Vertical FOV ({fov_deg[0, 1]:.2f}°) is outside typical range (20-150°)")
-    
-    # Print full intrinsic matrix for verification
-    print(f"\n  Full intrinsic matrix (3x3):")
-    K = intrinsics[0, 0].numpy()
-    for i in range(3):
-        print(f"    [{K[i,0]:8.6f}, {K[i,1]:8.6f}, {K[i,2]:8.6f}]")
+        # Check if FOV is reasonable (typical range: 30-120 degrees)
+        if fov_deg[0, 0] < 20 or fov_deg[0, 0] > 150:
+            print(f"      WARNING: Horizontal FOV ({fov_deg[0, 0]:.2f}°) is outside typical range (20-150°)")
+        if fov_deg[0, 1] < 20 or fov_deg[0, 1] > 150:
+            print(f"      WARNING: Vertical FOV ({fov_deg[0, 1]:.2f}°) is outside typical range (20-150°)")
 
     # Compute near and far planes dynamically based on camera baselines
     # This matches how datasets handle COLMAP coordinate system scale
@@ -796,65 +755,24 @@ def main():
     print("="*70)
     issues = []
     
-    # Check image dimensions match COLMAP
-    if INTRINSICS_HARDCODED is not None:
-        fx, fy, cx, cy = INTRINSICS_HARDCODED
-        # COLMAP stores cx, cy in pixel coordinates
-        # Typical values: cx ≈ width/2, cy ≈ height/2 for centered principal point
-        # If principal point is far from center, it might indicate:
-        # 1. Different image dimensions in COLMAP
-        # 2. Camera has offset principal point (less common)
-        cx_ratio = cx / width if width > 0 else 0
-        cy_ratio = cy / height if height > 0 else 0
-        
-        # Check if principal point is significantly off-center (more than 20% from center)
-        # This could indicate dimension mismatch or unusual camera calibration
-        cx_center_offset = abs(cx_ratio - 0.5)
-        cy_center_offset = abs(cy_ratio - 0.5)
-        
-        if cx_center_offset > 0.2 or cy_center_offset > 0.2:
-            # Principal point is far from center - could indicate dimension mismatch
-            # Try to infer COLMAP dimensions assuming principal point was centered
-            if cx_center_offset > 0.2:
-                inferred_colmap_width = cx * 2 if cx > 0 else width
-                issues.append(
-                    f"Principal point cx={cx:.1f} is {cx_center_offset*100:.1f}% off-center. "
-                    f"This suggests COLMAP may have used width ~{inferred_colmap_width:.0f} "
-                    f"(current: {width}). Check if COLMAP reconstruction used different image dimensions."
-                )
-            if cy_center_offset > 0.2:
-                inferred_colmap_height = cy * 2 if cy > 0 else height
-                issues.append(
-                    f"Principal point cy={cy:.1f} is {cy_center_offset*100:.1f}% off-center. "
-                    f"This suggests COLMAP may have used height ~{inferred_colmap_height:.0f} "
-                    f"(current: {height}). Check if COLMAP reconstruction used different image dimensions."
-                )
-        elif cx_center_offset > 0.1 or cy_center_offset > 0.1:
-            # Moderate offset - might be intentional (offset principal point) or dimension mismatch
-            issues.append(
-                f"Principal point is moderately off-center (cx offset: {cx_center_offset*100:.1f}%, "
-                f"cy offset: {cy_center_offset*100:.1f}%). This may be normal for your camera, "
-                f"or could indicate a dimension mismatch with COLMAP."
-            )
-    
     # Check coordinate system scale
-    # Note: COLMAP uses arbitrary scale, so we compute near/far dynamically
-    # This check is just for informational purposes
     if camera_distances:
         avg_dist = sum(camera_distances) / len(camera_distances)
         if avg_dist < 0.01:
             issues.append("Camera distances are very small - may cause numerical precision issues")
         if avg_dist > 1000:
             issues.append("Camera distances are very large - may cause numerical precision issues")
-        # Don't warn about scale mismatch since we compute near/far dynamically now
     
-    # Check FOV
-    if INTRINSICS_HARDCODED is not None:
+    # Check FOV for all views
+    for i in range(num_views):
+        img_name = image_filenames[i]
+        fov = get_fov(intrinsics[0, i:i+1])
+        fov_deg = fov * 180 / math.pi
         fov_h = fov_deg[0, 0].item()
         if fov_h < 30 or fov_h > 120:
-            issues.append(f"FOV ({fov_h:.1f}°) is outside typical range - may indicate incorrect intrinsics")
+            issues.append(f"View {i} ({img_name}): FOV ({fov_h:.1f}°) is outside typical range")
         elif fov_h < 20:
-            issues.append(f"FOV ({fov_h:.1f}°) is very narrow - may indicate telephoto lens or incorrect intrinsics")
+            issues.append(f"View {i} ({img_name}): FOV ({fov_h:.1f}°) is very narrow")
     
     if issues:
         print("  Potential issues found:")
