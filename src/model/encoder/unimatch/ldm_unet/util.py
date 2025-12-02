@@ -109,6 +109,10 @@ def checkpoint(func, inputs, params, flag):
                    explicitly take as arguments.
     :param flag: if False, disable gradient checkpointing.
     """
+    # Disable checkpointing during TorchScript tracing - CheckpointFunction.apply
+    # is incompatible with tracing and causes _Map_base::at errors
+    if torch.jit.is_tracing():
+        return func(*inputs)
     if flag:
         args = tuple(inputs) + tuple(params)
         return CheckpointFunction.apply(func, len(inputs), *args)
