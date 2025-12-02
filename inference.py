@@ -10,15 +10,15 @@ Input views: determined by EXTRINSICS_HARDCODED dictionary keys (image filenames
 # ============================================================================
 
 CHECKPOINT_PATH = "pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth"  # Set to None for random init
-CONFIG_ROOT = "/content/depthsplat/config"  # Path to config directory
-OUTPUT_DIR = "/content/drive/MyDrive/DepthSplat/run-output"
+CONFIG_ROOT = "config"  # Path to config directory
+OUTPUT_DIR = "run-output"
 
 # Base directory containing the images and metadata files
 # All .png and .jpg images in this directory will be processed
 # For each image, a corresponding *_metadata.json file must exist in the same directory
 # (e.g., for "dude_1.png", there must be "dude_1_metadata.json")
 # Camera intrinsics and extrinsics will be loaded from these metadata files.
-IMAGE_BASE_PATH = "/content/drive/MyDrive/DepthSplat/3_new_input"
+IMAGE_BASE_PATH = "input"
 
 # Encoder config overrides (set to None to use YAML defaults)
 ENCODER_OVERRIDES = {
