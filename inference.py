@@ -50,7 +50,7 @@ COREML_MODEL_OUTPUT_PATH = COREML_MODEL_OUPUT_PATH_BASE if USE_BASE_MODEL else C
 
 # Toggle detailed validation and diagnostics during PLY export.
 # Leave disabled for fastest export.
-PLY_EXPORT_VALIDATION = False
+PLY_EXPORT_VALIDATION = True
 
 # Torch compile / encoder benchmarking options
 # Set to True to compile the encoder with torch.compile for faster repeated inference.
@@ -72,6 +72,13 @@ NUM_ENCODER_RUNS = 1
 # Typical values: near_disparity=1.0-2.0, far_disparity=0.1-0.5
 NEAR_DISPARITY = 1.0   # Pixel disparity for near plane computation (close objects)
 FAR_DISPARITY = 0.1    # Pixel disparity for far plane computation (far objects)
+
+# Override near/far planes directly (bypasses automatic computation)
+# Set to None to use automatic computation based on camera baselines
+# Set to a float value to override for all views
+# Example: NEAR_OVERRIDE = 0.5, FAR_OVERRIDE = 200.0
+NEAR_OVERRIDE = None   # Override near plane value (None = use automatic computation)
+FAR_OVERRIDE = None    # Override far plane value (None = use automatic computation)
 
 # ============================================================================
 
@@ -668,7 +675,7 @@ onnx_model_name = "depthsplat_encoder.onnx"
 generate_onnx = False
 run_onnx = False
 generate_coreml = False
-run_coreml = True
+run_coreml = False
 coreml_minimal_outputs = True  # True => Gaussians + viz scales/rotations (skip depths)
 coreml_use_fp16_input = True   # Set True to use FP16 input (experimental, may reduce quality)
 ort_session = None
@@ -1179,123 +1186,185 @@ def run_encoder(
     # Compute near and far planes dynamically based on camera baselines
     # This matches how datasets handle COLMAP coordinate system scale
     # COLMAP uses arbitrary scale units, so we compute near/far relative to camera baselines
-    print(f"\n  Computing Near/Far Planes from Camera Baselines:")
+    print(f"\n  Computing Near/Far Planes:")
+    
+    # Initialize camera distance variables (used in validation later)
+    min_camera_dist = min(camera_distances) if camera_distances else 0
+    max_camera_dist = max(camera_distances) if camera_distances else 0
+    
+    # Check for manual overrides first
+    use_override = (NEAR_OVERRIDE is not None) or (FAR_OVERRIDE is not None)
+    
+    if use_override:
+        print(f"    Using manual override values (set NEAR_OVERRIDE/FAR_OVERRIDE at top of file):")
+        # Initialize with overrides or None
+        near = torch.ones(batch_size, num_views, dtype=torch.float32) * NEAR_OVERRIDE if NEAR_OVERRIDE is not None else None
+        far = torch.ones(batch_size, num_views, dtype=torch.float32) * FAR_OVERRIDE if FAR_OVERRIDE is not None else None
+        
+        if NEAR_OVERRIDE is not None:
+            print(f"      Near plane (override): {NEAR_OVERRIDE:.6f}")
+        if FAR_OVERRIDE is not None:
+            print(f"      Far plane (override): {FAR_OVERRIDE:.6f}")
+        
+        # If both are overridden, validate and skip computation
+        if NEAR_OVERRIDE is not None and FAR_OVERRIDE is not None:
+            print(f"    Both near and far are overridden - skipping automatic computation")
+            # Validate that far > near
+            if far[0, 0].item() <= near[0, 0].item():
+                raise ValueError(
+                    f"FAR_OVERRIDE ({FAR_OVERRIDE:.6f}) must be greater than NEAR_OVERRIDE ({NEAR_OVERRIDE:.6f})"
+                )
+            print(f"    Near/far ratio: {far[0, 0].item() / near[0, 0].item():.1f}x")
+            
+            # Print validation info for override case
+            print(f"\n    Validation (override mode):")
+            print(f"      Camera distances from origin: min={min_camera_dist:.3f}, max={max_camera_dist:.3f}")
+            print(f"      Near/far ratio: {far[0, 0].item() / near[0, 0].item():.1f}x")
+        else:
+            # One is overridden, need to compute the other
+            print(f"    Computing remaining value from camera baselines...")
+            # Will compute below, but need to handle the case where we can't compute
+            if not (camera_centers and len(camera_centers) >= 2):
+                # Can't compute, use fallback for the non-overridden value
+                if near is None:
+                    near = torch.ones(batch_size, num_views, dtype=torch.float32) * 0.1
+                    print(f"    Using fallback near plane: 0.1 (cannot compute from baselines)")
+                if far is None:
+                    far = torch.ones(batch_size, num_views, dtype=torch.float32) * 100.0
+                    print(f"    Using fallback far plane: 100.0 (cannot compute from baselines)")
+    
+    # Compute non-overridden values (or both if no overrides)
     if camera_centers and len(camera_centers) >= 2:
-        # Convert to torch tensors for computation (they should already be torch tensors)
-        extrinsics_tensor = extrinsics  # Already a torch tensor [1, num_views, 4, 4]
-        intrinsics_tensor = intrinsics  # Already a torch tensor [1, num_views, 3, 3]
-        
-        # Use disparity values to compute near/far planes
-        # These are configurable at the top of the file (NEAR_DISPARITY, FAR_DISPARITY)
-        # Smaller disparity = farther depth, larger disparity = closer depth
-        near_disparity = NEAR_DISPARITY
-        far_disparity = FAR_DISPARITY
-        
-        print(f"    Computing based on camera baselines...")
-        print(f"    Using disparity values: near={near_disparity}px, far={far_disparity}px")
-        
-        near_computed = compute_depth_for_disparity(
-            extrinsics_tensor,
-            intrinsics_tensor,
-            (height, width),
-            near_disparity,
-        )
-        far_computed = compute_depth_for_disparity(
-            extrinsics_tensor,
-            intrinsics_tensor,
-            (height, width),
-            far_disparity,
-        )
-        
-        print(f"    ✓ Computed near plane: {near_computed[0].item():.6f} (from {near_disparity}px disparity)")
-        print(f"    ✓ Computed far plane: {far_computed[0].item():.6f} (from {far_disparity}px disparity)")
-        
-        # Compute camera baselines for validation and fallback
-        origins = extrinsics_tensor[:, :, :3, 3]  # [batch, views, 3]
-        deltas = (origins[:, None, :, :] - origins[:, :, None, :]).norm(dim=-1)  # [batch, views, views]
-        max_baseline = deltas.max().item()
-        # Get minimum baseline (excluding self-distances which are 0)
-        deltas_positive = deltas[deltas > 1e-6]
-        min_baseline = deltas_positive.min().item() if len(deltas_positive) > 0 else max_baseline
-        
-        # Check if computed values are reasonable relative to baselines
-        # If computed near/far are > 100x the baseline, they're likely incorrect
-        # This can happen with narrow FOV cameras where pixel disparity computation doesn't work well
-        use_computed = True
-        if near_computed[0].item() > 100 * max_baseline:
-            print(f"    WARNING: Computed near plane ({near_computed[0].item():.1f}) is > 100x max baseline ({max_baseline:.3f})")
-            print(f"    This often happens with narrow FOV cameras. Using baseline-based fallback.")
-            use_computed = False
-        
-        if far_computed[0].item() > 1000 * max_baseline:
-            print(f"    WARNING: Computed far plane ({far_computed[0].item():.1f}) is > 1000x max baseline ({max_baseline:.3f})")
-            if use_computed:
+        # If both are overridden, skip computation entirely
+        if NEAR_OVERRIDE is not None and FAR_OVERRIDE is not None:
+            pass  # Already set above, skip computation
+        else:
+            # Convert to torch tensors for computation (they should already be torch tensors)
+            extrinsics_tensor = extrinsics  # Already a torch tensor [1, num_views, 4, 4]
+            intrinsics_tensor = intrinsics  # Already a torch tensor [1, num_views, 3, 3]
+            
+            # Use disparity values to compute near/far planes
+            # These are configurable at the top of the file (NEAR_DISPARITY, FAR_DISPARITY)
+            # Smaller disparity = farther depth, larger disparity = closer depth
+            near_disparity = NEAR_DISPARITY
+            far_disparity = FAR_DISPARITY
+            
+            print(f"    Computing based on camera baselines...")
+            print(f"    Using disparity values: near={near_disparity}px, far={far_disparity}px")
+            
+            near_computed = compute_depth_for_disparity(
+                extrinsics_tensor,
+                intrinsics_tensor,
+                (height, width),
+                near_disparity,
+            )
+            far_computed = compute_depth_for_disparity(
+                extrinsics_tensor,
+                intrinsics_tensor,
+                (height, width),
+                far_disparity,
+            )
+            
+            print(f"    ✓ Computed near plane: {near_computed[0].item():.6f} (from {near_disparity}px disparity)")
+            print(f"    ✓ Computed far plane: {far_computed[0].item():.6f} (from {far_disparity}px disparity)")
+            
+            # Compute camera baselines for validation and fallback
+            origins = extrinsics_tensor[:, :, :3, 3]  # [batch, views, 3]
+            deltas = (origins[:, None, :, :] - origins[:, :, None, :]).norm(dim=-1)  # [batch, views, views]
+            max_baseline = deltas.max().item()
+            # Get minimum baseline (excluding self-distances which are 0)
+            deltas_positive = deltas[deltas > 1e-6]
+            min_baseline = deltas_positive.min().item() if len(deltas_positive) > 0 else max_baseline
+            
+            # Check if computed values are reasonable relative to baselines
+            # If computed near/far are > 100x the baseline, they're likely incorrect
+            # This can happen with narrow FOV cameras where pixel disparity computation doesn't work well
+            use_computed = True
+            if near_computed[0].item() > 100 * max_baseline:
+                print(f"    WARNING: Computed near plane ({near_computed[0].item():.1f}) is > 100x max baseline ({max_baseline:.3f})")
                 print(f"    This often happens with narrow FOV cameras. Using baseline-based fallback.")
-            use_computed = False
-        
-        # Validate computed values
-        near_valid = (near_computed[0].item() > 0 and 
-                     not torch.isnan(near_computed[0]) and 
-                     not torch.isinf(near_computed[0]))
-        
-        far_valid = (far_computed[0].item() > 0 and 
-                    not torch.isnan(far_computed[0]) and 
-                    not torch.isinf(far_computed[0]))
-        
-        if not near_valid or not use_computed:
-            # Use baseline-based fallback with scene-aware scaling
-            # Model was trained on DL3DV (near=0.5, far=200) and RE10K (baseline-scaled)
-            # Use 0.5x min_baseline to ensure we capture nearby scene content
-            # This is more conservative than 0.2x and better matches training data
-            near_fallback = max(0.5, 0.5 * min_baseline)
-            # Also ensure near is at least 0.1x the minimum camera distance
-            # This helps when scene content is close to cameras
-            if camera_distances:
-                min_camera_dist = min(camera_distances)
-                near_fallback = max(near_fallback, 0.1 * min_camera_dist)
-            print(f"    Using baseline-based near plane: {near_fallback:.6f}")
-            print(f"      (0.5x min_baseline={min_baseline:.3f}, or 0.1x min_camera_dist, min=0.5)")
-            near = torch.ones(batch_size, num_views, dtype=torch.float32) * near_fallback
-        else:
-            near = near_computed.unsqueeze(1).repeat(1, num_views)  # [batch, views]
-        
-        # Validate far plane (must be > near plane)
-        if not far_valid or not use_computed:
-            # Use baseline-based fallback with more reasonable scaling
-            # Model was trained with far=200.0 (DL3DV) or baseline-scaled (RE10K)
-            # Use 15x max_baseline for better depth resolution than 50x
-            # This gives near/far ratio of ~30-100x, similar to training data
-            far_fallback = 15.0 * max_baseline
-            # Cap at 200.0 (same as DL3DV training data) to match model expectations
-            far_fallback = min(200.0, far_fallback)
-            # Also ensure far is at least 5x the maximum camera distance
-            # This ensures we capture scene content beyond camera positions
-            if camera_distances:
-                max_camera_dist = max(camera_distances)
-                far_fallback = max(far_fallback, 5.0 * max_camera_dist)
-            print(f"    Using baseline-based far plane: {far_fallback:.6f}")
-            print(f"      (15x max_baseline={max_baseline:.3f}, or 5x max_camera_dist, capped at 200.0)")
-            far = torch.ones(batch_size, num_views, dtype=torch.float32) * far_fallback
-        elif far_computed[0].item() <= near[0, 0].item():
-            print(f"    WARNING: Computed far plane ({far_computed[0].item():.6f}) <= near plane ({near[0, 0].item():.6f})")
-            far_fallback = 15.0 * max_baseline
-            far_fallback = min(200.0, far_fallback)
-            if camera_distances:
-                max_camera_dist = max(camera_distances)
-                far_fallback = max(far_fallback, 5.0 * max_camera_dist)
-            print(f"    Using baseline-based far plane: {far_fallback:.6f}")
-            far = torch.ones(batch_size, num_views, dtype=torch.float32) * far_fallback
-        else:
-            far = far_computed.unsqueeze(1).repeat(1, num_views)   # [batch, views]
-        
-        # Additional validation
-        min_camera_dist = min(camera_distances) if camera_distances else 0
-        max_camera_dist = max(camera_distances) if camera_distances else 0
-        
-        print(f"\n    Validation:")
-        print(f"      Max baseline: {max_baseline:.3f}, Min baseline: {min_baseline:.3f}")
-        print(f"      Camera distances from origin: min={min_camera_dist:.3f}, max={max_camera_dist:.3f}")
-        print(f"      Near/far ratio: {far[0, 0].item() / near[0, 0].item():.1f}x")
+                use_computed = False
+            
+            if far_computed[0].item() > 1000 * max_baseline:
+                print(f"    WARNING: Computed far plane ({far_computed[0].item():.1f}) is > 1000x max baseline ({max_baseline:.3f})")
+                if use_computed:
+                    print(f"    This often happens with narrow FOV cameras. Using baseline-based fallback.")
+                use_computed = False
+            
+            # Validate computed values
+            near_valid = (near_computed[0].item() > 0 and 
+                         not torch.isnan(near_computed[0]) and 
+                         not torch.isinf(near_computed[0]))
+            
+            far_valid = (far_computed[0].item() > 0 and 
+                        not torch.isnan(far_computed[0]) and 
+                        not torch.isinf(far_computed[0]))
+            
+            # Compute near plane (only if not overridden)
+            if NEAR_OVERRIDE is None:
+                if not near_valid or not use_computed:
+                    # Use baseline-based fallback with scene-aware scaling
+                    # Model was trained on DL3DV (near=0.5, far=200) and RE10K (baseline-scaled)
+                    # Use 0.5x min_baseline to ensure we capture nearby scene content
+                    # This is more conservative than 0.2x and better matches training data
+                    near_fallback = max(0.5, 0.5 * min_baseline)
+                    # Also ensure near is at least 0.1x the minimum camera distance
+                    # This helps when scene content is close to cameras
+                    if camera_distances:
+                        min_camera_dist = min(camera_distances)
+                        near_fallback = max(near_fallback, 0.1 * min_camera_dist)
+                    print(f"    Using baseline-based near plane: {near_fallback:.6f}")
+                    print(f"      (0.5x min_baseline={min_baseline:.3f}, or 0.1x min_camera_dist, min=0.5)")
+                    near = torch.ones(batch_size, num_views, dtype=torch.float32) * near_fallback
+                else:
+                    near = near_computed.unsqueeze(1).repeat(1, num_views)  # [batch, views]
+            
+            # Compute far plane (only if not overridden)
+            if FAR_OVERRIDE is None:
+                # Get current near value (either overridden or computed)
+                current_near = near[0, 0].item() if near is not None else near_computed[0].item()
+                
+                # Validate far plane (must be > near plane)
+                if not far_valid or not use_computed:
+                    # Use baseline-based fallback with more reasonable scaling
+                    # Model was trained with far=200.0 (DL3DV) or baseline-scaled (RE10K)
+                    # Use 15x max_baseline for better depth resolution than 50x
+                    # This gives near/far ratio of ~30-100x, similar to training data
+                    far_fallback = 15.0 * max_baseline
+                    # Cap at 200.0 (same as DL3DV training data) to match model expectations
+                    far_fallback = min(200.0, far_fallback)
+                    # Also ensure far is at least 5x the maximum camera distance
+                    # This ensures we capture scene content beyond camera positions
+                    if camera_distances:
+                        max_camera_dist = max(camera_distances)
+                        far_fallback = max(far_fallback, 5.0 * max_camera_dist)
+                    # Ensure far > near
+                    far_fallback = max(far_fallback, current_near * 1.1)  # At least 10% larger than near
+                    print(f"    Using baseline-based far plane: {far_fallback:.6f}")
+                    print(f"      (15x max_baseline={max_baseline:.3f}, or 5x max_camera_dist, capped at 200.0)")
+                    far = torch.ones(batch_size, num_views, dtype=torch.float32) * far_fallback
+                elif far_computed[0].item() <= current_near:
+                    print(f"    WARNING: Computed far plane ({far_computed[0].item():.6f}) <= near plane ({current_near:.6f})")
+                    far_fallback = 15.0 * max_baseline
+                    far_fallback = min(200.0, far_fallback)
+                    if camera_distances:
+                        max_camera_dist = max(camera_distances)
+                        far_fallback = max(far_fallback, 5.0 * max_camera_dist)
+                    # Ensure far > near
+                    far_fallback = max(far_fallback, current_near * 1.1)
+                    print(f"    Using baseline-based far plane: {far_fallback:.6f}")
+                    far = torch.ones(batch_size, num_views, dtype=torch.float32) * far_fallback
+                else:
+                    far = far_computed.unsqueeze(1).repeat(1, num_views)   # [batch, views]
+            
+            # Additional validation
+            min_camera_dist = min(camera_distances) if camera_distances else 0
+            max_camera_dist = max(camera_distances) if camera_distances else 0
+            
+            print(f"\n    Validation:")
+            print(f"      Max baseline: {max_baseline:.3f}, Min baseline: {min_baseline:.3f}")
+            print(f"      Camera distances from origin: min={min_camera_dist:.3f}, max={max_camera_dist:.3f}")
+            print(f"      Near/far ratio: {far[0, 0].item() / near[0, 0].item():.1f}x")
         
         if near[0, 0].item() > min_camera_dist:
             print(f"      NOTE: Near plane ({near[0, 0].item():.3f}) > min camera distance ({min_camera_dist:.3f})")
@@ -1304,12 +1373,29 @@ def run_encoder(
             print(f"      WARNING: Far plane ({far[0, 0].item():.3f}) may be too small relative to camera distance")
             print(f"      Consider that objects might be further than {far[0, 0].item():.3f} units from cameras")
     else:
-        # Fallback to fixed values if we can't compute
+        # Fallback to fixed values if we can't compute (only if not overridden)
         print(f"    Cannot compute from baselines (need at least 2 cameras with valid extrinsics)")
-        print(f"    Using fixed values: near=0.1, far=100.0")
-        print(f"    WARNING: These fixed values may not match your COLMAP coordinate system scale!")
-        near = torch.ones(batch_size, num_views, dtype=torch.float32) * 0.1
-        far = torch.ones(batch_size, num_views, dtype=torch.float32) * 100.0
+        if NEAR_OVERRIDE is None:
+            print(f"    Using fixed near value: 0.1")
+            print(f"    WARNING: This fixed value may not match your COLMAP coordinate system scale!")
+            near = torch.ones(batch_size, num_views, dtype=torch.float32) * 0.1
+        else:
+            print(f"    Using overridden near value: {NEAR_OVERRIDE:.6f}")
+            near = torch.ones(batch_size, num_views, dtype=torch.float32) * NEAR_OVERRIDE
+        
+        if FAR_OVERRIDE is None:
+            print(f"    Using fixed far value: 100.0")
+            print(f"    WARNING: This fixed value may not match your COLMAP coordinate system scale!")
+            far = torch.ones(batch_size, num_views, dtype=torch.float32) * 100.0
+        else:
+            print(f"    Using overridden far value: {FAR_OVERRIDE:.6f}")
+            far = torch.ones(batch_size, num_views, dtype=torch.float32) * FAR_OVERRIDE
+        
+        # Validate that far > near
+        if far[0, 0].item() <= near[0, 0].item():
+            raise ValueError(
+                f"Far plane ({far[0, 0].item():.6f}) must be greater than near plane ({near[0, 0].item():.6f})"
+            )
 
     # Final validation before passing to encoder
     print("\n" + "="*70)
