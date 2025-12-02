@@ -41,8 +41,10 @@ TENSORRT_MODEL_PATH = "depthsplat_encoder_trt.ts"  # Path to save/load TensorRT 
 TENSORRT_ENGINE_PATH = "depthsplat_encoder.engine"  # Path for TensorRT engine (ONNX path)
 TENSORRT_ONNX_PATH = "depthsplat_encoder.onnx"  # Path for intermediate ONNX model
 TENSORRT_FP16 = True  # Use FP16 precision (faster, slightly less accurate)
-TENSORRT_USE_TORCH_COMPILE = False  # Use torch.compile instead (PyTorch 2.0+)
-TENSORRT_USE_ONNX = True  # Use ONNX->TensorRT path (more reliable for complex models)
+TENSORRT_USE_TORCH_COMPILE = True  # Use torch.compile instead (PyTorch 2.0+) - RECOMMENDED for this model
+TENSORRT_USE_ONNX = False  # ONNX export fails due to complex numbers in DINOv2
+TORCH_COMPILE_BACKEND = "inductor"  # Backend: "inductor" (default), "cudagraphs", or "tensorrt"
+TORCH_COMPILE_CACHE_DIR = ".torch_compile_cache"  # Directory to cache compiled models
 BENCHMARK_RUNS = 10  # Number of runs for benchmarking
 WARMUP_RUNS = 5  # Number of warmup runs before benchmarking
 
@@ -854,19 +856,27 @@ def compile_to_tensorrt_via_onnx(
 
 def compile_with_torch_compile(
     model: torch.nn.Module,
+    example_inputs: dict = None,
     backend: str = "inductor",
+    cache_dir: str = None,
 ) -> torch.nn.Module:
     """
     Compile a PyTorch model using torch.compile (PyTorch 2.0+).
-    This is more robust than TensorRT for complex models with xformers.
+    This is more robust than TensorRT/ONNX for complex models with complex number operations.
+    
+    The compilation is cached to disk, so subsequent runs will be faster.
     
     Args:
         model: PyTorch model to compile
-        backend: Compilation backend ("inductor", "cudagraphs", etc.)
+        example_inputs: Example inputs to trigger compilation (for warmup)
+        backend: Compilation backend ("inductor", "cudagraphs", "tensorrt")
+        cache_dir: Directory to cache compiled kernels (enables persistence)
         
     Returns:
         Compiled model
     """
+    import os
+    
     print("\n" + "="*70)
     print("Compiling Model with torch.compile")
     print("="*70)
@@ -882,17 +892,54 @@ def compile_with_torch_compile(
             print("  Falling back to standard PyTorch")
             return None
         
-        print("  Compiling model (first run will be slower)...")
+        # Enable kernel caching for persistence across runs
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+            os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+            print(f"  Cache directory: {cache_dir}")
+            print("  Compiled kernels will be cached for faster subsequent runs")
+        
+        print("  Compiling model...")
+        print("  (First compilation may take several minutes, but will be cached)")
         
         # Compile the model
         compiled_model = torch.compile(
             model,
             backend=backend,
             mode="max-autotune",  # Optimize for performance
+            fullgraph=False,  # Allow graph breaks for complex models
         )
         
+        # Run warmup to trigger actual compilation
+        if example_inputs is not None:
+            print("  Running warmup inference to trigger compilation...")
+            with torch.no_grad():
+                try:
+                    # Create context for the encoder
+                    context = {
+                        "image": example_inputs["image"],
+                        "extrinsics": example_inputs["extrinsics"],
+                        "intrinsics": example_inputs["intrinsics"],
+                        "near": example_inputs["near"],
+                        "far": example_inputs["far"],
+                    }
+                    _ = compiled_model(
+                        context=context,
+                        global_step=0,
+                        deterministic=True,
+                        visualization_dump={},
+                        scene_names=None,
+                    )
+                    print("  ✓ Warmup inference completed!")
+                except Exception as e:
+                    print(f"  Warmup inference failed: {e}")
+                    print("  Compilation will happen on first actual inference")
+        
         print("  ✓ Model compiled successfully!")
-        print("  Note: First inference will trigger actual compilation")
+        if cache_dir:
+            print(f"  Cached kernels saved to: {cache_dir}")
+            print("  Next run will load cached kernels (faster startup)")
         
         return compiled_model
         
@@ -1743,12 +1790,29 @@ def main():
             print("\n" + "="*70)
             print("Optimization Setup (torch.compile)")
             print("="*70)
+            print(f"  Backend: {TORCH_COMPILE_BACKEND}")
+            print(f"  Cache directory: {TORCH_COMPILE_CACHE_DIR}")
+            print("  (This is the recommended optimization for this model)")
             
-            compiled_encoder = compile_with_torch_compile(encoder, backend="inductor")
+            # Prepare example inputs for warmup
+            example_inputs = {
+                "image": context["image"],
+                "extrinsics": context["extrinsics"],
+                "intrinsics": context["intrinsics"],
+                "near": context["near"],
+                "far": context["far"],
+            }
+            
+            compiled_encoder = compile_with_torch_compile(
+                encoder,
+                example_inputs=example_inputs,
+                backend=TORCH_COMPILE_BACKEND,
+                cache_dir=TORCH_COMPILE_CACHE_DIR,
+            )
             
             if compiled_encoder is not None:
                 encoder_to_use = compiled_encoder
-                optimization_name = "torch.compile (Inductor)"
+                optimization_name = f"torch.compile ({TORCH_COMPILE_BACKEND})"
             else:
                 use_optimization = False
                 
