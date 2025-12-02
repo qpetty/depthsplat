@@ -6,18 +6,19 @@ import warnings
 
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
+XFORMERS_AVAILABLE = False
+
 try:
     if XFORMERS_ENABLED:
         from xformers.ops import memory_efficient_attention, unbind
-
         XFORMERS_AVAILABLE = True
-        # warnings.warn("xFormers is available (Attention)")
-    else:
-        # warnings.warn("xFormers is disabled (Attention)")
-        raise ImportError
 except ImportError:
-    XFORMERS_AVAILABLE = False
-    # warnings.warn("xFormers is not available (Attention)")
+    pass
+
+
+def use_pytorch_attention():
+    """Check if we should use PyTorch native attention (for TensorRT compatibility)."""
+    return os.environ.get("FORCE_PYTORCH_ATTENTION") == "1"
 
 
 class CrossAttention(nn.Module):
@@ -33,7 +34,9 @@ class CrossAttention(nn.Module):
     ):
         super().__init__()
 
-        assert XFORMERS_AVAILABLE
+        # Only require xformers if not forcing PyTorch attention
+        if not use_pytorch_attention():
+            assert XFORMERS_AVAILABLE, "xFormers required. Set FORCE_PYTORCH_ATTENTION=1 for TensorRT."
 
         if out_dim is None:
             out_dim = in_dim1
@@ -51,13 +54,25 @@ class CrossAttention(nn.Module):
 
         q = self.q(x).reshape(b, n1, self.num_heads, c // self.num_heads)
         kv = self.kv(y).reshape(b, n2, 2, self.num_heads, c // self.num_heads)
-        k, v = unbind(kv, 2)
-
-        x = memory_efficient_attention(q, k, v)
-        x = x.reshape(b, n1, c)
         
+        if use_pytorch_attention() or not XFORMERS_AVAILABLE:
+            # PyTorch native attention for TensorRT compatibility
+            k, v = kv.unbind(2)
+            
+            # xformers: [b, seq, heads, dim] -> PyTorch: [b, heads, seq, dim]
+            q_pt = q.permute(0, 2, 1, 3)
+            k_pt = k.permute(0, 2, 1, 3)
+            v_pt = v.permute(0, 2, 1, 3)
+            
+            x = F.scaled_dot_product_attention(q_pt, k_pt, v_pt)
+            x = x.permute(0, 2, 1, 3)  # back to [b, seq, heads, dim]
+        else:
+            # xformers for normal inference (faster)
+            k, v = unbind(kv, 2)
+            x = memory_efficient_attention(q, k, v)
+        
+        x = x.reshape(b, n1, c)
         x = self.proj(x)
-
         return x
         
 
@@ -158,4 +173,3 @@ class UNetCrossAttentionBlock(nn.Module):
         cross_attn = cross_attn.view(b, h, w, c).permute(0, 3, 1, 2)  # [B, C, H, W]
 
         return identity + cross_attn
-

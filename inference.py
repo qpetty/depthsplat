@@ -402,11 +402,11 @@ def compile_to_tensorrt(
     """
     Compile a PyTorch model to TensorRT.
     
-    NOTE: This may fail with complex models that use xformers or dynamic shapes.
-    If compilation fails, consider using torch.compile instead (TENSORRT_USE_TORCH_COMPILE=True).
+    This function re-creates the encoder with PyTorch native attention (instead of xformers)
+    to ensure compatibility with JIT tracing required by TensorRT.
     
     Args:
-        model: PyTorch model to compile
+        model: PyTorch model to compile (used for copying weights)
         example_inputs: Dictionary of example inputs for tracing
         save_path: Path to save the compiled model
         fp16: Whether to use FP16 precision
@@ -414,6 +414,8 @@ def compile_to_tensorrt(
     Returns:
         TensorRT wrapped model or None if compilation failed
     """
+    import os
+    
     if not TENSORRT_AVAILABLE:
         print("TensorRT compilation skipped: torch_tensorrt not available")
         return None
@@ -423,11 +425,22 @@ def compile_to_tensorrt(
     print("="*70)
     print(f"  Target precision: {'FP16' if fp16 else 'FP32'}")
     print(f"  Save path: {save_path}")
-    print(f"  NOTE: This model uses xformers which may not be compatible with JIT tracing")
+    
+    # Set environment variable BEFORE creating the encoder
+    # This makes CrossAttention use PyTorch native attention instead of xformers
+    os.environ["FORCE_PYTORCH_ATTENTION"] = "1"
     
     try:
-        # Put model in eval mode
-        model.eval()
+        print("  Re-creating encoder with PyTorch native attention...")
+        
+        # Re-create encoder with PyTorch attention (env var is now set)
+        encoder_cfg = load_encoder_config(CONFIG_ROOT, ENCODER_OVERRIDES)
+        pytorch_encoder, _ = get_encoder(encoder_cfg)
+        pytorch_encoder = pytorch_encoder.to("cuda").eval()
+        
+        # Copy weights from original model
+        pytorch_encoder.load_state_dict(model.state_dict())
+        print("  ✓ Encoder re-created with PyTorch native attention")
         
         # Create a wrapper that accepts separate tensor inputs
         class EncoderWrapper(torch.nn.Module):
@@ -462,7 +475,7 @@ def compile_to_tensorrt(
                 # Return the essential gaussian properties as separate tensors
                 return gaussians.means, gaussians.covariances, gaussians.harmonics, gaussians.opacities
         
-        wrapped_model = EncoderWrapper(model).cuda().eval()
+        wrapped_model = EncoderWrapper(pytorch_encoder).cuda().eval()
         
         # Trace the model with example inputs
         print("  Tracing model with example inputs...")
@@ -554,6 +567,11 @@ def compile_to_tensorrt(
         import traceback
         traceback.print_exc()
         return None
+        
+    finally:
+        # Clean up - restore xformers for normal inference
+        if "FORCE_PYTORCH_ATTENTION" in os.environ:
+            del os.environ["FORCE_PYTORCH_ATTENTION"]
 
 
 def benchmark_inference(
