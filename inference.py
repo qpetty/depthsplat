@@ -38,8 +38,11 @@ import numpy as np
 # If compilation fails, the script will automatically fall back to PyTorch
 USE_TENSORRT = True  # Enable TensorRT optimization
 TENSORRT_MODEL_PATH = "depthsplat_encoder_trt.ts"  # Path to save/load TensorRT model
+TENSORRT_ENGINE_PATH = "depthsplat_encoder.engine"  # Path for TensorRT engine (ONNX path)
+TENSORRT_ONNX_PATH = "depthsplat_encoder.onnx"  # Path for intermediate ONNX model
 TENSORRT_FP16 = True  # Use FP16 precision (faster, slightly less accurate)
 TENSORRT_USE_TORCH_COMPILE = False  # Use torch.compile instead (PyTorch 2.0+)
+TENSORRT_USE_ONNX = True  # Use ONNX->TensorRT path (more reliable for complex models)
 BENCHMARK_RUNS = 10  # Number of runs for benchmarking
 WARMUP_RUNS = 5  # Number of warmup runs before benchmarking
 
@@ -407,6 +410,336 @@ class TensorRTEncoderWrapper(torch.nn.Module):
         
         # Return in the same format as the original encoder
         return {"gaussians": gaussians}
+
+
+class TensorRTEngineWrapper(torch.nn.Module):
+    """
+    Wrapper for TensorRT engine that runs inference using the TensorRT Python API.
+    This is used with the ONNX->TensorRT path for more reliable compilation.
+    """
+    def __init__(self, engine_path: str, output_names: list):
+        super().__init__()
+        import tensorrt as trt
+        
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.output_names = output_names
+        
+        # Load the engine
+        print(f"  Loading TensorRT engine from {engine_path}...")
+        with open(engine_path, "rb") as f:
+            engine_data = f.read()
+        
+        self.runtime = trt.Runtime(self.logger)
+        self.engine = self.runtime.deserialize_cuda_engine(engine_data)
+        self.context = self.engine.create_execution_context()
+        
+        # Get binding info
+        self.input_names = []
+        self.output_shapes = {}
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            mode = self.engine.get_tensor_mode(name)
+            if mode == trt.TensorIOMode.INPUT:
+                self.input_names.append(name)
+            else:
+                shape = self.engine.get_tensor_shape(name)
+                self.output_shapes[name] = shape
+        
+        print(f"  ✓ Engine loaded with {len(self.input_names)} inputs, {len(self.output_shapes)} outputs")
+    
+    def forward(self, image, extrinsics, intrinsics, near, far):
+        import tensorrt as trt
+        
+        # Set input shapes (for dynamic shapes)
+        inputs = {
+            "image": image,
+            "extrinsics": extrinsics,
+            "intrinsics": intrinsics,
+            "near": near,
+            "far": far,
+        }
+        
+        # Set input tensor addresses
+        for name in self.input_names:
+            tensor = inputs[name].contiguous()
+            self.context.set_input_shape(name, tuple(tensor.shape))
+            self.context.set_tensor_address(name, tensor.data_ptr())
+        
+        # Allocate output tensors
+        outputs = {}
+        for name in self.output_names:
+            shape = self.context.get_tensor_shape(name)
+            dtype = torch.float32  # Assume float32 outputs
+            output = torch.empty(tuple(shape), dtype=dtype, device="cuda")
+            outputs[name] = output
+            self.context.set_tensor_address(name, output.data_ptr())
+        
+        # Run inference
+        self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        
+        # Return outputs in order
+        return tuple(outputs[name] for name in self.output_names)
+
+
+class TensorRTEngineEncoderWrapper(torch.nn.Module):
+    """
+    High-level wrapper that makes TensorRTEngineWrapper compatible with the encoder interface.
+    """
+    def __init__(self, engine_wrapper: TensorRTEngineWrapper):
+        super().__init__()
+        self.engine_wrapper = engine_wrapper
+    
+    def forward(self, context, global_step=0, deterministic=False, visualization_dump=None, scene_names=None):
+        """Forward pass that matches the original encoder interface."""
+        # Extract inputs from context
+        image = context["image"]
+        extrinsics = context["extrinsics"]
+        intrinsics = context["intrinsics"]
+        near = context["near"]
+        far = context["far"]
+        
+        # Run TensorRT engine
+        means, covariances, harmonics, opacities = self.engine_wrapper(
+            image, extrinsics, intrinsics, near, far
+        )
+        
+        # Create Gaussians object
+        from src.model.types import Gaussians
+        gaussians = Gaussians(
+            means=means,
+            covariances=covariances,
+            harmonics=harmonics,
+            opacities=opacities,
+        )
+        
+        return {"gaussians": gaussians}
+
+
+def compile_to_tensorrt_via_onnx(
+    model: torch.nn.Module,
+    example_inputs: dict,
+    onnx_path: Path,
+    engine_path: Path,
+    fp16: bool = True,
+) -> Optional[torch.nn.Module]:
+    """
+    Compile a PyTorch model to TensorRT via ONNX.
+    
+    This is more reliable than direct TorchScript->TensorRT conversion for complex models.
+    
+    Args:
+        model: PyTorch model to compile (used for copying weights)
+        example_inputs: Dictionary of example inputs for tracing
+        onnx_path: Path to save intermediate ONNX model
+        engine_path: Path to save TensorRT engine
+        fp16: Whether to use FP16 precision
+        
+    Returns:
+        TensorRT wrapped model or None if compilation failed
+    """
+    import os
+    
+    print("\n" + "="*70)
+    print("Compiling Model to TensorRT via ONNX")
+    print("="*70)
+    print(f"  Target precision: {'FP16' if fp16 else 'FP32'}")
+    print(f"  ONNX path: {onnx_path}")
+    print(f"  Engine path: {engine_path}")
+    
+    # Check if engine already exists
+    if engine_path.exists():
+        print(f"  Found existing TensorRT engine at {engine_path}")
+        try:
+            output_names = ["means", "covariances", "harmonics", "opacities"]
+            engine_wrapper = TensorRTEngineWrapper(str(engine_path), output_names)
+            return TensorRTEngineEncoderWrapper(engine_wrapper)
+        except Exception as e:
+            print(f"  Failed to load existing engine: {e}")
+            print("  Will rebuild engine...")
+    
+    # Set environment variable for PyTorch attention
+    os.environ["FORCE_PYTORCH_ATTENTION"] = "1"
+    
+    try:
+        print("  Re-creating encoder with PyTorch native attention...")
+        
+        # Re-create encoder with PyTorch attention
+        encoder_cfg = load_encoder_config(CONFIG_ROOT, ENCODER_OVERRIDES)
+        pytorch_encoder, _ = get_encoder(encoder_cfg)
+        pytorch_encoder = pytorch_encoder.to("cuda").eval()
+        
+        # Patch DINOv2's attention
+        patch_dinov2_attention(pytorch_encoder)
+        
+        # Copy weights from original model
+        pytorch_encoder.load_state_dict(model.state_dict())
+        print("  ✓ Encoder re-created with PyTorch native attention")
+        
+        # Create a wrapper for ONNX export
+        class EncoderONNXWrapper(torch.nn.Module):
+            def __init__(self, encoder):
+                super().__init__()
+                self.encoder = encoder
+            
+            def forward(self, image, extrinsics, intrinsics, near, far):
+                context = {
+                    "image": image,
+                    "extrinsics": extrinsics,
+                    "intrinsics": intrinsics,
+                    "near": near,
+                    "far": far,
+                }
+                result = self.encoder(
+                    context=context,
+                    global_step=0,
+                    deterministic=True,
+                    visualization_dump={},
+                    scene_names=None,
+                )
+                gaussians = result["gaussians"]
+                return gaussians.means, gaussians.covariances, gaussians.harmonics, gaussians.opacities
+        
+        wrapped_model = EncoderONNXWrapper(pytorch_encoder).cuda().eval()
+        
+        # Step 1: Export to ONNX
+        print("  Exporting model to ONNX...")
+        input_names = ["image", "extrinsics", "intrinsics", "near", "far"]
+        output_names = ["means", "covariances", "harmonics", "opacities"]
+        
+        batch_size, num_views, channels, height, width = example_inputs["image"].shape
+        
+        # Define dynamic axes for flexible batch/view sizes
+        dynamic_axes = {
+            "image": {0: "batch", 1: "views"},
+            "extrinsics": {0: "batch", 1: "views"},
+            "intrinsics": {0: "batch", 1: "views"},
+            "near": {0: "batch", 1: "views"},
+            "far": {0: "batch", 1: "views"},
+            "means": {0: "batch"},
+            "covariances": {0: "batch"},
+            "harmonics": {0: "batch"},
+            "opacities": {0: "batch"},
+        }
+        
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapped_model,
+                (
+                    example_inputs["image"],
+                    example_inputs["extrinsics"],
+                    example_inputs["intrinsics"],
+                    example_inputs["near"],
+                    example_inputs["far"],
+                ),
+                str(onnx_path),
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+                opset_version=17,
+                do_constant_folding=True,
+                export_params=True,
+            )
+        
+        print(f"  ✓ ONNX model exported to {onnx_path}")
+        print(f"    File size: {onnx_path.stat().st_size / (1024*1024):.2f} MB")
+        
+        # Step 2: Convert ONNX to TensorRT
+        print("  Converting ONNX to TensorRT engine (this may take several minutes)...")
+        
+        try:
+            import tensorrt as trt
+        except ImportError:
+            print("  ✗ tensorrt package not found. Install with: pip install tensorrt")
+            print("  Falling back to standard PyTorch inference")
+            return None
+        
+        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+        
+        # Build the engine
+        builder = trt.Builder(TRT_LOGGER)
+        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        parser = trt.OnnxParser(network, TRT_LOGGER)
+        
+        # Parse ONNX
+        with open(str(onnx_path), "rb") as f:
+            if not parser.parse(f.read()):
+                print("  ✗ Failed to parse ONNX model:")
+                for i in range(parser.num_errors):
+                    print(f"    {parser.get_error(i)}")
+                return None
+        
+        print(f"    ONNX parsed successfully: {network.num_inputs} inputs, {network.num_outputs} outputs")
+        
+        # Configure builder
+        config = builder.create_builder_config()
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)  # 2GB
+        
+        if fp16:
+            if builder.platform_has_fast_fp16:
+                config.set_flag(trt.BuilderFlag.FP16)
+                print("    FP16 mode enabled")
+            else:
+                print("    Warning: FP16 not supported on this platform")
+        
+        # Set optimization profile for dynamic shapes
+        profile = builder.create_optimization_profile()
+        
+        # Set shape ranges for each input
+        # Min, Optimal, Max shapes
+        profile.set_shape("image", 
+                         (1, 2, 3, height, width),      # min
+                         (batch_size, num_views, 3, height, width),  # opt
+                         (batch_size, num_views * 2, 3, height, width))  # max
+        profile.set_shape("extrinsics",
+                         (1, 2, 4, 4),
+                         (batch_size, num_views, 4, 4),
+                         (batch_size, num_views * 2, 4, 4))
+        profile.set_shape("intrinsics",
+                         (1, 2, 3, 3),
+                         (batch_size, num_views, 3, 3),
+                         (batch_size, num_views * 2, 3, 3))
+        profile.set_shape("near",
+                         (1, 2),
+                         (batch_size, num_views),
+                         (batch_size, num_views * 2))
+        profile.set_shape("far",
+                         (1, 2),
+                         (batch_size, num_views),
+                         (batch_size, num_views * 2))
+        
+        config.add_optimization_profile(profile)
+        
+        # Build engine
+        print("    Building TensorRT engine...")
+        serialized_engine = builder.build_serialized_network(network, config)
+        
+        if serialized_engine is None:
+            print("  ✗ Failed to build TensorRT engine")
+            return None
+        
+        # Save engine
+        with open(str(engine_path), "wb") as f:
+            f.write(serialized_engine)
+        
+        print(f"  ✓ TensorRT engine saved to {engine_path}")
+        print(f"    File size: {engine_path.stat().st_size / (1024*1024):.2f} MB")
+        
+        # Create and return wrapper
+        engine_wrapper = TensorRTEngineWrapper(str(engine_path), output_names)
+        return TensorRTEngineEncoderWrapper(engine_wrapper)
+        
+    except Exception as e:
+        print(f"  ✗ ONNX->TensorRT compilation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n  Falling back to standard PyTorch inference")
+        return None
+        
+    finally:
+        # Clean up
+        if "FORCE_PYTORCH_ATTENTION" in os.environ:
+            del os.environ["FORCE_PYTORCH_ATTENTION"]
 
 
 def compile_with_torch_compile(
@@ -1314,7 +1647,27 @@ def main():
             print("Optimization Setup (TensorRT)")
             print("="*70)
             
-            if trt_model_path.exists():
+            # Check for ONNX-based TensorRT engine first (preferred)
+            engine_path = Path(TENSORRT_ENGINE_PATH)
+            if TENSORRT_USE_ONNX and engine_path.exists():
+                print(f"  Found existing TensorRT engine: {engine_path}")
+                print(f"  File size: {engine_path.stat().st_size / (1024*1024):.2f} MB")
+                
+                try:
+                    print("  Loading TensorRT engine...")
+                    output_names = ["means", "covariances", "harmonics", "opacities"]
+                    engine_wrapper = TensorRTEngineWrapper(str(engine_path), output_names)
+                    trt_encoder = TensorRTEngineEncoderWrapper(engine_wrapper)
+                    print("  ✓ TensorRT engine loaded successfully!")
+                    encoder_to_use = trt_encoder
+                    optimization_name = "TensorRT (ONNX)"
+                except Exception as e:
+                    print(f"  ✗ Failed to load TensorRT engine: {e}")
+                    print("  Will try to rebuild...")
+                    use_optimization = False
+            
+            # Check for TorchScript-based TensorRT model
+            elif trt_model_path.exists():
                 print(f"  Found existing TensorRT model: {trt_model_path}")
                 print(f"  File size: {trt_model_path.stat().st_size / (1024*1024):.2f} MB")
                 
@@ -1343,13 +1696,31 @@ def main():
                     "far": context["far"],
                 }
                 
-                # Compile to TensorRT
-                trt_encoder = compile_to_tensorrt(
-                    encoder,
-                    example_inputs,
-                    trt_model_path,
-                    fp16=TENSORRT_FP16,
-                )
+                trt_encoder = None
+                
+                # Try ONNX->TensorRT path first (more reliable for complex models)
+                if TENSORRT_USE_ONNX:
+                    print("  Using ONNX->TensorRT path (more reliable for complex models)...")
+                    onnx_path = Path(TENSORRT_ONNX_PATH)
+                    engine_path = Path(TENSORRT_ENGINE_PATH)
+                    
+                    trt_encoder = compile_to_tensorrt_via_onnx(
+                        encoder,
+                        example_inputs,
+                        onnx_path,
+                        engine_path,
+                        fp16=TENSORRT_FP16,
+                    )
+                
+                # Fall back to TorchScript path if ONNX fails or is disabled
+                if trt_encoder is None and not TENSORRT_USE_ONNX:
+                    print("  Using TorchScript->TensorRT path...")
+                    trt_encoder = compile_to_tensorrt(
+                        encoder,
+                        example_inputs,
+                        trt_model_path,
+                        fp16=TENSORRT_FP16,
+                    )
                 
                 if trt_encoder is not None:
                     encoder_to_use = trt_encoder
