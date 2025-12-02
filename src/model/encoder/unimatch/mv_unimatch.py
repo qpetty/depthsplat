@@ -215,7 +215,9 @@ class MultiViewUniMatch(nn.Module):
 
     def extract_feature(self, images):
         # images: [B, V, C, H, W]
-        b, v = images.shape[:2]
+        # Use explicit size() calls for better TensorRT/JIT compatibility
+        b = images.size(0)
+        v = images.size(1)
         concat = rearrange(images, "b v c h w -> (b v) c h w")
         # list of [BV, C, H, W], resolution from high to low
         features = self.backbone(concat)
@@ -243,7 +245,11 @@ class MultiViewUniMatch(nn.Module):
 
         # first normalize images
         images = self.normalize_images(images)
-        b, v, _, ori_h, ori_w = images.shape
+        # Use explicit size() calls for better TensorRT/JIT compatibility
+        b = images.size(0)
+        v = images.size(1)
+        ori_h = images.size(3)
+        ori_w = images.size(4)
 
         # update the num_views in unet attention, useful for random input views
         set_num_views(self.regressor, num_views=v)
@@ -301,7 +307,9 @@ class MultiViewUniMatch(nn.Module):
         results_dict.update({"features_mv": features_list_mv})
 
         # mono feature
-        ori_h, ori_w = images.shape[-2:]
+        # Use explicit size() calls for better TensorRT/JIT compatibility
+        ori_h = images.size(3)
+        ori_w = images.size(4)
         resize_h, resize_w = ori_h // 14 * 14, ori_w // 14 * 14
         concat = rearrange(images, "b v c h w -> (b v) c h w")
         concat = F.interpolate(

@@ -146,7 +146,11 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         scene_names: Optional[list] = None,
     ):
         device = context["image"].device
-        b, v, _, h, w = context["image"].shape
+        # Use explicit size() calls for better TensorRT/JIT compatibility
+        b = context["image"].size(0)
+        v = context["image"].size(1)
+        h = context["image"].size(3)
+        w = context["image"].size(4)
 
         if v > 3:
             with torch.no_grad():
@@ -218,8 +222,9 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         match_prob = results_dict['match_probs'][-1]
         match_prob = torch.max(match_prob, dim=1, keepdim=True)[
             0]  # [BV, 1, H, W]
+        # Use explicit size() for TensorRT/JIT compatibility
         match_prob = F.interpolate(
-            match_prob, size=depth.shape[-2:], mode='nearest')
+            match_prob, size=(depth.size(-2), depth.size(-1)), mode='nearest')
 
         # unet input
         concat = torch.cat((
