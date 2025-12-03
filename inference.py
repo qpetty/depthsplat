@@ -585,6 +585,93 @@ class DepthSplatInference:
         
         return result.astype(np.float32)
     
+    @staticmethod
+    def _rotation_matrix_to_quaternion_gpu(R_mat: torch.Tensor) -> torch.Tensor:
+        """
+        Convert rotation matrices to quaternions (xyzw order) using PyTorch on GPU.
+        
+        Args:
+            R_mat: Rotation matrices of shape [..., 3, 3]
+            
+        Returns:
+            Quaternions of shape [..., 4] in xyzw order
+        """
+        original_shape = R_mat.shape[:-2]
+        R_flat = R_mat.reshape(-1, 3, 3)
+        n = R_flat.shape[0]
+        device = R_flat.device
+        
+        quats = torch.zeros((n, 4), dtype=torch.float32, device=device)
+        
+        trace = R_flat[:, 0, 0] + R_flat[:, 1, 1] + R_flat[:, 2, 2]
+        
+        # Case 1: trace > 0
+        mask1 = trace > 0
+        if mask1.any():
+            s = torch.sqrt(trace[mask1] + 1.0) * 2
+            quats[mask1, 3] = 0.25 * s
+            quats[mask1, 0] = (R_flat[mask1, 2, 1] - R_flat[mask1, 1, 2]) / s
+            quats[mask1, 1] = (R_flat[mask1, 0, 2] - R_flat[mask1, 2, 0]) / s
+            quats[mask1, 2] = (R_flat[mask1, 1, 0] - R_flat[mask1, 0, 1]) / s
+        
+        # Case 2: R[0,0] > R[1,1] and R[0,0] > R[2,2]
+        mask2 = ~mask1 & (R_flat[:, 0, 0] > R_flat[:, 1, 1]) & (R_flat[:, 0, 0] > R_flat[:, 2, 2])
+        if mask2.any():
+            s = torch.sqrt(1.0 + R_flat[mask2, 0, 0] - R_flat[mask2, 1, 1] - R_flat[mask2, 2, 2]) * 2
+            quats[mask2, 3] = (R_flat[mask2, 2, 1] - R_flat[mask2, 1, 2]) / s
+            quats[mask2, 0] = 0.25 * s
+            quats[mask2, 1] = (R_flat[mask2, 0, 1] + R_flat[mask2, 1, 0]) / s
+            quats[mask2, 2] = (R_flat[mask2, 0, 2] + R_flat[mask2, 2, 0]) / s
+        
+        # Case 3: R[1,1] > R[2,2]
+        mask3 = ~mask1 & ~mask2 & (R_flat[:, 1, 1] > R_flat[:, 2, 2])
+        if mask3.any():
+            s = torch.sqrt(1.0 + R_flat[mask3, 1, 1] - R_flat[mask3, 0, 0] - R_flat[mask3, 2, 2]) * 2
+            quats[mask3, 3] = (R_flat[mask3, 0, 2] - R_flat[mask3, 2, 0]) / s
+            quats[mask3, 0] = (R_flat[mask3, 0, 1] + R_flat[mask3, 1, 0]) / s
+            quats[mask3, 1] = 0.25 * s
+            quats[mask3, 2] = (R_flat[mask3, 1, 2] + R_flat[mask3, 2, 1]) / s
+        
+        # Case 4: else
+        mask4 = ~mask1 & ~mask2 & ~mask3
+        if mask4.any():
+            s = torch.sqrt(1.0 + R_flat[mask4, 2, 2] - R_flat[mask4, 0, 0] - R_flat[mask4, 1, 1]) * 2
+            quats[mask4, 3] = (R_flat[mask4, 1, 0] - R_flat[mask4, 0, 1]) / s
+            quats[mask4, 0] = (R_flat[mask4, 0, 2] + R_flat[mask4, 2, 0]) / s
+            quats[mask4, 1] = (R_flat[mask4, 1, 2] + R_flat[mask4, 2, 1]) / s
+            quats[mask4, 2] = 0.25 * s
+        
+        # Normalize
+        quats = quats / (torch.norm(quats, dim=-1, keepdim=True) + 1e-8)
+        
+        return quats.reshape(*original_shape, 4)
+    
+    @staticmethod
+    def _quaternion_multiply_gpu(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """
+        Multiply two quaternions (xyzw order) using PyTorch on GPU.
+        
+        Args:
+            q1: Quaternions of shape [..., 4] in xyzw order
+            q2: Quaternions of shape [..., 4] in xyzw order
+            
+        Returns:
+            Result quaternions of shape [..., 4] in xyzw order
+        """
+        x1, y1, z1, w1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        x2, y2, z2, w2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+        
+        # Hamilton product
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        
+        result = torch.stack([x, y, z, w], dim=-1)
+        result = result / (torch.norm(result, dim=-1, keepdim=True) + 1e-8)
+        
+        return result
+
     def _gaussians_to_ply_bytes(
         self,
         gaussians,
@@ -614,55 +701,54 @@ class DepthSplatInference:
                 f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
             )
         
-        # Transform rotations to world space - OPTIMIZED: pure numpy quaternion math (no scipy)
+        # ====== GPU PROCESSING ======
+        # Do all math on GPU before transferring to CPU
         t0 = time.perf_counter()
-        rotations_per_view = rotations.view(num_views, num_gaussians_per_view, 4)
-        c2w_rotations = context["extrinsics"][0, :, :3, :3].detach().cpu().numpy()
         
-        # Get all camera rotations as quaternions [V, N, 4] in xyzw order
-        all_cam_quats = rotations_per_view.detach().cpu().numpy()  # [V, N, 4]
+        # Transform rotations to world space on GPU
+        rotations_per_view = rotations.view(num_views, num_gaussians_per_view, 4)  # [V, N, 4]
+        c2w_rotations = context["extrinsics"][0, :, :3, :3]  # [V, 3, 3] - stays on GPU
         
-        # Convert c2w rotation matrices to quaternions for each view [V, 4]
-        c2w_quats = self._rotation_matrix_to_quaternion_batch(c2w_rotations)  # [V, 4]
+        # Convert c2w rotation matrices to quaternions on GPU [V, 4]
+        c2w_quats = self._rotation_matrix_to_quaternion_gpu(c2w_rotations)
         
         # Expand c2w_quats to match gaussians: [V, 1, 4] -> broadcast with [V, N, 4]
-        c2w_quats_expanded = c2w_quats[:, np.newaxis, :]  # [V, 1, 4]
+        c2w_quats_expanded = c2w_quats.unsqueeze(1)  # [V, 1, 4]
         
-        # Quaternion multiplication: q_world = q_c2w * q_cam (for each gaussian)
-        # Broadcast across N gaussians per view
-        world_rotations_quat = self._quaternion_multiply_batch(
-            c2w_quats_expanded, all_cam_quats
-        )  # [V, N, 4]
+        # Quaternion multiplication on GPU: q_world = q_c2w * q_cam
+        world_rotations = self._quaternion_multiply_gpu(c2w_quats_expanded, rotations_per_view)
+        world_rotations = world_rotations.reshape(-1, 4)  # [V*N, 4]
         
-        # Flatten to [V*N, 4]
-        world_rotations_quat = world_rotations_quat.reshape(-1, 4)
+        # Reorder quaternion from xyzw to wxyz for PLY format (on GPU)
+        rotations_ply = world_rotations[:, [3, 0, 1, 2]]  # [N, 4] wxyz
         
-        timings['rotation_transform'] = time.perf_counter() - t0
+        # Compute log scales and opacity logit on GPU
+        scales_log = torch.log(scales + 1e-8)
+        opacities_logit = torch.logit(gaussians.opacities[0], eps=1e-8)
         
-        # Transfer data from GPU to CPU
+        # Get DC component of harmonics
+        harmonics_dc = gaussians.harmonics[0, :, :, 0]  # [N, 3]
+        
+        # Means are already on GPU
+        means = gaussians.means[0]  # [N, 3]
+        
+        timings['gpu_compute'] = time.perf_counter() - t0
+        
+        # ====== TRANSFER TO CPU ======
         t0 = time.perf_counter()
-        means_np = gaussians.means[0].detach().cpu().numpy()
-        scales_np = scales.detach().cpu().numpy()
-        harmonics_np = gaussians.harmonics[0].detach().cpu().numpy()
-        opacities_np = gaussians.opacities[0].detach().cpu().numpy()
+        
+        # Transfer all processed data to CPU in one batch
+        means_np = means.cpu().numpy()
+        scales_log_np = scales_log.cpu().numpy()
+        rotations_ply_np = rotations_ply.cpu().numpy()
+        harmonics_dc_np = harmonics_dc.cpu().numpy()
+        opacities_logit_np = opacities_logit.cpu().numpy()
+        
         timings['gpu_to_cpu'] = time.perf_counter() - t0
         
-        # Prepare numpy arrays
+        # ====== CREATE STRUCTURED ARRAY ======
         t0 = time.perf_counter()
-        # Reorder quaternion from xyzw to wxyz for PLY format
-        rotations_ply = world_rotations_quat[:, [3, 0, 1, 2]].astype(np.float32)
         
-        harmonics_dc = harmonics_np[..., 0].astype(np.float32)
-        normals = np.zeros_like(means_np, dtype=np.float32)
-        
-        # Compute opacity logit and log scales
-        opacities_logit = np.log(opacities_np / (1 - opacities_np + 1e-8)).astype(np.float32)
-        scales_log = np.log(scales_np + 1e-8).astype(np.float32)
-        
-        timings['numpy_prep'] = time.perf_counter() - t0
-        
-        # Create PLY structured array - OPTIMIZED: direct field assignment
-        t0 = time.perf_counter()
         dtype_full = [
             ("x", "f4"), ("y", "f4"), ("z", "f4"),
             ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
@@ -675,27 +761,28 @@ class DepthSplatInference:
         num_gaussians = means_np.shape[0]
         elements = np.empty(num_gaussians, dtype=dtype_full)
         
-        # Direct field assignment - much faster than list(map(tuple, ...))
-        elements['x'] = means_np[:, 0].astype(np.float32)
-        elements['y'] = means_np[:, 1].astype(np.float32)
-        elements['z'] = means_np[:, 2].astype(np.float32)
-        elements['nx'] = normals[:, 0]
-        elements['ny'] = normals[:, 1]
-        elements['nz'] = normals[:, 2]
-        elements['f_dc_0'] = harmonics_dc[:, 0]
-        elements['f_dc_1'] = harmonics_dc[:, 1]
-        elements['f_dc_2'] = harmonics_dc[:, 2]
-        elements['opacity'] = opacities_logit
-        elements['scale_0'] = scales_log[:, 0]
-        elements['scale_1'] = scales_log[:, 1]
-        elements['scale_2'] = scales_log[:, 2]
-        elements['rot_0'] = rotations_ply[:, 0]
-        elements['rot_1'] = rotations_ply[:, 1]
-        elements['rot_2'] = rotations_ply[:, 2]
-        elements['rot_3'] = rotations_ply[:, 3]
+        # Direct field assignment
+        elements['x'] = means_np[:, 0]
+        elements['y'] = means_np[:, 1]
+        elements['z'] = means_np[:, 2]
+        elements['nx'] = 0.0
+        elements['ny'] = 0.0
+        elements['nz'] = 0.0
+        elements['f_dc_0'] = harmonics_dc_np[:, 0]
+        elements['f_dc_1'] = harmonics_dc_np[:, 1]
+        elements['f_dc_2'] = harmonics_dc_np[:, 2]
+        elements['opacity'] = opacities_logit_np
+        elements['scale_0'] = scales_log_np[:, 0]
+        elements['scale_1'] = scales_log_np[:, 1]
+        elements['scale_2'] = scales_log_np[:, 2]
+        elements['rot_0'] = rotations_ply_np[:, 0]
+        elements['rot_1'] = rotations_ply_np[:, 1]
+        elements['rot_2'] = rotations_ply_np[:, 2]
+        elements['rot_3'] = rotations_ply_np[:, 3]
+        
         timings['structured_array'] = time.perf_counter() - t0
         
-        # Write PLY to buffer
+        # ====== WRITE PLY ======
         t0 = time.perf_counter()
         buffer = io.BytesIO()
         PlyData([PlyElement.describe(elements, "vertex")]).write(buffer)
