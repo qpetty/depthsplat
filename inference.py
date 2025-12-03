@@ -1,22 +1,31 @@
 """
-Run encoder using direct config loading (no Hydra) and export to PLY.
+Run encoder using direct config loading (no Hydra) and export to PLY or SPZ.
 
 This module can be imported and used programmatically:
 
-    from inference import DepthSplatInference
+    from inference import DepthSplatInference, InferenceConfig
     
     # Initialize encoder (uses module-level config variables)
     model = DepthSplatInference()
     
-    # Run inference from file paths
+    # Run inference from file paths (default PLY output)
     ply_bytes = model.run_from_paths("/path/to/images")
     
+    # Run inference with SPZ output (compressed, ~10x smaller)
+    config = InferenceConfig(output_format="spz")
+    spz_bytes = model.run_from_paths("/path/to/images", config=config)
+    
     # Or run inference from pre-loaded data
-    ply_bytes = model.run_from_data(
+    output_bytes = model.run_from_data(
         images=images_tensor,  # [num_views, 3, H, W]
         intrinsics_list=intrinsics_list,  # List of 3x3 numpy arrays
         extrinsics_list=extrinsics_list,  # List of 4x4 numpy arrays
+        config=InferenceConfig(output_format="spz"),  # Optional: use SPZ format
     )
+
+Output formats:
+    - PLY: Standard Gaussian splat format, larger file size
+    - SPZ: Compressed format (~10x smaller), requires spz library
 
 Image resolution: 512x960
 Input views: determined by image files in the input directory
@@ -71,6 +80,13 @@ from src.config import load_typed_config
 from src.model.encoder import EncoderDepthSplatCfg, get_encoder
 from plyfile import PlyData, PlyElement
 from src.misc.image_io import load_image
+
+# Optional SPZ support for compressed gaussian splat export
+try:
+    import spz
+    SPZ_AVAILABLE = True
+except ImportError:
+    SPZ_AVAILABLE = False
 from einops import rearrange
 import math
 import torchvision.transforms as tf
@@ -90,6 +106,7 @@ class InferenceConfig:
     verbose: bool = True
     skip_checks: bool = True  # Skip expensive validation checks (rotation det, etc.) for speed
     log_timing: bool = False  # Log detailed timing breakdown for each step
+    output_format: str = "ply"  # Output format: "ply" or "spz"
 
 
 def load_metadata_from_json(image_path: Path) -> dict:
@@ -261,11 +278,21 @@ class DepthSplatInference:
         - CONFIG_ROOT: Path to config directory
         - ENCODER_OVERRIDES: Dictionary of config overrides
     
+    Supported output formats:
+        - PLY: Standard format, uncompressed
+        - SPZ: Compressed format (~10x smaller), requires spz library
+    
     Example:
-        from inference import DepthSplatInference
+        from inference import DepthSplatInference, InferenceConfig
         
         model = DepthSplatInference()
+        
+        # PLY output (default)
         ply_bytes = model.run_from_paths("/path/to/images")
+        
+        # SPZ output (compressed)
+        config = InferenceConfig(output_format="spz")
+        spz_bytes = model.run_from_paths("/path/to/images", config=config)
     """
     
     def __init__(self):
@@ -710,6 +737,169 @@ class DepthSplatInference:
                 print(f"    {name:20s}: {elapsed:8.4f}s ({pct:5.1f}%)")
         
         return ply_bytes
+
+    def _gaussians_to_spz_bytes(
+        self,
+        gaussians,
+        visualization_dump: dict,
+        context: dict,
+        num_views: int,
+        log_timing: bool = False,
+    ) -> bytes:
+        """
+        Convert gaussians to SPZ format and return as bytes.
+        
+        SPZ is a compressed format for 3D gaussian splats, typically ~10x smaller than PLY.
+        The output uses RDF coordinate system (Right-Down-Front) for PLY compatibility.
+        
+        Args:
+            gaussians: Gaussian output from encoder
+            visualization_dump: Dictionary with scales and rotations
+            context: Context dict with extrinsics
+            num_views: Number of input views
+            log_timing: Whether to log timing breakdown
+            
+        Returns:
+            SPZ file contents as bytes
+        """
+        if not SPZ_AVAILABLE:
+            raise ImportError(
+                "SPZ library not installed. Install with: pip install spz "
+                "or from source: cd spz && pip install ."
+            )
+        
+        timings = {}
+        total_start = time.perf_counter()
+        
+        if "scales" not in visualization_dump or "rotations" not in visualization_dump:
+            raise ValueError(
+                "visualization_dump does not contain scales/rotations. "
+                "Cannot export to SPZ without this information."
+            )
+        
+        scales = visualization_dump["scales"][0]
+        rotations = visualization_dump["rotations"][0]
+        
+        total_gaussians = rotations.shape[0]
+        num_gaussians_per_view = total_gaussians // num_views
+        
+        if total_gaussians % num_views != 0:
+            raise ValueError(
+                f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
+            )
+        
+        # ====== GPU PROCESSING ======
+        t0 = time.perf_counter()
+        
+        # Transform rotations to world space on GPU
+        rotations_per_view = rotations.view(num_views, num_gaussians_per_view, 4)  # [V, N, 4]
+        c2w_rotations = context["extrinsics"][0, :, :3, :3]  # [V, 3, 3]
+        
+        # Convert c2w rotation matrices to quaternions on GPU [V, 4]
+        c2w_quats = self._rotation_matrix_to_quaternion_gpu(c2w_rotations)
+        
+        # Expand c2w_quats to match gaussians
+        c2w_quats_expanded = c2w_quats.unsqueeze(1)  # [V, 1, 4]
+        
+        # Quaternion multiplication on GPU: q_world = q_c2w * q_cam
+        world_rotations = self._quaternion_multiply_gpu(c2w_quats_expanded, rotations_per_view)
+        world_rotations = world_rotations.reshape(-1, 4)  # [V*N, 4]
+        
+        # SPZ uses XYZW quaternion order (same as our internal format)
+        rotations_spz = world_rotations  # [N, 4] xyzw
+        
+        # Compute log scales (SPZ stores scales in log space)
+        scales_log = torch.log(scales + 1e-8)
+        
+        # Compute opacity logit (SPZ stores alpha as inverse sigmoid)
+        opacities_logit = torch.logit(gaussians.opacities[0], eps=1e-8)
+        
+        # Get DC component of harmonics for colors
+        # SPZ stores colors as SH DC coefficients
+        harmonics_dc = gaussians.harmonics[0, :, :, 0]  # [N, 3]
+        
+        # Means are already in world space
+        means = gaussians.means[0]  # [N, 3]
+        
+        timings['gpu_compute'] = time.perf_counter() - t0
+        
+        # ====== TRANSFER TO CPU ======
+        t0 = time.perf_counter()
+        
+        means_np = means.cpu().numpy().astype(np.float32)
+        scales_log_np = scales_log.cpu().numpy().astype(np.float32)
+        rotations_spz_np = rotations_spz.cpu().numpy().astype(np.float32)
+        harmonics_dc_np = harmonics_dc.cpu().numpy().astype(np.float32)
+        opacities_logit_np = opacities_logit.cpu().numpy().astype(np.float32)
+        
+        timings['gpu_to_cpu'] = time.perf_counter() - t0
+        
+        # ====== CREATE SPZ GAUSSIAN CLOUD ======
+        t0 = time.perf_counter()
+        
+        num_gaussians = means_np.shape[0]
+        
+        cloud = spz.GaussianCloud()
+        cloud.sh_degree = 0  # Only DC component (no higher-order SH)
+        cloud.antialiased = False
+        
+        # Set positions (flattened xyz)
+        cloud.positions = means_np.flatten()
+        
+        # Set scales (flattened, log-space)
+        cloud.scales = scales_log_np.flatten()
+        
+        # Set rotations (flattened xyzw quaternions)
+        cloud.rotations = rotations_spz_np.flatten()
+        
+        # Set alphas (pre-sigmoid opacity)
+        cloud.alphas = opacities_logit_np.flatten()
+        
+        # Set colors (SH DC coefficients)
+        cloud.colors = harmonics_dc_np.flatten()
+        
+        # No higher-order spherical harmonics
+        cloud.sh = np.array([], dtype=np.float32)
+        
+        timings['create_cloud'] = time.perf_counter() - t0
+        
+        # ====== SAVE TO SPZ ======
+        t0 = time.perf_counter()
+        
+        # Use RDF coordinate system (standard PLY coordinate system)
+        # This ensures compatibility with most 3D gaussian splat viewers
+        pack_options = spz.PackOptions()
+        pack_options.from_coord = spz.RDF
+        
+        # Save to a temporary file and read bytes
+        import tempfile
+        import os
+        
+        with tempfile.NamedTemporaryFile(suffix='.spz', delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            success = spz.save_spz(cloud, pack_options, tmp_path)
+            if not success:
+                raise RuntimeError("Failed to save SPZ file")
+            
+            with open(tmp_path, 'rb') as f:
+                spz_bytes = f.read()
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        
+        timings['spz_write'] = time.perf_counter() - t0
+        
+        timings['total'] = time.perf_counter() - total_start
+        
+        if log_timing:
+            print("\n  SPZ Conversion Sub-timings:")
+            for name, elapsed in timings.items():
+                pct = (elapsed / timings['total']) * 100 if timings['total'] > 0 else 0
+                print(f"    {name:20s}: {elapsed:8.4f}s ({pct:5.1f}%)")
+        
+        return spz_bytes
     
     def run_from_paths(
         self,
@@ -720,16 +910,17 @@ class DepthSplatInference:
         Run inference from image file paths.
         
         Loads images and metadata from a directory, runs the encoder, and returns
-        the resulting Gaussian splat as PLY bytes.
+        the resulting Gaussian splat as bytes in the specified format.
         
         Args:
             image_base_path: Directory containing images and metadata files.
                 For each image (e.g., "view_0.png"), a corresponding metadata file
                 (e.g., "view_0_metadata.json") must exist.
             config: Inference configuration. Uses defaults if None.
+                Set config.output_format to "spz" for compressed output.
         
         Returns:
-            PLY file contents as bytes.
+            Gaussian splat file contents as bytes (PLY or SPZ format based on config).
         """
         if config is None:
             config = InferenceConfig()
@@ -818,9 +1009,10 @@ class DepthSplatInference:
                 the tensor dimensions.
             image_filenames: List of image filenames for logging. Optional.
             config: Inference configuration. Uses defaults if None.
+                Set config.output_format to "spz" for compressed output.
         
         Returns:
-            PLY file contents as bytes.
+            Gaussian splat file contents as bytes (PLY or SPZ format based on config).
         """
         if config is None:
             config = InferenceConfig()
@@ -922,16 +1114,35 @@ class DepthSplatInference:
         if config.verbose:
             print(f"Gaussian output: {gaussians.means.shape[1]} gaussians")
         
-        # Convert to PLY bytes
+        # Convert to output format
         t0 = time.perf_counter()
-        ply_bytes = self._gaussians_to_ply_bytes(
-            gaussians=gaussians,
-            visualization_dump=visualization_dump,
-            context=context,
-            num_views=num_views,
-            log_timing=config.log_timing,
-        )
-        timings['6_ply_conversion'] = time.perf_counter() - t0
+        output_format = config.output_format.lower()
+        
+        if output_format == "spz":
+            if not SPZ_AVAILABLE:
+                raise ImportError(
+                    "SPZ library not installed. Install with: pip install spz "
+                    "or from source: cd spz && pip install ."
+                )
+            output_bytes = self._gaussians_to_spz_bytes(
+                gaussians=gaussians,
+                visualization_dump=visualization_dump,
+                context=context,
+                num_views=num_views,
+                log_timing=config.log_timing,
+            )
+            timings['6_spz_conversion'] = time.perf_counter() - t0
+        elif output_format == "ply":
+            output_bytes = self._gaussians_to_ply_bytes(
+                gaussians=gaussians,
+                visualization_dump=visualization_dump,
+                context=context,
+                num_views=num_views,
+                log_timing=config.log_timing,
+            )
+            timings['6_ply_conversion'] = time.perf_counter() - t0
+        else:
+            raise ValueError(f"Unsupported output format: {output_format}. Use 'ply' or 'spz'.")
         
         timings['7_total'] = time.perf_counter() - total_start
         
@@ -945,11 +1156,22 @@ class DepthSplatInference:
                 print(f"  {name:25s}: {elapsed:8.4f}s ({pct:5.1f}%)")
             print("="*60 + "\n")
         
-        return ply_bytes
+        return output_bytes
 
 
 def main():
     """Main function for command-line usage."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="DepthSplat inference - generate Gaussian splats from images")
+    parser.add_argument("--format", "-f", choices=["ply", "spz"], default="ply",
+                        help="Output format: 'ply' (default) or 'spz' (compressed, ~10x smaller)")
+    parser.add_argument("--input", "-i", default=IMAGE_BASE_PATH,
+                        help="Input directory containing images and metadata files")
+    parser.add_argument("--output", "-o", default=OUTPUT_DIR,
+                        help="Output directory for generated splat file")
+    args = parser.parse_args()
+    
     # Initialize model
     model = DepthSplatInference()
     
@@ -960,23 +1182,33 @@ def main():
         near_disparity=NEAR_DISPARITY,
         far_disparity=FAR_DISPARITY,
         verbose=True,
+        output_format=args.format,
     )
     
-    ply_bytes = model.run_from_paths(
-        image_base_path=IMAGE_BASE_PATH,
+    output_bytes = model.run_from_paths(
+        image_base_path=args.input,
         config=config,
     )
 
-    # Save PLY to file
-    output_dir = Path(OUTPUT_DIR)
+    # Save output file
+    output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ply_path = output_dir / "gaussians.ply"
     
-    with open(ply_path, 'wb') as f:
-        f.write(ply_bytes)
+    if args.format == "spz":
+        output_path = output_dir / "gaussians.spz"
+    else:
+        output_path = output_dir / "gaussians.ply"
     
-    print(f"\n✓ Successfully exported to {ply_path}")
-    print(f"  File size: {len(ply_bytes) / (1024*1024):.2f} MB")
+    with open(output_path, 'wb') as f:
+        f.write(output_bytes)
+    
+    print(f"\n✓ Successfully exported to {output_path}")
+    print(f"  File size: {len(output_bytes) / (1024*1024):.2f} MB")
+    
+    if args.format == "spz":
+        print(f"  Format: SPZ (compressed gaussian splat)")
+    else:
+        print(f"  Format: PLY (standard gaussian splat)")
 
     print("\n" + "="*70)
     print("Done!")
