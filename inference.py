@@ -50,6 +50,7 @@ ENCODER_OVERRIDES = {
 
 import numpy as np
 import io
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -87,6 +88,8 @@ class InferenceConfig:
     near_disparity: float = 1.0
     far_disparity: float = 0.1
     verbose: bool = True
+    skip_checks: bool = True  # Skip expensive validation checks (rotation det, etc.) for speed
+    log_timing: bool = False  # Log detailed timing breakdown for each step
 
 
 def load_metadata_from_json(image_path: Path) -> dict:
@@ -315,6 +318,7 @@ class DepthSplatInference:
         target_width: int,
         image_filenames: list[str],
         verbose: bool = True,
+        skip_checks: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[float]]:
         """Prepare camera extrinsics and intrinsics tensors from lists."""
         num_views = len(extrinsics_list)
@@ -333,9 +337,11 @@ class DepthSplatInference:
             rotation_normalized = normalize_rotation_matrix(rotation)
             ext_tensor[:3, :3] = rotation_normalized
             
-            det = torch.det(rotation_normalized)
-            if verbose and not torch.allclose(det, torch.tensor(1.0), atol=1e-5):
-                print(f"  WARNING: View {i} ({img_name}) rotation matrix determinant: {det.item():.6f}")
+            # Only compute determinant check when verbose and not skipping checks
+            if verbose and not skip_checks:
+                det = torch.det(rotation_normalized)
+                if not torch.allclose(det, torch.tensor(1.0), atol=1e-5):
+                    print(f"  WARNING: View {i} ({img_name}) rotation matrix determinant: {det.item():.6f}")
             
             camera_center = ext_tensor[:3, 3]
             camera_centers.append(camera_center)
@@ -395,6 +401,7 @@ class DepthSplatInference:
         near_disparity: float = 1.0,
         far_disparity: float = 0.1,
         verbose: bool = True,
+        skip_checks: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute near and far planes based on camera baselines."""
         batch_size = 1
@@ -420,28 +427,35 @@ class DepthSplatInference:
             
             origins = extrinsics[:, :, :3, 3]
             deltas = (origins[:, None, :, :] - origins[:, :, None, :]).norm(dim=-1)
-            max_baseline = deltas.max().item()
-            deltas_positive = deltas[deltas > 1e-6]
-            min_baseline = deltas_positive.min().item() if len(deltas_positive) > 0 else max_baseline
+            
+            # Batch all tensor-to-scalar conversions to minimize CUDA syncs
+            # Stack values and convert to numpy in one operation
+            values_to_check = torch.stack([
+                deltas.max(),
+                deltas[deltas > 1e-6].min() if (deltas > 1e-6).any() else deltas.max(),
+                near_computed[0],
+                far_computed[0],
+            ])
+            values_np = values_to_check.detach().cpu().numpy()
+            max_baseline = float(values_np[0])
+            min_baseline = float(values_np[1])
+            near_val = float(values_np[2])
+            far_val = float(values_np[3])
             
             use_computed = True
-            if near_computed[0].item() > 100 * max_baseline:
-                if verbose:
-                    print(f"    WARNING: Computed near plane too large, using fallback")
-                use_computed = False
+            if not skip_checks:
+                if near_val > 100 * max_baseline:
+                    if verbose:
+                        print(f"    WARNING: Computed near plane too large, using fallback")
+                    use_computed = False
+                
+                if far_val > 1000 * max_baseline:
+                    if verbose:
+                        print(f"    WARNING: Computed far plane too large, using fallback")
+                    use_computed = False
             
-            if far_computed[0].item() > 1000 * max_baseline:
-                if verbose:
-                    print(f"    WARNING: Computed far plane too large, using fallback")
-                use_computed = False
-            
-            near_valid = (near_computed[0].item() > 0 and 
-                         not torch.isnan(near_computed[0]) and 
-                         not torch.isinf(near_computed[0]))
-            
-            far_valid = (far_computed[0].item() > 0 and 
-                        not torch.isnan(far_computed[0]) and 
-                        not torch.isinf(far_computed[0]))
+            near_valid = (near_val > 0 and not np.isnan(near_val) and not np.isinf(near_val))
+            far_valid = (far_val > 0 and not np.isnan(far_val) and not np.isinf(far_val))
             
             if not near_valid or not use_computed:
                 near_fallback = max(0.5, 0.5 * min_baseline)
@@ -459,7 +473,7 @@ class DepthSplatInference:
                     max_camera_dist = max(camera_distances)
                     far_fallback = max(far_fallback, 5.0 * max_camera_dist)
                 far = torch.ones(batch_size, num_views, dtype=torch.float32) * far_fallback
-            elif far_computed[0].item() <= near[0, 0].item():
+            elif far_val <= near[0, 0].item():
                 far_fallback = 15.0 * max_baseline
                 far_fallback = min(200.0, far_fallback)
                 if camera_distances:
@@ -481,14 +495,108 @@ class DepthSplatInference:
         
         return near, far
     
+    @staticmethod
+    def _rotation_matrix_to_quaternion_batch(R_mat: np.ndarray) -> np.ndarray:
+        """
+        Convert rotation matrices to quaternions (xyzw order) using numpy.
+        
+        Args:
+            R_mat: Rotation matrices of shape [..., 3, 3]
+            
+        Returns:
+            Quaternions of shape [..., 4] in xyzw order
+        """
+        # Based on https://www.euclideanspace.com/maths/geometry/rotations/conversions/matrixToQuaternion/
+        original_shape = R_mat.shape[:-2]
+        R_flat = R_mat.reshape(-1, 3, 3)
+        n = R_flat.shape[0]
+        
+        quats = np.zeros((n, 4), dtype=np.float32)
+        
+        trace = R_flat[:, 0, 0] + R_flat[:, 1, 1] + R_flat[:, 2, 2]
+        
+        # Case 1: trace > 0
+        mask1 = trace > 0
+        if np.any(mask1):
+            s = np.sqrt(trace[mask1] + 1.0) * 2  # s = 4 * w
+            quats[mask1, 3] = 0.25 * s  # w
+            quats[mask1, 0] = (R_flat[mask1, 2, 1] - R_flat[mask1, 1, 2]) / s  # x
+            quats[mask1, 1] = (R_flat[mask1, 0, 2] - R_flat[mask1, 2, 0]) / s  # y
+            quats[mask1, 2] = (R_flat[mask1, 1, 0] - R_flat[mask1, 0, 1]) / s  # z
+        
+        # Case 2: R[0,0] > R[1,1] and R[0,0] > R[2,2]
+        mask2 = ~mask1 & (R_flat[:, 0, 0] > R_flat[:, 1, 1]) & (R_flat[:, 0, 0] > R_flat[:, 2, 2])
+        if np.any(mask2):
+            s = np.sqrt(1.0 + R_flat[mask2, 0, 0] - R_flat[mask2, 1, 1] - R_flat[mask2, 2, 2]) * 2
+            quats[mask2, 3] = (R_flat[mask2, 2, 1] - R_flat[mask2, 1, 2]) / s
+            quats[mask2, 0] = 0.25 * s
+            quats[mask2, 1] = (R_flat[mask2, 0, 1] + R_flat[mask2, 1, 0]) / s
+            quats[mask2, 2] = (R_flat[mask2, 0, 2] + R_flat[mask2, 2, 0]) / s
+        
+        # Case 3: R[1,1] > R[2,2]
+        mask3 = ~mask1 & ~mask2 & (R_flat[:, 1, 1] > R_flat[:, 2, 2])
+        if np.any(mask3):
+            s = np.sqrt(1.0 + R_flat[mask3, 1, 1] - R_flat[mask3, 0, 0] - R_flat[mask3, 2, 2]) * 2
+            quats[mask3, 3] = (R_flat[mask3, 0, 2] - R_flat[mask3, 2, 0]) / s
+            quats[mask3, 0] = (R_flat[mask3, 0, 1] + R_flat[mask3, 1, 0]) / s
+            quats[mask3, 1] = 0.25 * s
+            quats[mask3, 2] = (R_flat[mask3, 1, 2] + R_flat[mask3, 2, 1]) / s
+        
+        # Case 4: else
+        mask4 = ~mask1 & ~mask2 & ~mask3
+        if np.any(mask4):
+            s = np.sqrt(1.0 + R_flat[mask4, 2, 2] - R_flat[mask4, 0, 0] - R_flat[mask4, 1, 1]) * 2
+            quats[mask4, 3] = (R_flat[mask4, 1, 0] - R_flat[mask4, 0, 1]) / s
+            quats[mask4, 0] = (R_flat[mask4, 0, 2] + R_flat[mask4, 2, 0]) / s
+            quats[mask4, 1] = (R_flat[mask4, 1, 2] + R_flat[mask4, 2, 1]) / s
+            quats[mask4, 2] = 0.25 * s
+        
+        # Normalize quaternions
+        quats = quats / (np.linalg.norm(quats, axis=-1, keepdims=True) + 1e-8)
+        
+        return quats.reshape(*original_shape, 4)
+    
+    @staticmethod
+    def _quaternion_multiply_batch(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        """
+        Multiply two quaternions (xyzw order) using numpy broadcasting.
+        
+        Args:
+            q1: Quaternions of shape [..., 4] in xyzw order
+            q2: Quaternions of shape [..., 4] in xyzw order
+            
+        Returns:
+            Result quaternions of shape [..., 4] in xyzw order
+        """
+        # Extract components (xyzw order)
+        x1, y1, z1, w1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        x2, y2, z2, w2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+        
+        # Hamilton product
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        
+        result = np.stack([x, y, z, w], axis=-1)
+        
+        # Normalize
+        result = result / (np.linalg.norm(result, axis=-1, keepdims=True) + 1e-8)
+        
+        return result.astype(np.float32)
+    
     def _gaussians_to_ply_bytes(
         self,
         gaussians,
         visualization_dump: dict,
         context: dict,
         num_views: int,
+        log_timing: bool = False,
     ) -> bytes:
         """Convert gaussians to PLY format and return as bytes."""
+        timings = {}
+        total_start = time.perf_counter()
+        
         if "scales" not in visualization_dump or "rotations" not in visualization_dump:
             raise ValueError(
                 "visualization_dump does not contain scales/rotations. "
@@ -506,48 +614,55 @@ class DepthSplatInference:
                 f"Total gaussians ({total_gaussians}) must be divisible by num_views ({num_views})"
             )
         
+        # Transform rotations to world space - OPTIMIZED: pure numpy quaternion math (no scipy)
+        t0 = time.perf_counter()
         rotations_per_view = rotations.view(num_views, num_gaussians_per_view, 4)
-        c2w_rotations = context["extrinsics"][0, :, :3, :3].detach().cpu()
+        c2w_rotations = context["extrinsics"][0, :, :3, :3].detach().cpu().numpy()
         
-        world_rotations_list = []
-        for v in range(num_views):
-            cam_rotations_np = R.from_quat(
-                rotations_per_view[v].detach().cpu().numpy()
-            ).as_matrix()
-            
-            c2w_rot = c2w_rotations[v].detach().cpu().numpy()
-            c2w_rot_expanded = np.broadcast_to(
-                c2w_rot[None, :, :], 
-                (num_gaussians_per_view, 3, 3)
-            )
-            world_rotations_mat = c2w_rot_expanded @ cam_rotations_np
-            world_rotations_quat = R.from_matrix(world_rotations_mat).as_quat()
-            world_rotations_list.append(torch.from_numpy(world_rotations_quat))
+        # Get all camera rotations as quaternions [V, N, 4] in xyzw order
+        all_cam_quats = rotations_per_view.detach().cpu().numpy()  # [V, N, 4]
         
-        world_rotations = torch.cat(world_rotations_list, dim=0).to(rotations.device)
+        # Convert c2w rotation matrices to quaternions for each view [V, 4]
+        c2w_quats = self._rotation_matrix_to_quaternion_batch(c2w_rotations)  # [V, 4]
         
-        means_world = gaussians.means[0].detach().cpu()
-        scales_world = scales.detach().cpu()
-        rotations_world = world_rotations.detach().cpu()
-        harmonics_world = gaussians.harmonics[0].detach().cpu()
-        opacities_world = gaussians.opacities[0].detach().cpu()
+        # Expand c2w_quats to match gaussians: [V, 1, 4] -> broadcast with [V, N, 4]
+        c2w_quats_expanded = c2w_quats[:, np.newaxis, :]  # [V, 1, 4]
         
-        x, y, z, w = rearrange(rotations_world.numpy(), "g xyzw -> xyzw g")
-        rotations_ply = np.stack((w, x, y, z), axis=-1)
+        # Quaternion multiplication: q_world = q_c2w * q_cam (for each gaussian)
+        # Broadcast across N gaussians per view
+        world_rotations_quat = self._quaternion_multiply_batch(
+            c2w_quats_expanded, all_cam_quats
+        )  # [V, N, 4]
         
-        harmonics_dc = harmonics_world[..., 0].numpy()
+        # Flatten to [V*N, 4]
+        world_rotations_quat = world_rotations_quat.reshape(-1, 4)
         
-        attributes_list = [
-            means_world.numpy(),
-            np.zeros_like(means_world.numpy()),
-            harmonics_dc,
-            torch.logit(opacities_world[..., None]).numpy(),
-            scales_world.log().numpy(),
-            rotations_ply,
-        ]
+        timings['rotation_transform'] = time.perf_counter() - t0
         
-        attributes = np.concatenate(attributes_list, axis=1)
+        # Transfer data from GPU to CPU
+        t0 = time.perf_counter()
+        means_np = gaussians.means[0].detach().cpu().numpy()
+        scales_np = scales.detach().cpu().numpy()
+        harmonics_np = gaussians.harmonics[0].detach().cpu().numpy()
+        opacities_np = gaussians.opacities[0].detach().cpu().numpy()
+        timings['gpu_to_cpu'] = time.perf_counter() - t0
         
+        # Prepare numpy arrays
+        t0 = time.perf_counter()
+        # Reorder quaternion from xyzw to wxyz for PLY format
+        rotations_ply = world_rotations_quat[:, [3, 0, 1, 2]].astype(np.float32)
+        
+        harmonics_dc = harmonics_np[..., 0].astype(np.float32)
+        normals = np.zeros_like(means_np, dtype=np.float32)
+        
+        # Compute opacity logit and log scales
+        opacities_logit = np.log(opacities_np / (1 - opacities_np + 1e-8)).astype(np.float32)
+        scales_log = np.log(scales_np + 1e-8).astype(np.float32)
+        
+        timings['numpy_prep'] = time.perf_counter() - t0
+        
+        # Create PLY structured array - OPTIMIZED: direct field assignment
+        t0 = time.perf_counter()
         dtype_full = [
             ("x", "f4"), ("y", "f4"), ("z", "f4"),
             ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
@@ -557,13 +672,46 @@ class DepthSplatInference:
             ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
         ]
         
-        elements = np.empty(means_world.shape[0], dtype=dtype_full)
-        elements[:] = list(map(tuple, attributes))
+        num_gaussians = means_np.shape[0]
+        elements = np.empty(num_gaussians, dtype=dtype_full)
         
+        # Direct field assignment - much faster than list(map(tuple, ...))
+        elements['x'] = means_np[:, 0].astype(np.float32)
+        elements['y'] = means_np[:, 1].astype(np.float32)
+        elements['z'] = means_np[:, 2].astype(np.float32)
+        elements['nx'] = normals[:, 0]
+        elements['ny'] = normals[:, 1]
+        elements['nz'] = normals[:, 2]
+        elements['f_dc_0'] = harmonics_dc[:, 0]
+        elements['f_dc_1'] = harmonics_dc[:, 1]
+        elements['f_dc_2'] = harmonics_dc[:, 2]
+        elements['opacity'] = opacities_logit
+        elements['scale_0'] = scales_log[:, 0]
+        elements['scale_1'] = scales_log[:, 1]
+        elements['scale_2'] = scales_log[:, 2]
+        elements['rot_0'] = rotations_ply[:, 0]
+        elements['rot_1'] = rotations_ply[:, 1]
+        elements['rot_2'] = rotations_ply[:, 2]
+        elements['rot_3'] = rotations_ply[:, 3]
+        timings['structured_array'] = time.perf_counter() - t0
+        
+        # Write PLY to buffer
+        t0 = time.perf_counter()
         buffer = io.BytesIO()
         PlyData([PlyElement.describe(elements, "vertex")]).write(buffer)
         buffer.seek(0)
-        return buffer.read()
+        ply_bytes = buffer.read()
+        timings['ply_write'] = time.perf_counter() - t0
+        
+        timings['total'] = time.perf_counter() - total_start
+        
+        if log_timing:
+            print("\n  PLY Conversion Sub-timings:")
+            for name, elapsed in timings.items():
+                pct = (elapsed / timings['total']) * 100 if timings['total'] > 0 else 0
+                print(f"    {name:20s}: {elapsed:8.4f}s ({pct:5.1f}%)")
+        
+        return ply_bytes
     
     def run_from_paths(
         self,
@@ -679,6 +827,9 @@ class DepthSplatInference:
         if config is None:
             config = InferenceConfig()
         
+        total_start = time.perf_counter()
+        timings = {}
+        
         num_views = images.shape[0]
         height, width = images.shape[2], images.shape[3]
         
@@ -689,6 +840,7 @@ class DepthSplatInference:
             image_filenames = [f"view_{i}" for i in range(num_views)]
         
         # Resize images if needed
+        t0 = time.perf_counter()
         if height != config.target_height or width != config.target_width:
             resize_transform = tf.Resize(
                 (config.target_height, config.target_width), 
@@ -699,8 +851,10 @@ class DepthSplatInference:
         
         # Add batch dimension
         images = images.unsqueeze(0)
+        timings['1_image_resize'] = time.perf_counter() - t0
         
         # Prepare camera data
+        t0 = time.perf_counter()
         extrinsics, intrinsics, camera_centers, viewing_directions, camera_distances = \
             self._prepare_camera_data(
                 extrinsics_list=extrinsics_list,
@@ -710,9 +864,12 @@ class DepthSplatInference:
                 target_width=width,
                 image_filenames=image_filenames,
                 verbose=config.verbose,
+                skip_checks=config.skip_checks,
             )
+        timings['2_prepare_camera'] = time.perf_counter() - t0
         
         # Compute near/far planes
+        t0 = time.perf_counter()
         near, far = self._compute_near_far_planes(
             extrinsics=extrinsics,
             intrinsics=intrinsics,
@@ -723,9 +880,12 @@ class DepthSplatInference:
             near_disparity=config.near_disparity,
             far_disparity=config.far_disparity,
             verbose=config.verbose,
+            skip_checks=config.skip_checks,
         )
+        timings['3_near_far_planes'] = time.perf_counter() - t0
         
-        # Prepare context
+        # Prepare context - move tensors to GPU
+        t0 = time.perf_counter()
         context = {
             "image": images.to(self.device),
             "extrinsics": extrinsics.to(self.device),
@@ -733,11 +893,14 @@ class DepthSplatInference:
             "near": near.to(self.device),
             "far": far.to(self.device),
         }
+        timings['4_to_device'] = time.perf_counter() - t0
         
         # Run encoder
         visualization_dump = {}
         
-        with torch.no_grad():
+        t0 = time.perf_counter()
+        # Use inference_mode for faster inference (disables autograd more aggressively than no_grad)
+        with torch.inference_mode():
             result = self.encoder(
                 context=context,
                 global_step=0,
@@ -745,6 +908,10 @@ class DepthSplatInference:
                 visualization_dump=visualization_dump,
                 scene_names=None,
             )
+        # Synchronize to get accurate timing
+        if self.device != "cpu":
+            torch.cuda.synchronize()
+        timings['5_encoder_forward'] = time.perf_counter() - t0
         
         # Handle both dict and direct gaussians return
         if isinstance(result, dict):
@@ -758,12 +925,29 @@ class DepthSplatInference:
             print(f"Gaussian output: {gaussians.means.shape[1]} gaussians")
         
         # Convert to PLY bytes
-        return self._gaussians_to_ply_bytes(
+        t0 = time.perf_counter()
+        ply_bytes = self._gaussians_to_ply_bytes(
             gaussians=gaussians,
             visualization_dump=visualization_dump,
             context=context,
             num_views=num_views,
+            log_timing=config.log_timing,
         )
+        timings['6_ply_conversion'] = time.perf_counter() - t0
+        
+        timings['7_total'] = time.perf_counter() - total_start
+        
+        # Log timing breakdown
+        if config.log_timing:
+            print("\n" + "="*60)
+            print("DEPTHSPLAT INFERENCE TIMING BREAKDOWN")
+            print("="*60)
+            for name, elapsed in timings.items():
+                pct = (elapsed / timings['7_total']) * 100 if timings['7_total'] > 0 else 0
+                print(f"  {name:25s}: {elapsed:8.4f}s ({pct:5.1f}%)")
+            print("="*60 + "\n")
+        
+        return ply_bytes
 
 
 def main():
