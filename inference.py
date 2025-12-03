@@ -107,6 +107,7 @@ class InferenceConfig:
     skip_checks: bool = True  # Skip expensive validation checks (rotation det, etc.) for speed
     log_timing: bool = False  # Log detailed timing breakdown for each step
     output_format: str = "ply"  # Output format: "ply" or "spz"
+    spz_fast_compression: bool = True  # Use fast compression for SPZ (faster but ~10-20% larger files)
 
 
 def load_metadata_from_json(image_path: Path) -> dict:
@@ -745,6 +746,7 @@ class DepthSplatInference:
         context: dict,
         num_views: int,
         log_timing: bool = False,
+        fast_compression: bool = True,
     ) -> bytes:
         """
         Convert gaussians to SPZ format and return as bytes.
@@ -758,6 +760,8 @@ class DepthSplatInference:
             context: Context dict with extrinsics
             num_views: Number of input views
             log_timing: Whether to log timing breakdown
+            fast_compression: Use fast compression (Z_BEST_SPEED) for ~5-10x faster
+                compression at the cost of ~10-20% larger files. Default True.
             
         Returns:
             SPZ file contents as bytes
@@ -871,23 +875,12 @@ class DepthSplatInference:
         pack_options = spz.PackOptions()
         pack_options.from_coord = spz.RDF
         
-        # Save to a temporary file and read bytes
-        import tempfile
-        import os
-        
-        with tempfile.NamedTemporaryFile(suffix='.spz', delete=False) as tmp:
-            tmp_path = tmp.name
-        
-        try:
-            success = spz.save_spz(cloud, pack_options, tmp_path)
-            if not success:
-                raise RuntimeError("Failed to save SPZ file")
-            
-            with open(tmp_path, 'rb') as f:
-                spz_bytes = f.read()
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        # Use in-memory compression (avoids file I/O overhead)
+        # Fast compression uses Z_BEST_SPEED (level 1) vs Z_DEFAULT_COMPRESSION (level 6)
+        if fast_compression:
+            spz_bytes = spz.save_spz_to_bytes_fast(cloud, pack_options)
+        else:
+            spz_bytes = spz.save_spz_to_bytes(cloud, pack_options)
         
         timings['spz_write'] = time.perf_counter() - t0
         
@@ -1130,6 +1123,7 @@ class DepthSplatInference:
                 context=context,
                 num_views=num_views,
                 log_timing=config.log_timing,
+                fast_compression=config.spz_fast_compression,
             )
             timings['6_spz_conversion'] = time.perf_counter() - t0
         elif output_format == "ply":
