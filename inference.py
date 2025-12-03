@@ -442,17 +442,18 @@ class DepthSplatInference:
             near_val = float(values_np[2])
             far_val = float(values_np[3])
             
+            # Always check for unreasonable near/far values and use fallback if needed
+            # This is critical for correctness, not just a validation check
             use_computed = True
-            if not skip_checks:
-                if near_val > 100 * max_baseline:
-                    if verbose:
-                        print(f"    WARNING: Computed near plane too large, using fallback")
-                    use_computed = False
-                
-                if far_val > 1000 * max_baseline:
-                    if verbose:
-                        print(f"    WARNING: Computed far plane too large, using fallback")
-                    use_computed = False
+            if near_val > 100 * max_baseline:
+                if verbose:
+                    print(f"    WARNING: Computed near plane too large, using fallback")
+                use_computed = False
+            
+            if far_val > 1000 * max_baseline:
+                if verbose:
+                    print(f"    WARNING: Computed far plane too large, using fallback")
+                use_computed = False
             
             near_valid = (near_val > 0 and not np.isnan(near_val) and not np.isinf(near_val))
             far_valid = (far_val > 0 and not np.isnan(far_val) and not np.isinf(far_val))
