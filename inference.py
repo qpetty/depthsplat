@@ -640,8 +640,15 @@ class DepthSplatInference:
                 "Cannot export to PLY without this information."
             )
         
-        scales = visualization_dump["scales"][0]
-        rotations = visualization_dump["rotations"][0]
+        # Synchronize CUDA operations on this device before CPU transfer
+        # This is critical for multi-GPU scenarios where each GPU has its own stream
+        if gaussians.means.device.type == "cuda":
+            torch.cuda.synchronize(gaussians.means.device)
+        
+        # Clone visualization_dump tensors to ensure we have independent copies
+        # rearrange() creates views, and the encoder may reuse internal buffers
+        scales = visualization_dump["scales"][0].clone()
+        rotations = visualization_dump["rotations"][0].clone()
         
         total_gaussians = rotations.shape[0]
         num_gaussians_per_view = total_gaussians // num_views
@@ -688,11 +695,13 @@ class DepthSplatInference:
         t0 = time.perf_counter()
         
         # Transfer all processed data to CPU in one batch
-        means_np = means.cpu().numpy()
-        scales_log_np = scales_log.cpu().numpy()
-        rotations_ply_np = rotations_ply.cpu().numpy()
-        harmonics_dc_np = harmonics_dc.cpu().numpy()
-        opacities_logit_np = opacities_logit.cpu().numpy()
+        # CRITICAL: Use .copy() to ensure numpy arrays have independent memory
+        # that won't be affected by PyTorch tensor garbage collection or buffer reuse
+        means_np = means.cpu().numpy().copy()
+        scales_log_np = scales_log.cpu().numpy().copy()
+        rotations_ply_np = rotations_ply.cpu().numpy().copy()
+        harmonics_dc_np = harmonics_dc.cpu().numpy().copy()
+        opacities_logit_np = opacities_logit.cpu().numpy().copy()
         
         timings['gpu_to_cpu'] = time.perf_counter() - t0
         
@@ -792,8 +801,15 @@ class DepthSplatInference:
                 "Cannot export to SPZ without this information."
             )
         
-        scales = visualization_dump["scales"][0]
-        rotations = visualization_dump["rotations"][0]
+        # Synchronize CUDA operations on this device before CPU transfer
+        # This is critical for multi-GPU scenarios where each GPU has its own stream
+        if gaussians.means.device.type == "cuda":
+            torch.cuda.synchronize(gaussians.means.device)
+        
+        # Clone visualization_dump tensors to ensure we have independent copies
+        # rearrange() creates views, and the encoder may reuse internal buffers
+        scales = visualization_dump["scales"][0].clone()
+        rotations = visualization_dump["rotations"][0].clone()
         
         total_gaussians = rotations.shape[0]
         num_gaussians_per_view = total_gaussians // num_views
@@ -841,11 +857,14 @@ class DepthSplatInference:
         # ====== TRANSFER TO CPU ======
         t0 = time.perf_counter()
         
-        means_np = means.cpu().numpy().astype(np.float32)
-        scales_log_np = scales_log.cpu().numpy().astype(np.float32)
-        rotations_spz_np = rotations_spz.cpu().numpy().astype(np.float32)
-        harmonics_dc_np = harmonics_dc.cpu().numpy().astype(np.float32)
-        opacities_logit_np = opacities_logit.cpu().numpy().astype(np.float32)
+        # CRITICAL: Use .copy() to ensure numpy arrays have independent memory
+        # that won't be affected by PyTorch tensor garbage collection or buffer reuse
+        # Note: .astype() with the same dtype may not always copy, so we ensure with .copy()
+        means_np = means.cpu().numpy().astype(np.float32, copy=True)
+        scales_log_np = scales_log.cpu().numpy().astype(np.float32, copy=True)
+        rotations_spz_np = rotations_spz.cpu().numpy().astype(np.float32, copy=True)
+        harmonics_dc_np = harmonics_dc.cpu().numpy().astype(np.float32, copy=True)
+        opacities_logit_np = opacities_logit.cpu().numpy().astype(np.float32, copy=True)
         
         timings['gpu_to_cpu'] = time.perf_counter() - t0
         
@@ -1102,9 +1121,10 @@ class DepthSplatInference:
                 visualization_dump=visualization_dump,
                 scene_names=None,
             )
-        # Synchronize to get accurate timing
+        # Synchronize to get accurate timing and ensure all GPU operations complete
+        # CRITICAL: Specify the device for multi-GPU scenarios
         if self.device != "cpu":
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
         timings['5_encoder_forward'] = time.perf_counter() - t0
         
         # Handle both dict and direct gaussians return
