@@ -296,9 +296,20 @@ class DepthSplatInference:
         spz_bytes = model.run_from_paths("/path/to/images", config=config)
     """
     
-    def __init__(self):
-        """Initialize the encoder using module-level configuration."""
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    def __init__(self, device: str = None):
+        """Initialize the encoder using module-level configuration.
+        
+        Args:
+            device: Device to use (e.g., "cuda:0", "cuda:1"). 
+                    If None, uses the current CUDA device set by torch.cuda.set_device().
+        """
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            # Use current CUDA device (respects torch.cuda.set_device())
+            self.device = f"cuda:{torch.cuda.current_device()}"
+        else:
+            self.device = "cpu"
         print(f"Using device: {self.device}")
         
         # Load encoder config
